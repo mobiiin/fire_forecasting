@@ -1,0 +1,32 @@
+# Generated tensor outputs
+tensors/
+*.npy
+*.npz
+*.zarr/
+./data
+./keepz_05
+
+# Generated training artifacts
+artifacts/
+outputs/
+configs/artifacts/
+
+
+# Raw simulation outputs and large derived files
+KINGNSM04ASC.*
+*.flux.*
+*.fuel.*
+*.terrain
+!KINGNSM04ASC.hdr
+
+# Python cache files
+__pycache__/
+*.pyc
+
+# Temporary editor files
+.DS_Store
+Thumbs.db
+
+# Local agent/tool state
+.agents/
+.codex/

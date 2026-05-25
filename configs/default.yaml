@@ -1,0 +1,59 @@
+data_dir: ../../keepz_05
+file_pattern: "*.npy"
+input_sequence_length: 6
+prediction_horizon: 1
+target_channel: 0
+task_type: regression
+fire_threshold: 0.5
+use_patches: false
+use_patches_for_eval: false
+patch_size: 64
+active_patch_probability: 0.7
+active_threshold: 0.5
+train_fraction: 0.7
+val_fraction: 0.15
+test_fraction: 0.15
+batch_size: 4
+learning_rate: 0.0001
+epochs: 50
+num_workers: 4
+device: auto
+
+model:
+  name: convlstm_unet
+  input_channels: 56
+  hidden_channels: [32, 64, 128]
+  kernel_size: 3
+  num_layers: 1
+  dropout: 0.0
+  output_channels: 1
+  bidirectional: false
+
+normalization:
+  path: ./artifacts/normalization_stats.npz
+  method: zscore
+  epsilon: 1.0e-06
+
+checkpoint:
+  path: ./artifacts/checkpoints/convlstm_unet.pt
+  save_best_only: true
+  monitor: val_loss
+
+visualization:
+  output_path: ./outputs/visualizations
+  cmap: inferno
+  dpi: 150
+  target_threshold: 0.5
+
+training:
+  optimizer: adamw
+  weight_decay: 0.0
+  gradient_clip_norm: 1.0
+  mixed_precision: false
+  scheduler: reduce_on_plateau
+  scheduler_factor: 0.5
+  scheduler_patience: 5
+
+logging:
+  level: INFO
+  log_dir: ./artifacts/logs
