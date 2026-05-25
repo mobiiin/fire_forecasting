@@ -5,6 +5,8 @@ tensors/
 *.zarr/
 ./data
 ./keepz_05
+./keepz_*
+
 
 # Generated training artifacts
 artifacts/

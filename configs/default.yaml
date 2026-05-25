@@ -1,8 +1,9 @@
-data_dir: ../../keepz_05
+data_dir: ../keepz_05
 file_pattern: "*.npy"
 input_sequence_length: 6
 prediction_horizon: 1
-target_channel: 0
+target_channel: 55
+input_channel_count: 50
 task_type: regression
 fire_threshold: 0.5
 use_patches: false
@@ -15,13 +16,13 @@ val_fraction: 0.15
 test_fraction: 0.15
 batch_size: 4
 learning_rate: 0.0001
-epochs: 50
+epochs: 30
 num_workers: 4
 device: auto
 
 model:
   name: convlstm_unet
-  input_channels: 56
+  input_channels: 50
   hidden_channels: [32, 64, 128]
   kernel_size: 3
   num_layers: 1

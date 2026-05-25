@@ -11,6 +11,7 @@ import numpy as np
 def compute_channel_stats(
 	file_paths: Iterable[str | Path],
 	sample_indices: Sequence[int] | None = None,
+	channel_indices: Sequence[int] | slice | None = None,
 	eps: float = 1e-6,
 ) -> dict[str, np.ndarray]:
 	"""Compute per-channel statistics with a numerically stable streaming update.
@@ -37,6 +38,13 @@ def compute_channel_stats(
 		array = np.load(file_path, allow_pickle=False)
 		if array.ndim != 3:
 			raise ValueError(f"Expected a 3D tensor in {file_path}, got shape {array.shape}.")
+		if channel_indices is not None:
+			array = array[:, :, channel_indices]
+			if array.ndim != 3:
+				raise ValueError(
+					"channel_indices must select at least one channel. "
+					f"Got resulting shape {array.shape} for {file_path}."
+				)
 
 		if not np.issubdtype(array.dtype, np.floating):
 			array = array.astype(np.float64, copy=False)

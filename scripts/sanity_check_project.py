@@ -108,6 +108,9 @@ def _build_datasets(config: Mapping[str, Any], files: list[Path], normalization_
 
     input_sequence_length = int(config["input_sequence_length"])
     prediction_horizon = int(config["prediction_horizon"])
+    input_channel_count = int(config.get("input_channel_count", config.get("model", {}).get("input_channels", 0)))
+    if input_channel_count <= 0:
+        raise KeyError("Config must define a positive input_channel_count or model.input_channels.")
     split_indices = chronological_split_indices(
         num_timesteps=len(files),
         input_sequence_length=input_sequence_length,
@@ -127,6 +130,7 @@ def _build_datasets(config: Mapping[str, Any], files: list[Path], normalization_
         "input_sequence_length": input_sequence_length,
         "prediction_horizon": prediction_horizon,
         "target_channel": int(config["target_channel"]),
+        "input_channel_count": input_channel_count,
         "task_type": str(config.get("task_type", "regression")),
         "fire_threshold": float(config.get("fire_threshold", 0.5)),
         "normalization_stats": normalization_stats,

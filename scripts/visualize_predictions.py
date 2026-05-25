@@ -99,6 +99,9 @@ def _build_test_dataset(config: Mapping[str, Any], normalization_stats) -> FireS
     files = _sort_chronologically(_discover_files(config))
     input_sequence_length = int(config["input_sequence_length"])
     prediction_horizon = int(config["prediction_horizon"])
+    input_channel_count = int(config.get("input_channel_count", _get_section(config, "model").get("input_channels", 0)))
+    if input_channel_count <= 0:
+        raise KeyError("Config must define a positive input_channel_count or model.input_channels.")
     splits = chronological_split_indices(
         num_timesteps=len(files),
         input_sequence_length=input_sequence_length,
@@ -113,6 +116,7 @@ def _build_test_dataset(config: Mapping[str, Any], normalization_stats) -> FireS
         input_sequence_length=input_sequence_length,
         prediction_horizon=prediction_horizon,
         target_channel=int(config["target_channel"]),
+        input_channel_count=input_channel_count,
         task_type=str(config.get("task_type", _get_section(config, "training").get("task_type", "regression"))),
         fire_threshold=float(config.get("fire_threshold", _get_section(config, "training").get("fire_threshold", 0.5))),
         normalization_stats=normalization_stats,
@@ -120,7 +124,7 @@ def _build_test_dataset(config: Mapping[str, Any], normalization_stats) -> FireS
     )
 
 
-def _build_test_loader(dataset) -> DataLoader:
+def _build_test_loader(dataset):
     """Create a chronological, sample-by-sample test DataLoader."""
 
     if torch is None or DataLoader is None:
@@ -136,7 +140,7 @@ def _build_test_loader(dataset) -> DataLoader:
     )
 
 
-def _select_device(config: Mapping[str, Any]) -> torch.device:
+def _select_device(config: Mapping[str, Any]):
     """Select the inference device from config, defaulting to CPU when unavailable."""
 
     device_setting = str(config.get("device", _get_section(config, "training").get("device", "auto"))).lower()
@@ -277,7 +281,8 @@ def visualize_predictions(config_path: str | Path, num_samples: int = 10) -> lis
                     f"Prediction spatial size {tuple(predicted.shape[-2:])} does not match target size {tuple(y_sample.shape[-2:])}."
                 )
 
-            current_map = x_sample[0, -1, test_dataset.target_channel].detach().cpu().numpy()
+            current_channel_index = int(x_sample.shape[2] - 1)
+            current_map = x_sample[0, -1, current_channel_index].detach().cpu().numpy()
             ground_truth_map = y_sample[0, 0].detach().cpu().numpy()
             if task_type == "segmentation":
                 predicted_map = torch.sigmoid(predicted[0, 0]).detach().cpu().numpy()
@@ -304,7 +309,7 @@ def visualize_predictions(config_path: str | Path, num_samples: int = 10) -> lis
                 cmap=cmap,
                 dpi=dpi,
                 normalization_stats=normalization_stats,
-                channel_index=test_dataset.target_channel,
+                channel_index=current_channel_index,
                 draw_contours=True,
             )
             saved_paths.append(saved_path)

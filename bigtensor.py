@@ -15,6 +15,44 @@ def _load_flat_text_data(input_filepath, data_type=np.float32, skip_header_rows=
     return np.loadtxt(input_filepath, dtype=data_type, skiprows=skip_header_rows)
 
 
+def _non_finite_counts(array):
+    """Return NaN and Inf counts for a numeric array."""
+    nan_count = int(np.isnan(array).sum())
+    inf_count = int(np.isinf(array).sum())
+    return nan_count, inf_count
+
+
+def _raise_if_non_finite(array, stage_name, input_filepath):
+    """Fail fast when non-finite values are present."""
+    nan_count, inf_count = _non_finite_counts(array)
+    if nan_count == 0 and inf_count == 0:
+        return
+
+    raise ValueError(
+        f"{stage_name} contains non-finite values for '{input_filepath}': "
+        f"nan_count={nan_count}, inf_count={inf_count}."
+    )
+
+
+def _print_tensor_summary(array, tensor_name):
+    """Print a compact numeric summary for tracing dataset generation."""
+    finite_mask = np.isfinite(array)
+    finite_count = int(finite_mask.sum())
+    nan_count, inf_count = _non_finite_counts(array)
+    print(
+        f"INFO {tensor_name}: shape={array.shape}, dtype={array.dtype}, "
+        f"finite_count={finite_count}, nan_count={nan_count}, inf_count={inf_count}"
+    )
+    if finite_count == 0:
+        return
+
+    finite_values = array[finite_mask]
+    print(
+        f"INFO {tensor_name}: min={float(finite_values.min()):.6g}, "
+        f"max={float(finite_values.max()):.6g}, mean={float(finite_values.mean()):.6g}"
+    )
+
+
 def _resolve_data_path(data_root, filename):
     """Join a data-root directory and a filename."""
     return os.path.join(data_root, filename)
@@ -47,6 +85,7 @@ def average_pool_fuel(
             data_type=data_type,
             skip_header_rows=skip_header_rows,
         )
+        _raise_if_non_finite(flat_data, "Raw fuel text data", input_filepath)
         
         num_elements = np.prod(initial_shape)
         if flat_data.size < num_elements:
@@ -55,6 +94,7 @@ def average_pool_fuel(
         # --- 2. Reshape the data to its initial 3D shape ---
         initial_tensor = flat_data[:num_elements].reshape(initial_shape)
         print(f"✅ Data reshaped to initial shape: {initial_tensor.shape}")
+        _raise_if_non_finite(initial_tensor, "Fuel tensor after reshape", input_filepath)
 
         # --- 3. Perform pooling ---
         h, w, c = initial_shape
@@ -78,6 +118,8 @@ def average_pool_fuel(
             pooled_tensor = reshaped_for_pooling.sum(axis=(1, 3))
         else:
             raise ValueError("pooling_mode must be one of: average, max, sum.")
+        _raise_if_non_finite(pooled_tensor, "Fuel tensor after pooling", input_filepath)
+        _print_tensor_summary(pooled_tensor, "fuel_tensor")
         
         print("\n🎉 Success! Pooling complete.")
         print(f"Final shape of pooled tensor: {pooled_tensor.shape}")
@@ -108,6 +150,7 @@ def load_asc_tensor(
             data_type=data_type,
             skip_header_rows=skip_header_rows,
         )
+        _raise_if_non_finite(flat_data, "Raw ASC text data", input_filepath)
 
         if flat_data.size < total_elements:
             missing = total_elements - flat_data.size
@@ -119,6 +162,8 @@ def load_asc_tensor(
             flat_data = np.pad(flat_data, (0, missing), mode='constant', constant_values=0)
 
         asc_tensor = flat_data[:total_elements].reshape((x_size, y_size, keep_z_levels, field_count))
+        _raise_if_non_finite(asc_tensor, "ASC tensor after reshape", input_filepath)
+        _print_tensor_summary(asc_tensor, "asc_tensor")
         print(f"✅ ASC tensor shape: {asc_tensor.shape}")
         return asc_tensor
 
@@ -145,6 +190,7 @@ def load_flux_tensor(
             data_type=data_type,
             skip_header_rows=skip_header_rows,
         )
+        _raise_if_non_finite(flat_data, "Raw flux text data", input_filepath)
 
         if flat_data.size < total_elements:
             raise ValueError(
@@ -152,6 +198,8 @@ def load_flux_tensor(
             )
 
         flux_tensor = flat_data[:total_elements].reshape(target_shape)
+        _raise_if_non_finite(flux_tensor, "Flux tensor after reshape", input_filepath)
+        _print_tensor_summary(flux_tensor, "flux_tensor")
         print(f"✅ Flux tensor shape: {flux_tensor.shape}")
         return flux_tensor
 
@@ -199,6 +247,8 @@ def merge_timestamp(
         asc_features = np.transpose(asc_tensor, (0, 1, 3, 2)).reshape(
             asc_tensor.shape[0], asc_tensor.shape[1], keep_z_levels * asc_tensor.shape[3]
         )
+        _raise_if_non_finite(asc_features, "Flattened ASC feature tensor", base_file)
+        _print_tensor_summary(asc_features, "asc_features")
         print(f"✅ ASC features flattened to shape: {asc_features.shape}")
 
         flux_tensor = load_flux_tensor(
@@ -223,6 +273,8 @@ def merge_timestamp(
 
         merged_tensor = np.concatenate((asc_features, flux_tensor, fuel_tensor), axis=2)
         merged_tensor = merged_tensor.astype(data_type, copy=False)
+        _raise_if_non_finite(merged_tensor, "Merged tensor before save", base_file)
+        _print_tensor_summary(merged_tensor, "merged_tensor")
         print(f"🎉 Merged tensor shape: {merged_tensor.shape}")
         return merged_tensor
 
@@ -272,6 +324,11 @@ def process_all_files(
                 continue
 
             print(f"\n💾 Saving merged tensor to '{output_file}'...")
+            _raise_if_non_finite(
+                merged_tensor,
+                f"Merged tensor for timestamp {ts:04d}",
+                output_file,
+            )
             np.save(output_file, merged_tensor)
             print(f"🎉 Saved tensor for timestamp {ts:04d} with keep_z_levels={keep_z_levels}.")
 

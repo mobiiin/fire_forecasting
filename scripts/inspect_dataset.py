@@ -5,8 +5,9 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Sequence, Tuple
+from typing import List, Sequence, Tuple
 
 import numpy as np
 
@@ -53,7 +54,7 @@ def extract_numeric_suffix(name: str) -> int | None:
 def load_array(file_path: Path) -> np.ndarray:
     """Load a single NumPy file without materializing the whole dataset."""
 
-    return np.load(file_path, allow_pickle=False)
+    return np.load(file_path, mmap_mode="r", allow_pickle=False)
 
 
 def infer_dimensions(array_shape: Sequence[int]) -> Tuple[int, int, int]:
@@ -77,37 +78,165 @@ def select_sample_indices(file_count: int, maximum_samples: int = 5) -> List[int
     return indices
 
 
+@dataclass
+class FileInspectionResult:
+    """Detailed validation result for a single dataset file."""
+
+    file_path: Path
+    loaded: bool
+    shape: Tuple[int, ...] | None = None
+    dtype: str | None = None
+    load_error: str | None = None
+    is_numeric: bool = False
+    finite_count: int = 0
+    nan_count: int = 0
+    inf_count: int = 0
+    finite_min: float | None = None
+    finite_max: float | None = None
+
+
+@dataclass
+class DatasetInspectionSummary:
+    """Aggregate validation results across the full dataset."""
+
+    file_count: int
+    reference_shape: Tuple[int, ...]
+    reference_dtype: str
+    files_scanned: int = 0
+    load_failures: List[str] | None = None
+    non_3d_files: List[str] | None = None
+    shape_mismatches: List[str] | None = None
+    dtype_mismatches: List[str] | None = None
+    non_numeric_files: List[str] | None = None
+    nan_files: List[str] | None = None
+    inf_files: List[str] | None = None
+    all_non_finite_files: List[str] | None = None
+    total_nan_count: int = 0
+    total_inf_count: int = 0
+    global_finite_min: float | None = None
+    global_finite_max: float | None = None
+
+    def __post_init__(self) -> None:
+        self.load_failures = []
+        self.non_3d_files = []
+        self.shape_mismatches = []
+        self.dtype_mismatches = []
+        self.non_numeric_files = []
+        self.nan_files = []
+        self.inf_files = []
+        self.all_non_finite_files = []
+
+    def has_issues(self) -> bool:
+        return any(
+            (
+                self.load_failures,
+                self.non_3d_files,
+                self.shape_mismatches,
+                self.dtype_mismatches,
+                self.non_numeric_files,
+                self.nan_files,
+                self.inf_files,
+                self.all_non_finite_files,
+            )
+        )
+
+
 def summarize_array(array: np.ndarray) -> str:
     """Format basic numeric summary statistics for a tensor."""
 
+    if not np.issubdtype(array.dtype, np.number):
+        return f"dtype={array.dtype}, non-numeric"
+
     finite_mask = np.isfinite(array)
-    has_nan = bool(np.isnan(array).any())
-    has_inf = bool(np.isinf(array).any())
-    if not finite_mask.any():
-        return "all values are non-finite"
+    nan_count = int(np.isnan(array).sum())
+    inf_count = int(np.isinf(array).sum())
+    finite_count = int(finite_mask.sum())
+    if finite_count == 0:
+        return (
+            f"dtype={array.dtype}, finite_count=0, "
+            f"nan_count={nan_count}, inf_count={inf_count}"
+        )
 
     finite_values = array[finite_mask]
     return (
-        f"min={finite_values.min():.6g}, max={finite_values.max():.6g}, "
+        f"dtype={array.dtype}, min={finite_values.min():.6g}, max={finite_values.max():.6g}, "
         f"mean={finite_values.mean():.6g}, std={finite_values.std():.6g}, "
-        f"has_nan={has_nan}, has_inf={has_inf}"
+        f"nan_count={nan_count}, inf_count={inf_count}"
     )
 
 
-def inspect_dataset(files: Sequence[Path]) -> None:
-    """Print a compact inspection report for a sequential tensor dataset."""
+def inspect_file(file_path: Path) -> FileInspectionResult:
+    """Inspect one file and capture validation details without raising."""
 
-    first_array = load_array(files[0])
-    target_shape = tuple(first_array.shape)
-    target_dtype = first_array.dtype
-    channels, height, width = infer_dimensions(target_shape)
+    try:
+        array = load_array(file_path)
+    except Exception as exc:
+        return FileInspectionResult(
+            file_path=file_path,
+            loaded=False,
+            load_error=f"{type(exc).__name__}: {exc}",
+        )
 
-    shape_consistent = True
-    inconsistent_files: List[str] = []
-    any_nan = bool(np.isnan(first_array).any())
-    any_inf = bool(np.isinf(first_array).any())
+    result = FileInspectionResult(
+        file_path=file_path,
+        loaded=True,
+        shape=tuple(int(dimension) for dimension in array.shape),
+        dtype=str(array.dtype),
+        is_numeric=bool(np.issubdtype(array.dtype, np.number)),
+    )
+    if not result.is_numeric:
+        return result
+
+    finite_mask = np.isfinite(array)
+    result.finite_count = int(finite_mask.sum())
+    result.nan_count = int(np.isnan(array).sum())
+    result.inf_count = int(np.isinf(array).sum())
+
+    if result.finite_count > 0:
+        finite_values = array[finite_mask]
+        result.finite_min = float(finite_values.min())
+        result.finite_max = float(finite_values.max())
+
+    return result
+
+
+def format_issue_examples(entries: Sequence[str], maximum_entries: int = 10) -> str:
+    """Format a short preview list for issue summaries."""
+
+    if not entries:
+        return "0"
+    preview = ", ".join(entries[:maximum_entries])
+    if len(entries) > maximum_entries:
+        preview += f", ... (+{len(entries) - maximum_entries} more)"
+    return f"{len(entries)} [{preview}]"
+
+
+def inspect_dataset(files: Sequence[Path]) -> DatasetInspectionSummary:
+    """Validate the whole dataset and return a full inspection summary."""
+
+    first_result = inspect_file(files[0])
+    if not first_result.loaded:
+        raise ValueError(
+            f"Failed to load first file {files[0].name}: {first_result.load_error}"
+        )
+    if first_result.shape is None:
+        raise ValueError(f"Could not determine shape for first file {files[0].name}.")
+    if len(first_result.shape) != 3:
+        raise ValueError(
+            f"Expected first tensor to be 3D, got shape {first_result.shape} in {files[0].name}."
+        )
+
+    target_shape = first_result.shape
+    target_dtype = str(first_result.dtype)
+    height, width, channels = target_shape
+    summary = DatasetInspectionSummary(
+        file_count=len(files),
+        reference_shape=target_shape,
+        reference_dtype=target_dtype,
+    )
 
     sample_indices = select_sample_indices(len(files))
+    sample_results = {index: inspect_file(files[index]) for index in sample_indices}
 
     print(f"number of files: {len(files)}")
     print("first 5 filenames:")
@@ -117,39 +246,92 @@ def inspect_dataset(files: Sequence[Path]) -> None:
     for file_path in files[-5:]:
         print(f"  {file_path.name}")
 
-    print(f"first file shape: {target_shape}")
-    print(f"dtype: {target_dtype}")
+    print(f"reference shape: {target_shape}")
+    print(f"reference dtype: {target_dtype}")
     print(f"inferred dimensions: C={channels}, H={height}, W={width}")
 
     print("sample file statistics:")
     for index in sample_indices:
-        file_path = files[index]
-        array = first_array if index == 0 else load_array(file_path)
-        if tuple(array.shape) != target_shape:
-            shape_consistent = False
-            inconsistent_files.append(f"{file_path.name}: {tuple(array.shape)}")
-        any_nan = any_nan or bool(np.isnan(array).any())
-        any_inf = any_inf or bool(np.isinf(array).any())
-        print(f"  {file_path.name}: {summarize_array(array)}")
+        result = sample_results[index]
+        if not result.loaded:
+            print(f"  {result.file_path.name}: load_error={result.load_error}")
+            continue
 
-    for file_path in files[1:]:
-        array = load_array(file_path)
-        if tuple(array.shape) != target_shape:
-            shape_consistent = False
-            inconsistent_files.append(f"{file_path.name}: {tuple(array.shape)}")
-        any_nan = any_nan or bool(np.isnan(array).any())
-        any_inf = any_inf or bool(np.isinf(array).any())
+        try:
+            sample_array = load_array(result.file_path)
+            print(f"  {result.file_path.name}: {summarize_array(sample_array)}")
+        except Exception as exc:
+            print(f"  {result.file_path.name}: failed to summarize ({type(exc).__name__}: {exc})")
 
-    print(f"all files have the same shape: {shape_consistent}")
-    print(f"any NaNs present: {any_nan}")
-    print(f"any infinities present: {any_inf}")
+    for file_path in files:
+        result = first_result if file_path == files[0] else inspect_file(file_path)
+        summary.files_scanned += 1
 
-    if not shape_consistent:
-        details = "\n".join(f"  {entry}" for entry in inconsistent_files[:10])
-        raise ValueError(
-            "Dataset contains inconsistent tensor shapes. "
-            f"Expected {target_shape}, but found:\n{details}"
-        )
+        if not result.loaded:
+            summary.load_failures.append(f"{file_path.name} ({result.load_error})")
+            continue
+        if result.shape is None:
+            summary.load_failures.append(f"{file_path.name} (shape unavailable)")
+            continue
+        if len(result.shape) != 3:
+            summary.non_3d_files.append(f"{file_path.name}: {result.shape}")
+            continue
+        if result.shape != target_shape:
+            summary.shape_mismatches.append(f"{file_path.name}: {result.shape}")
+        if result.dtype != target_dtype:
+            summary.dtype_mismatches.append(f"{file_path.name}: {result.dtype}")
+        if not result.is_numeric:
+            summary.non_numeric_files.append(f"{file_path.name}: {result.dtype}")
+            continue
+
+        if result.nan_count > 0:
+            summary.nan_files.append(f"{file_path.name}: {result.nan_count}")
+            summary.total_nan_count += result.nan_count
+        if result.inf_count > 0:
+            summary.inf_files.append(f"{file_path.name}: {result.inf_count}")
+            summary.total_inf_count += result.inf_count
+        if result.finite_count == 0:
+            summary.all_non_finite_files.append(file_path.name)
+            continue
+
+        if summary.global_finite_min is None or (
+            result.finite_min is not None and result.finite_min < summary.global_finite_min
+        ):
+            summary.global_finite_min = result.finite_min
+        if summary.global_finite_max is None or (
+            result.finite_max is not None and result.finite_max > summary.global_finite_max
+        ):
+            summary.global_finite_max = result.finite_max
+
+    print("full dataset scan:")
+    print(f"  files scanned: {summary.files_scanned}")
+    print(f"  load failures: {format_issue_examples(summary.load_failures)}")
+    print(f"  non-3D tensors: {format_issue_examples(summary.non_3d_files)}")
+    print(f"  shape mismatches: {format_issue_examples(summary.shape_mismatches)}")
+    print(f"  dtype mismatches: {format_issue_examples(summary.dtype_mismatches)}")
+    print(f"  non-numeric tensors: {format_issue_examples(summary.non_numeric_files)}")
+    print(
+        "  files with NaNs: "
+        f"{format_issue_examples(summary.nan_files)} "
+        f"(total_nan_count={summary.total_nan_count})"
+    )
+    print(
+        "  files with infinities: "
+        f"{format_issue_examples(summary.inf_files)} "
+        f"(total_inf_count={summary.total_inf_count})"
+    )
+    print(
+        "  files with no finite values: "
+        f"{format_issue_examples(summary.all_non_finite_files)}"
+    )
+    print(f"  global finite min: {summary.global_finite_min}")
+    print(f"  global finite max: {summary.global_finite_max}")
+
+    if summary.has_issues():
+        raise ValueError("Dataset inspection failed. See full dataset scan summary above.")
+
+    print("dataset inspection passed with no structural or non-finite value issues")
+    return summary
 
 
 def report_split_sample_counts(files: Sequence[Path], config: dict) -> None:
@@ -222,4 +404,4 @@ if __name__ == "__main__":
         main()
     except Exception as exc:  # pragma: no cover - CLI safeguard
         print(f"error: {exc}", file=sys.stderr)
-        raise
+        sys.exit(1)

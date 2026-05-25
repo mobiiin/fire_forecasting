@@ -325,6 +325,18 @@ def _current_lr(optimizer) -> float:
 	return 0.0
 
 
+def _rename_result_prefix(results: Mapping[str, float], source_prefix: str, target_prefix: str) -> dict[str, float]:
+	"""Rename metric prefixes for reuse across validation and test evaluation."""
+
+	renamed: dict[str, float] = {}
+	for key, value in results.items():
+		if key.startswith(source_prefix):
+			renamed[f"{target_prefix}{key[len(source_prefix):]}"] = float(value)
+		else:
+			renamed[key] = float(value)
+	return renamed
+
+
 def train_model(config_path: str | Path) -> dict[str, Any]:
 	"""Train the ConvLSTM U-Net according to the provided YAML config."""
 
@@ -552,6 +564,79 @@ def train_model(config_path: str | Path) -> dict[str, Any]:
 		"best_checkpoint_path": str(best_checkpoint_path),
 		"training_log_path": str(training_log_path),
 		"final_epoch_summary": final_epoch_summary,
+		"test_results": test_results,
+	}
+
+
+def evaluate_model_on_test_set(
+	config_path: str | Path,
+	checkpoint_path: str | Path | None = None,
+	checkpoint_kind: str = "best",
+) -> dict[str, Any]:
+	"""Load a trained checkpoint and evaluate it on the configured test split."""
+
+	if torch is None:
+		raise ImportError("PyTorch is required to evaluate the ConvLSTM U-Net model.")
+
+	config = _ensure_config_path(load_config(config_path), config_path)
+	logging_config = _get_section(config, "logging")
+
+	log_level = str(logging_config.get("level", "INFO"))
+	log_dir = Path(logging_config.get("log_dir", "./artifacts/logs")).expanduser().resolve()
+	log_dir.mkdir(parents=True, exist_ok=True)
+	logger = setup_logging(log_level, str(log_dir / "test_convlstm_unet.log"))
+
+	train_loader, _, test_loader = create_dataloaders(config)
+	if len(test_loader.dataset) == 0:
+		raise ValueError("Test split is empty; cannot evaluate the model.")
+
+	input_sequence_length = int(config.get("input_sequence_length", 1))
+	output_channels = int(_get_section(config, "model").get("output_channels", 1))
+	input_channels = _infer_input_channels_from_loader(train_loader)
+	device = _get_device(config)
+
+	model = build_model_from_config(config, input_channels=input_channels).to(device)
+	criterion = get_loss_function(config)
+
+	if checkpoint_path is None:
+		latest_checkpoint_path, best_checkpoint_path = _resolve_training_paths(config)
+		checkpoint_selector = str(checkpoint_kind).lower()
+		if checkpoint_selector == "best":
+			resolved_checkpoint_path = best_checkpoint_path
+		elif checkpoint_selector == "latest":
+			resolved_checkpoint_path = latest_checkpoint_path
+		else:
+			raise ValueError(f"checkpoint_kind must be 'best' or 'latest', got {checkpoint_kind!r}.")
+	else:
+		resolved_checkpoint_path = Path(checkpoint_path).expanduser().resolve()
+
+	if not resolved_checkpoint_path.exists():
+		raise FileNotFoundError(f"Checkpoint not found: {resolved_checkpoint_path}")
+
+	logger.info("Loading checkpoint for test evaluation: %s", resolved_checkpoint_path)
+	checkpoint = load_checkpoint(resolved_checkpoint_path, map_location=device)
+	model.load_state_dict(checkpoint["model_state_dict"])
+
+	raw_results = _run_epoch(
+		model=model,
+		loader=test_loader,
+		criterion=criterion,
+		config=config,
+		device=device,
+		input_sequence_length=input_sequence_length,
+		input_channels=input_channels,
+		output_channels=output_channels,
+		train=False,
+	)
+	test_results = _rename_result_prefix(raw_results, "val_", "test_")
+
+	logger.info("Test evaluation complete on %s samples.", len(test_loader.dataset))
+	for metric_name, metric_value in test_results.items():
+		logger.info("%s=%.6f", metric_name, metric_value)
+
+	return {
+		"checkpoint_path": str(resolved_checkpoint_path),
+		"num_test_samples": len(test_loader.dataset),
 		"test_results": test_results,
 	}
 

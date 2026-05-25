@@ -73,6 +73,7 @@ class FireSequenceDataset(Dataset):
 		input_sequence_length: int,
 		prediction_horizon: int,
 		target_channel: int,
+		input_channel_count: int | None = None,
 		task_type: str = "regression",
 		fire_threshold: float = 0.5,
 		use_patches: bool = False,
@@ -88,6 +89,7 @@ class FireSequenceDataset(Dataset):
 		self.input_sequence_length = int(input_sequence_length)
 		self.prediction_horizon = int(prediction_horizon)
 		self.target_channel = int(target_channel)
+		self.input_channel_count = None if input_channel_count is None else int(input_channel_count)
 		self.task_type = str(task_type).lower()
 		self.fire_threshold = float(fire_threshold)
 		self.use_patches = bool(use_patches)
@@ -121,6 +123,12 @@ class FireSequenceDataset(Dataset):
 			)
 
 		self.expected_height, self.expected_width, self.num_channels = first_tensor.shape
+		if self.input_channel_count is None:
+			self.input_channel_count = self.num_channels
+		if self.input_channel_count <= 0 or self.input_channel_count > self.num_channels:
+			raise ValueError(
+				f"input_channel_count must be in [1, {self.num_channels}], got {self.input_channel_count}."
+			)
 		if self.target_channel < 0 or self.target_channel >= self.num_channels:
 			raise ValueError(
 				f"target_channel must be in [0, {self.num_channels - 1}], got {self.target_channel}."
@@ -240,7 +248,7 @@ class FireSequenceDataset(Dataset):
 		for file_path in input_file_paths:
 			tensor = self._load_tensor(file_path)
 			self._validate_tensor_shape(tensor, file_path)
-			input_frames.append(np.asarray(tensor, dtype=np.float32))
+			input_frames.append(np.asarray(tensor[:, :, : self.input_channel_count], dtype=np.float32))
 
 		target_tensor = self._load_tensor(target_file_path)
 		self._validate_tensor_shape(target_tensor, target_file_path)
@@ -263,10 +271,20 @@ class FireSequenceDataset(Dataset):
 			if target_array.shape != (self.patch_size, self.patch_size):
 				raise ValueError("Target patch extraction produced an unexpected shape.")
 		if self.normalization_stats is not None:
+			stats_mean = np.asarray(self.normalization_stats["mean"])
+			stats_std = np.asarray(self.normalization_stats["std"])
+			if stats_mean.shape[0] != self.input_channel_count:
+				if stats_mean.shape[0] < self.input_channel_count:
+					raise ValueError(
+						"Normalization stats have fewer channels than the dataset input slice. "
+						f"Got {stats_mean.shape[0]} stats channels and {self.input_channel_count} input channels."
+					)
+				stats_mean = stats_mean[: self.input_channel_count]
+				stats_std = stats_std[: self.input_channel_count]
 			stacked_inputs = normalize_tensor(
 				stacked_inputs,
-				self.normalization_stats["mean"],
-				self.normalization_stats["std"],
+				stats_mean,
+				stats_std,
 			).astype(np.float32, copy=False)
 
 		stacked_inputs = np.transpose(stacked_inputs, (0, 3, 1, 2))
@@ -333,6 +351,9 @@ def create_dataloaders(config):
 	input_sequence_length = int(config["input_sequence_length"])
 	prediction_horizon = int(config["prediction_horizon"])
 	target_channel = int(config["target_channel"])
+	input_channel_count = int(config.get("input_channel_count", config.get("model", {}).get("input_channels", 0)))
+	if input_channel_count <= 0:
+		raise KeyError("Config must define a positive input_channel_count or model.input_channels.")
 
 	split_indices = chronological_split_indices(
 		num_timesteps=len(files),
@@ -356,6 +377,7 @@ def create_dataloaders(config):
 		"input_sequence_length": input_sequence_length,
 		"prediction_horizon": prediction_horizon,
 		"target_channel": target_channel,
+		"input_channel_count": input_channel_count,
 		"task_type": str(config.get("task_type", config.get("training", {}).get("task_type", "regression"))),
 		"fire_threshold": float(config.get("fire_threshold", config.get("training", {}).get("fire_threshold", 0.5))),
 		"patch_size": int(config.get("patch_size", 64)),
@@ -436,7 +458,7 @@ if __name__ == "__main__":
 	expected_spatial = int(config.get("patch_size", 64)) if bool(config.get("use_patches", False)) else 144
 	assert x_batch.shape[1:] == (
 		int(config["input_sequence_length"]),
-		int(config["model"]["input_channels"]),
+		int(config.get("input_channel_count", config["model"]["input_channels"])),
 		expected_spatial,
 		expected_spatial,
 	), f"Unexpected X batch shape: {tuple(x_batch.shape)}"

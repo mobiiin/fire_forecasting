@@ -125,6 +125,12 @@ Train:
 python scripts/train_convlstm_unet.py --config configs/default.yaml
 ```
 
+Test:
+
+```bash
+python scripts/test_model.py --config configs/default.yaml
+```
+
 Visualize:
 
 ```bash
@@ -177,7 +183,13 @@ python scripts/train_convlstm_unet.py --config configs/default.yaml
 python scripts/visualize_predictions.py --config configs/default.yaml --num_samples 10
 ```
 
-6. Run rollout prediction
+6. Evaluate on test split
+
+```bash
+python scripts/test_model.py --config configs/default.yaml
+```
+
+7. Run rollout prediction
 
 ```bash
 python scripts/rollout_predictions.py --config configs/default.yaml --start_index 0 --rollout_steps 30
@@ -260,4 +272,3 @@ Prediction visualization outputs include:
 4. ConvGRU U-Net (if implemented later)
 5. Attention ConvLSTM U-Net (later)
 6. Patch-based training (later)
-

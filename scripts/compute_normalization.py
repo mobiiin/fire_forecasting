@@ -127,9 +127,13 @@ def main() -> None:
     if not training_indices:
         raise ValueError("No valid training input timestamps were found for normalization.")
 
+    input_channel_count = int(config.get("input_channel_count", config.get("model", {}).get("input_channels", 0)))
+    if input_channel_count <= 0:
+        raise KeyError("Config must define a positive input_channel_count or model.input_channels.")
+
     training_files = [files[index] for index in training_indices]
     eps = float(normalization_config.get("epsilon", 1e-6))
-    stats = compute_channel_stats(training_files, eps=eps)
+    stats = compute_channel_stats(training_files, channel_indices=slice(0, input_channel_count), eps=eps)
 
     output_path = resolve_path(config_path, str(normalization_config["path"]))
     output_path.parent.mkdir(parents=True, exist_ok=True)

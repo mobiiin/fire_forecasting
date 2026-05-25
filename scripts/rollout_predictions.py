@@ -111,6 +111,9 @@ def _build_test_dataset(config: Mapping[str, Any], normalization_stats) -> FireS
 	files = _discover_files(config)
 	input_sequence_length = int(config["input_sequence_length"])
 	prediction_horizon = int(config["prediction_horizon"])
+	input_channel_count = int(config.get("input_channel_count", _get_section(config, "model").get("input_channels", 0)))
+	if input_channel_count <= 0:
+		raise KeyError("Config must define a positive input_channel_count or model.input_channels.")
 	split_indices = chronological_split_indices(
 		num_timesteps=len(files),
 		input_sequence_length=input_sequence_length,
@@ -125,6 +128,7 @@ def _build_test_dataset(config: Mapping[str, Any], normalization_stats) -> FireS
 		input_sequence_length=input_sequence_length,
 		prediction_horizon=prediction_horizon,
 		target_channel=int(config["target_channel"]),
+		input_channel_count=input_channel_count,
 		normalization_stats=normalization_stats,
 		return_metadata=True,
 	)
@@ -195,23 +199,30 @@ def _update_window(
 	predicted_target: np.ndarray,
 	next_true_frame: np.ndarray | None,
 	rollout_mode: str,
-	target_channel: int,
+	input_channel_count: int,
 ) -> np.ndarray:
-	"""Insert the predicted target channel into the next autoregressive frame."""
+	"""Advance the input window using only the model input channels.
+
+	The model is trained on the first ``input_channel_count`` channels, while the
+	target label stays separate and is not fed back into the input state.
+	"""
 
 	if current_window.ndim != 4:
 		raise ValueError(f"Expected current_window shape (T, H, W, C), got {current_window.shape}.")
+	if current_window.shape[-1] != input_channel_count:
+		raise ValueError(
+			f"Expected current_window to have {input_channel_count} channels, got {current_window.shape[-1]}."
+		)
 	if rollout_mode == "teacher_forced_exogenous":
 		if next_true_frame is None:
 			raise ValueError("teacher_forced_exogenous requires a future ground-truth frame.")
-		new_frame = np.asarray(next_true_frame, dtype=np.float32).copy()
+		new_frame = np.asarray(next_true_frame[:, :, :input_channel_count], dtype=np.float32).copy()
 	elif rollout_mode == "constant_exogenous":
-		new_frame = current_window[-1].copy()
+		new_frame = current_window[-1, :, :, :input_channel_count].copy()
 	else:
 		raise ValueError(f"Unsupported rollout_mode: {rollout_mode}")
 
-	new_frame[:, :, target_channel] = np.asarray(predicted_target, dtype=np.float32)
-	updated = np.concatenate([current_window[1:], new_frame[None, ...]], axis=0)
+	updated = np.concatenate([current_window[1:, :, :, :input_channel_count], new_frame[None, ...]], axis=0)
 	if updated.shape != current_window.shape:
 		raise ValueError("Updated rollout window changed shape unexpectedly.")
 	return updated
@@ -256,6 +267,7 @@ def rollout_predictions(
 		raise ValueError("Test split is empty; cannot run rollout visualization.")
 	if start_index < 0 or start_index >= len(test_dataset):
 		raise IndexError(f"start_index must be in [0, {len(test_dataset) - 1}], got {start_index}.")
+	input_channel_count = int(getattr(test_dataset, "input_channel_count", test_dataset.num_channels))
 
 	files = test_dataset.file_paths
 	start_sample_index = int(test_dataset.sample_indices[start_index])
@@ -268,11 +280,13 @@ def rollout_predictions(
 	input_window_files = files[start_sample_index : start_sample_index + input_sequence_length]
 	if len(input_window_files) != input_sequence_length:
 		raise ValueError("Unable to assemble the initial rollout input window.")
-	current_window = np.stack([_load_raw_frame(file_path) for file_path in input_window_files], axis=0)
+	current_window = np.stack([
+		_load_raw_frame(file_path)[:, :, :input_channel_count] for file_path in input_window_files
+	], axis=0)
 	if current_window.ndim != 4:
 		raise ValueError(f"Expected rollout window shape (T, H, W, C), got {current_window.shape}.")
-	if current_window.shape[-1] != test_dataset.num_channels:
-		raise ValueError(f"Expected {test_dataset.num_channels} channels, got {current_window.shape[-1]}.")
+	if current_window.shape[-1] != input_channel_count:
+		raise ValueError(f"Expected {input_channel_count} channels, got {current_window.shape[-1]}.")
 
 	device_setting = str(config.get("device", _get_section(config, "training").get("device", "auto"))).lower()
 	if device_setting == "auto":
@@ -284,7 +298,7 @@ def rollout_predictions(
 	checkpoint_path = _resolve_checkpoint_path(config)
 	logger.info("Loading checkpoint: %s", checkpoint_path)
 	checkpoint = load_checkpoint(checkpoint_path, map_location="cpu")
-	model = _build_model(config, input_channels=test_dataset.num_channels).to(device)
+	model = _build_model(config, input_channels=input_channel_count).to(device)
 	model.load_state_dict(checkpoint["model_state_dict"])
 	model.eval()
 
@@ -376,7 +390,7 @@ def rollout_predictions(
 				predicted_target=predicted_target,
 				next_true_frame=future_true_frame,
 				rollout_mode=rollout_mode,
-				target_channel=target_channel,
+				input_channel_count=input_channel_count,
 			)
 
 	animation_ground_truth = ground_truth_frames if any(frame is not None for frame in ground_truth_frames) else None
