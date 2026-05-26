@@ -26,6 +26,7 @@ except ImportError:  # pragma: no cover - environment-specific fallback
 
 from src.config import load_config
 from src.data.dataset import FireSequenceDataset
+from src.data.preprocessing import inverse_normalize_channel_map as inverse_normalize_scalar_channel_map
 from src.data.preprocessing import load_normalization_stats, normalize_tensor
 from src.data.splits import chronological_split_indices
 from src.models.convlstm_unet import build_model_from_config
@@ -130,6 +131,7 @@ def _build_test_dataset(config: Mapping[str, Any], normalization_stats) -> FireS
 		target_channel=int(config["target_channel"]),
 		input_channel_count=input_channel_count,
 		normalization_stats=normalization_stats,
+		normalize_target=bool(_get_section(config, "normalization").get("normalize_target", False)),
 		return_metadata=True,
 	)
 
@@ -344,6 +346,14 @@ def rollout_predictions(
 				raise ValueError("Model must predict at least one channel.")
 
 			predicted_target = prediction[0, 0].detach().cpu().numpy()
+			if bool(getattr(test_dataset, "normalize_target", False)):
+				if test_dataset.target_mean is None or test_dataset.target_std is None:
+					raise ValueError("Target normalization is enabled, but target stats are unavailable.")
+				predicted_target = inverse_normalize_scalar_channel_map(
+					predicted_target,
+					test_dataset.target_mean,
+					test_dataset.target_std,
+				)
 			rollout_frames.append(np.asarray(predicted_target, dtype=np.float32))
 
 			next_true_frame = None

@@ -18,6 +18,7 @@ except ImportError:  # pragma: no cover - environment-specific fallback
 from src.config import load_config
 from src.data.dataset import FireSequenceDataset
 from src.data.splits import chronological_split_indices
+from src.data.preprocessing import inverse_normalize_channel_map as inverse_normalize_scalar_channel_map
 from src.data.preprocessing import load_normalization_stats
 from src.models.convlstm_unet import build_model_from_config
 from src.training.checkpoints import latest_and_best_checkpoint_paths, load_checkpoint
@@ -120,6 +121,7 @@ def _build_test_dataset(config: Mapping[str, Any], normalization_stats) -> FireS
         task_type=str(config.get("task_type", _get_section(config, "training").get("task_type", "regression"))),
         fire_threshold=float(config.get("fire_threshold", _get_section(config, "training").get("fire_threshold", 0.5))),
         normalization_stats=normalization_stats,
+        normalize_target=bool(_get_section(config, "normalization").get("normalize_target", False)),
         return_metadata=True,
     )
 
@@ -292,6 +294,20 @@ def visualize_predictions(config_path: str | Path, num_samples: int = 10) -> lis
                 predicted_map = predicted[0, 0].detach().cpu().numpy()
                 panel_target_name = "fire intensity"
                 contour_threshold = fire_threshold
+
+            if bool(getattr(test_dataset, "normalize_target", False)):
+                if test_dataset.target_mean is None or test_dataset.target_std is None:
+                    raise ValueError("Target normalization is enabled, but target stats are unavailable.")
+                ground_truth_map = inverse_normalize_scalar_channel_map(
+                    ground_truth_map,
+                    test_dataset.target_mean,
+                    test_dataset.target_std,
+                )
+                predicted_map = inverse_normalize_scalar_channel_map(
+                    predicted_map,
+                    test_dataset.target_mean,
+                    test_dataset.target_std,
+                )
 
             sample_title = f"Sample {sample_index + 1}/{max_samples} | {metadata_dict.get('target_file_path', 'unknown')}"
             output_name = _sample_output_name(metadata_dict)

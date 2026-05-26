@@ -75,6 +75,61 @@ def training_input_file_indices(
     return sorted(training_indices)
 
 
+def training_target_file_indices(
+    num_timesteps: int,
+    input_sequence_length: int,
+    prediction_horizon: int,
+    train_fraction: float,
+    val_fraction: float,
+    test_fraction: float,
+) -> list[int]:
+    """Return raw file indices that appear as training targets only."""
+
+    splits = chronological_split_indices(
+        num_timesteps=num_timesteps,
+        input_sequence_length=input_sequence_length,
+        prediction_horizon=prediction_horizon,
+        train_fraction=train_fraction,
+        val_fraction=val_fraction,
+        test_fraction=test_fraction,
+    )
+
+    target_indices: set[int] = set()
+    for start_index in splits["train"]:
+        target_indices.add(start_index + input_sequence_length - 1 + prediction_horizon)
+
+    return sorted(target_indices)
+
+
+def training_relevant_file_indices(
+    num_timesteps: int,
+    input_sequence_length: int,
+    prediction_horizon: int,
+    train_fraction: float,
+    val_fraction: float,
+    test_fraction: float,
+) -> list[int]:
+    """Return the union of training input and target raw timestamp indices."""
+
+    input_indices = training_input_file_indices(
+        num_timesteps=num_timesteps,
+        input_sequence_length=input_sequence_length,
+        prediction_horizon=prediction_horizon,
+        train_fraction=train_fraction,
+        val_fraction=val_fraction,
+        test_fraction=test_fraction,
+    )
+    target_indices = training_target_file_indices(
+        num_timesteps=num_timesteps,
+        input_sequence_length=input_sequence_length,
+        prediction_horizon=prediction_horizon,
+        train_fraction=train_fraction,
+        val_fraction=val_fraction,
+        test_fraction=test_fraction,
+    )
+    return sorted(set(input_indices).union(target_indices))
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     """Create the command-line interface for normalization computation."""
 
@@ -95,7 +150,7 @@ def main() -> None:
     config_path = Path(args.config).expanduser().resolve()
     config = load_config(config_path)
 
-    for required_key in ("data_dir", "file_pattern", "input_sequence_length", "prediction_horizon", "train_fraction", "val_fraction", "test_fraction"):
+    for required_key in ("data_dir", "file_pattern", "input_sequence_length", "prediction_horizon", "train_fraction", "val_fraction", "test_fraction", "target_channel"):
         if required_key not in config:
             raise KeyError(f"Config is missing required key '{required_key}'.")
 
@@ -126,14 +181,42 @@ def main() -> None:
 
     if not training_indices:
         raise ValueError("No valid training input timestamps were found for normalization.")
+    training_target_indices = training_target_file_indices(
+        num_timesteps=len(files),
+        input_sequence_length=int(config["input_sequence_length"]),
+        prediction_horizon=int(config["prediction_horizon"]),
+        train_fraction=float(config["train_fraction"]),
+        val_fraction=float(config["val_fraction"]),
+        test_fraction=float(config["test_fraction"]),
+    )
+    if not training_target_indices:
+        raise ValueError("No valid training target timestamps were found for normalization.")
+    training_relevant_indices = training_relevant_file_indices(
+        num_timesteps=len(files),
+        input_sequence_length=int(config["input_sequence_length"]),
+        prediction_horizon=int(config["prediction_horizon"]),
+        train_fraction=float(config["train_fraction"]),
+        val_fraction=float(config["val_fraction"]),
+        test_fraction=float(config["test_fraction"]),
+    )
+    if not training_relevant_indices:
+        raise ValueError("No valid training timestamps were found for normalization.")
 
     input_channel_count = int(config.get("input_channel_count", config.get("model", {}).get("input_channels", 0)))
     if input_channel_count <= 0:
         raise KeyError("Config must define a positive input_channel_count or model.input_channels.")
+    target_channel = int(config["target_channel"])
 
-    training_files = [files[index] for index in training_indices]
+    training_files = [files[index] for index in training_relevant_indices]
+    training_target_files = [files[index] for index in training_target_indices]
     eps = float(normalization_config.get("epsilon", 1e-6))
-    stats = compute_channel_stats(training_files, channel_indices=slice(0, input_channel_count), eps=eps)
+    stats = compute_channel_stats(training_files, channel_indices=None, eps=eps)
+    target_stats = compute_channel_stats(training_target_files, channel_indices=slice(target_channel, target_channel + 1), eps=eps)
+    stats["target_mean"] = target_stats["mean"][0]
+    stats["target_std"] = target_stats["std"][0]
+    stats["target_min"] = target_stats["min"][0]
+    stats["target_max"] = target_stats["max"][0]
+    stats["input_channel_count"] = np.asarray(input_channel_count)
 
     output_path = resolve_path(config_path, str(normalization_config["path"]))
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -147,6 +230,12 @@ def main() -> None:
     print(f"global channel mean range: {channel_mean.min():.6g} to {channel_mean.max():.6g}")
     print(f"global channel std range: {channel_std.min():.6g} to {channel_std.max():.6g}")
     print(f"channels with near-zero std: {near_zero_std}")
+    print(f"input_channel_count: {input_channel_count}")
+    print(f"target channel: {target_channel}")
+    print(f"target mean: {float(stats['target_mean']):.6g}")
+    print(f"target std: {float(stats['target_std']):.6g}")
+    print(f"target min: {float(stats['target_min']):.6g}")
+    print(f"target max: {float(stats['target_max']):.6g}")
     print(f"output path: {output_path}")
 
 

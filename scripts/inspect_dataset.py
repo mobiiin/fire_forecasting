@@ -368,6 +368,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(description="Inspect sequential wildfire tensors.")
     parser.add_argument(
+        "--data-dir",
+        type=str,
+        default=None,
+        help=(
+            "Override the dataset directory from the config file. "
+            "Use this when the tensors live somewhere else."
+        ),
+    )
+    parser.add_argument(
         "--config",
         type=str,
         default="configs/default.yaml",
@@ -388,7 +397,8 @@ def main() -> None:
     if "file_pattern" not in config:
         raise KeyError("Config is missing required key 'file_pattern'.")
 
-    data_dir = resolve_path(config_path, str(config["data_dir"]))
+    configured_data_dir = str(config["data_dir"])
+    data_dir = resolve_path(config_path, args.data_dir or configured_data_dir)
     file_pattern = str(config["file_pattern"])
 
     if not data_dir.exists():

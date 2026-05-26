@@ -116,6 +116,32 @@ def normalize_tensor(
 	return (array - mean_array) / safe_std
 
 
+def normalize_channel_map(
+	x: np.ndarray,
+	mean: float | np.ndarray,
+	std: float | np.ndarray,
+) -> np.ndarray:
+	"""Normalize a single 2D channel map with scalar statistics."""
+
+	array = np.asarray(x, dtype=np.float32)
+	mean_value = float(np.asarray(mean, dtype=np.float32))
+	std_value = max(float(np.asarray(std, dtype=np.float32)), 1e-6)
+	return (array - mean_value) / std_value
+
+
+def inverse_normalize_channel_map(
+	x: np.ndarray,
+	mean: float | np.ndarray,
+	std: float | np.ndarray,
+) -> np.ndarray:
+	"""Undo scalar normalization for a single 2D channel map."""
+
+	array = np.asarray(x, dtype=np.float32)
+	mean_value = float(np.asarray(mean, dtype=np.float32))
+	std_value = max(float(np.asarray(std, dtype=np.float32)), 1e-6)
+	return array * std_value + mean_value
+
+
 def load_normalization_stats(path: str | Path) -> dict[str, np.ndarray]:
 	"""Load normalization statistics from a saved ``.npz`` archive."""
 
@@ -130,4 +156,8 @@ def load_normalization_stats(path: str | Path) -> dict[str, np.ndarray]:
 			raise KeyError(
 				f"Normalization archive is missing required key(s): {', '.join(sorted(missing))}"
 			)
-		return {key: data[key] for key in required_keys}
+		stats = {key: data[key] for key in required_keys}
+		for optional_key in ("target_mean", "target_std", "target_min", "target_max"):
+			if optional_key in data.files:
+				stats[optional_key] = data[optional_key]
+		return stats

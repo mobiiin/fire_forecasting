@@ -134,6 +134,7 @@ def _build_datasets(config: Mapping[str, Any], files: list[Path], normalization_
         "task_type": str(config.get("task_type", "regression")),
         "fire_threshold": float(config.get("fire_threshold", 0.5)),
         "normalization_stats": normalization_stats,
+        "normalize_target": bool(config.get("normalization", {}).get("normalize_target", False)),
         "patch_size": int(config.get("patch_size", 64)),
         "active_patch_probability": float(config.get("active_patch_probability", 0.7)),
         "active_threshold": float(config.get("active_threshold", config.get("fire_threshold", 0.5))),

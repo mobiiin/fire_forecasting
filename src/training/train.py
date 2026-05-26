@@ -155,6 +155,23 @@ def _maybe_autocast(enabled: bool):
 	return nullcontext()
 
 
+def _denormalize_target_tensors_for_metrics(loader, y_pred: torch.Tensor, y_true: torch.Tensor):
+	"""Convert normalized regression targets back to raw units for metric reporting."""
+
+	dataset = getattr(loader, "dataset", None)
+	normalize_target = bool(getattr(dataset, "normalize_target", False))
+	target_mean = getattr(dataset, "target_mean", None)
+	target_std = getattr(dataset, "target_std", None)
+	task_type = str(getattr(dataset, "task_type", "regression")).lower()
+
+	if not normalize_target or task_type != "regression" or target_mean is None or target_std is None:
+		return y_pred, y_true
+
+	mean_tensor = torch.as_tensor(float(target_mean), dtype=y_pred.dtype, device=y_pred.device)
+	std_tensor = torch.as_tensor(max(float(target_std), 1e-6), dtype=y_pred.dtype, device=y_pred.device)
+	return y_pred * std_tensor + mean_tensor, y_true * std_tensor + mean_tensor
+
+
 def _run_epoch(
 	model: nn.Module,
 	loader,
@@ -231,7 +248,12 @@ def _run_epoch(
 		total_samples += batch_size
 		total_loss += float(loss.detach().item()) * batch_size
 
-		batch_metrics = compute_metrics(y_pred.detach(), y_batch.detach(), config)
+		metric_prediction, metric_target = _denormalize_target_tensors_for_metrics(
+			loader,
+			y_pred.detach(),
+			y_batch.detach(),
+		)
+		batch_metrics = compute_metrics(metric_prediction, metric_target, config)
 		for metric_name, metric_value in batch_metrics.items():
 			metric_totals[metric_name] += float(metric_value) * batch_size
 

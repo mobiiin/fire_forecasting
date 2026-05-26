@@ -19,7 +19,7 @@ except ImportError:  # pragma: no cover - environment-specific fallback
 
 		pass
 
-from src.data.preprocessing import load_normalization_stats, normalize_tensor
+from src.data.preprocessing import load_normalization_stats, normalize_channel_map, normalize_tensor
 from src.data.splits import chronological_split_indices
 
 
@@ -81,6 +81,7 @@ class FireSequenceDataset(Dataset):
 		active_patch_probability: float = 0.7,
 		active_threshold: float = 0.0,
 		normalization_stats: Mapping[str, np.ndarray] | str | Path | None = None,
+		normalize_target: bool = False,
 		transform=None,
 		target_transform=None,
 		return_metadata: bool = False,
@@ -99,6 +100,7 @@ class FireSequenceDataset(Dataset):
 		self.transform = transform
 		self.target_transform = target_transform
 		self.return_metadata = bool(return_metadata)
+		self.normalize_target = bool(normalize_target)
 
 		if self.input_sequence_length <= 0:
 			raise ValueError(
@@ -171,6 +173,7 @@ class FireSequenceDataset(Dataset):
 			)
 
 		self.normalization_stats = self._coerce_normalization_stats(normalization_stats)
+		self.target_mean, self.target_std = self._resolve_target_normalization_stats()
 
 	def _coerce_normalization_stats(
 		self,
@@ -192,7 +195,33 @@ class FireSequenceDataset(Dataset):
 				f"Normalization stats are missing required key(s): {', '.join(sorted(missing))}"
 			)
 
-		return {key: np.asarray(stats[key]) for key in required_keys}
+		normalized_stats = {key: np.asarray(stats[key]) for key in required_keys}
+		for optional_key in ("target_mean", "target_std", "target_min", "target_max"):
+			if optional_key in stats:
+				normalized_stats[optional_key] = np.asarray(stats[optional_key])
+		return normalized_stats
+
+	def _resolve_target_normalization_stats(self) -> tuple[float | None, float | None]:
+		"""Resolve scalar stats for target normalization when enabled."""
+
+		if self.normalization_stats is None or not self.normalize_target or self.task_type != "regression":
+			return None, None
+
+		stats_mean = np.asarray(self.normalization_stats["mean"])
+		stats_std = np.asarray(self.normalization_stats["std"])
+		if self.target_channel < stats_mean.shape[0] and self.target_channel < stats_std.shape[0]:
+			return float(stats_mean[self.target_channel]), float(stats_std[self.target_channel])
+
+		if "target_mean" in self.normalization_stats and "target_std" in self.normalization_stats:
+			return (
+				float(np.asarray(self.normalization_stats["target_mean"])),
+				float(np.asarray(self.normalization_stats["target_std"])),
+			)
+
+		raise ValueError(
+			"Target normalization was requested, but normalization stats do not include "
+			f"target channel {self.target_channel}. Recompute normalization stats with target stats enabled."
+		)
 
 	def _load_tensor(self, file_path: Path) -> np.ndarray:
 		"""Load a single tensor from disk with validation-friendly settings."""
@@ -286,6 +315,12 @@ class FireSequenceDataset(Dataset):
 				stats_mean,
 				stats_std,
 			).astype(np.float32, copy=False)
+		if self.target_mean is not None and self.target_std is not None:
+			target_array = normalize_channel_map(
+				target_array,
+				self.target_mean,
+				self.target_std,
+			).astype(np.float32, copy=False)
 
 		stacked_inputs = np.transpose(stacked_inputs, (0, 3, 1, 2))
 		stacked_inputs = np.ascontiguousarray(stacked_inputs, dtype=np.float32)
@@ -367,6 +402,7 @@ def create_dataloaders(config):
 	normalization_stats = None
 	normalization_config = config.get("normalization", {})
 	normalization_path = normalization_config.get("path")
+	normalize_target = bool(normalization_config.get("normalize_target", False))
 	if normalization_path:
 		resolved_normalization_path = _resolve_path(config_path, normalization_path)
 		if resolved_normalization_path.exists():
@@ -384,6 +420,7 @@ def create_dataloaders(config):
 		"active_patch_probability": float(config.get("active_patch_probability", 0.7)),
 		"active_threshold": float(config.get("active_threshold", config.get("fire_threshold", 0.5))),
 		"normalization_stats": normalization_stats,
+		"normalize_target": normalize_target,
 	}
 	use_train_patches = bool(config.get("use_patches", False))
 	use_eval_patches = bool(config.get("use_patches_for_eval", False))

@@ -95,11 +95,19 @@ Inspect data:
 python scripts/inspect_dataset.py --config configs/default.yaml
 ```
 
+Inspect selected target channels:
+
+```bash
+python scripts/inspect_target_channels.py --config configs/default.yaml --channels 50 51 52 53 54 55 --timesteps 0 100 500 1000 2000 3000
+```
+
 Compute normalization:
 
 ```bash
 python scripts/compute_normalization.py --config configs/default.yaml
 ```
+
+If `normalization.normalize_target: true`, rerun this after config or dataset changes so the archive includes target-channel stats as well as input-channel stats.
 
 Sanity check:
 
@@ -129,6 +137,12 @@ Test:
 
 ```bash
 python scripts/test_model.py --config configs/default.yaml
+```
+
+Evaluate persistence baseline:
+
+```bash
+python scripts/evaluate_persistence_baseline.py --config configs/default.yaml
 ```
 
 Visualize:
