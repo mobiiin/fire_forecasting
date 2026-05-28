@@ -23,17 +23,6 @@ This project trains a spatiotemporal deep learning model to predict future wildf
 	- continuous fire intensity (regression), or
 	- binary fire perimeter/fire mask (segmentation).
 
-## Repository Structure
-Expected project layout:
-
-```text
-fire_forecasting/
-	configs/
-	src/
-	scripts/
-	outputs/
-	data/
-```
 
 ## Conda Environment Setup
 Create and activate the environment before running any scripts:
@@ -45,16 +34,6 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-## GPU / CUDA Note
-PyTorch installation may need to be adjusted for your CUDA version.
-
-Quick check:
-
-```bash
-python -c "import torch; print(torch.__version__); print(torch.cuda.is_available())"
-```
-
-If CUDA is not available but you expected GPU usage, install a CUDA-compatible PyTorch build for your system.
 
 ## Configuration
 Main config file: `configs/default.yaml`

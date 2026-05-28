@@ -58,6 +58,25 @@ def _resolve_data_path(data_root, filename):
     return os.path.join(data_root, filename)
 
 
+def _pool_2d_channel(channel_2d, pool_window, pooling_mode):
+    """Pool a single 2D channel using non-overlapping windows."""
+    h, w = channel_2d.shape
+    ph, pw = pool_window
+
+    if h % ph != 0 or w % pw != 0:
+        raise ValueError("Channel shape is not divisible by the pooling window size.")
+
+    reshaped_for_pooling = channel_2d.reshape(h // ph, ph, w // pw, pw)
+
+    if pooling_mode == "average":
+        return reshaped_for_pooling.mean(axis=(1, 3))
+    if pooling_mode == "max":
+        return reshaped_for_pooling.max(axis=(1, 3))
+    if pooling_mode == "sum":
+        return reshaped_for_pooling.sum(axis=(1, 3))
+    raise ValueError("pooling_mode must be one of: average, max, sum.")
+
+
 def average_pool_fuel(
     input_filepath,
     initial_shape=(360, 360, 2),
@@ -88,32 +107,30 @@ def average_pool_fuel(
         )
         _raise_if_non_finite(flat_data, "Raw fuel text data", input_filepath)
 
-        num_elements = np.prod(initial_shape)
-        if flat_data.size < num_elements:
-            raise ValueError(f"File requires {num_elements} elements, but only found {flat_data.size}.")
-
-        initial_tensor = flat_data[:num_elements].reshape(initial_shape)
-        print(f"✅ Data reshaped to initial shape: {initial_tensor.shape}")
-        _raise_if_non_finite(initial_tensor, "Fuel tensor after reshape", input_filepath)
-
         h, w, c = initial_shape
-        ph, pw = pool_window
+        if c != 2:
+            raise ValueError(f"Fuel tensors are expected to have exactly 2 channels, got {c}.")
 
-        if h % ph != 0 or w % pw != 0:
-            raise ValueError("Initial shape is not divisible by the pooling window size.")
+        channel_size = h * w
+        required_elements = channel_size * c
+        if flat_data.size < required_elements:
+            raise ValueError(
+                f"File requires {required_elements} elements, but only found {flat_data.size}."
+            )
 
-        print(f"⏳ Performing {ph}x{pw} {pooling_mode} pooling...")
+        surface_flat = flat_data[:channel_size]
+        canopy_flat = flat_data[channel_size:required_elements]
 
-        reshaped_for_pooling = initial_tensor.reshape(h // ph, ph, w // pw, pw, c)
+        surface_tensor = surface_flat.reshape((h, w), order="C")
+        canopy_tensor = canopy_flat.reshape((h, w), order="C")
+        print(f"✅ Fuel channels reshaped to: surface={surface_tensor.shape}, canopy={canopy_tensor.shape}")
+        _raise_if_non_finite(surface_tensor, "Surface fuel tensor after reshape", input_filepath)
+        _raise_if_non_finite(canopy_tensor, "Canopy fuel tensor after reshape", input_filepath)
 
-        if pooling_mode == "average":
-            pooled_tensor = reshaped_for_pooling.mean(axis=(1, 3))
-        elif pooling_mode == "max":
-            pooled_tensor = reshaped_for_pooling.max(axis=(1, 3))
-        elif pooling_mode == "sum":
-            pooled_tensor = reshaped_for_pooling.sum(axis=(1, 3))
-        else:
-            raise ValueError("pooling_mode must be one of: average, max, sum.")
+        print(f"⏳ Performing {pool_window[0]}x{pool_window[1]} {pooling_mode} pooling...")
+        pooled_surface = _pool_2d_channel(surface_tensor, pool_window, pooling_mode)
+        pooled_canopy = _pool_2d_channel(canopy_tensor, pool_window, pooling_mode)
+        pooled_tensor = np.stack((pooled_surface, pooled_canopy), axis=2)
 
         _raise_if_non_finite(pooled_tensor, "Fuel tensor after pooling", input_filepath)
         _print_tensor_summary(pooled_tensor, "fuel_tensor")
@@ -142,7 +159,9 @@ def load_asc_tensor(
         if keep_z_levels < 1 or keep_z_levels > max_z_levels:
             raise ValueError(f"keep_z_levels must be between 1 and {max_z_levels}, got {keep_z_levels}.")
 
-        total_elements = x_size * y_size * keep_z_levels * field_count
+        channel_size = x_size * y_size
+        z_level_size = channel_size * field_count
+        total_elements = z_level_size * keep_z_levels
         print(f"⏳ Loading ASC data from '{input_filepath}'...")
         flat_data = _load_flat_text_data(
             input_filepath=input_filepath,
@@ -160,7 +179,27 @@ def load_asc_tensor(
             print(f"⚠️  ASC file is short by {missing} value(s); padding the tail with zeros.")
             flat_data = np.pad(flat_data, (0, missing), mode='constant', constant_values=0)
 
-        asc_tensor = flat_data[:total_elements].reshape((x_size, y_size, keep_z_levels, field_count))
+        asc_levels = []
+        for z_index in range(keep_z_levels):
+            z_start = z_index * z_level_size
+            z_end = z_start + z_level_size
+            z_flat = flat_data[z_start:z_end]
+
+            level_fields = []
+            for field_index in range(field_count):
+                field_start = field_index * channel_size
+                field_end = field_start + channel_size
+                field_tensor = z_flat[field_start:field_end].reshape((x_size, y_size), order="C")
+                _raise_if_non_finite(
+                    field_tensor,
+                    f"ASC field {field_index + 1} tensor at z-level {z_index + 1} after reshape",
+                    input_filepath,
+                )
+                level_fields.append(field_tensor)
+
+            asc_levels.append(np.stack(level_fields, axis=2))
+
+        asc_tensor = np.stack(asc_levels, axis=2)
         _raise_if_non_finite(asc_tensor, "ASC tensor after reshape", input_filepath)
         _print_tensor_summary(asc_tensor, "asc_tensor")
         print(f"✅ ASC tensor shape: {asc_tensor.shape}")
@@ -182,7 +221,12 @@ def load_flux_tensor(
 ):
     """Load the flux file into a 3D tensor with one channel per flux field."""
     try:
-        total_elements = np.prod(target_shape)
+        h, w, c = target_shape
+        if c != 4:
+            raise ValueError(f"Flux tensors are expected to have exactly 4 channels, got {c}.")
+
+        channel_size = h * w
+        total_elements = channel_size * c
         print(f"⏳ Loading flux data from '{input_filepath}'...")
         flat_data = _load_flat_text_data(
             input_filepath=input_filepath,
@@ -196,7 +240,19 @@ def load_flux_tensor(
                 f"Flux file has {flat_data.size} numbers, but {total_elements} are needed for shape {target_shape}."
             )
 
-        flux_tensor = flat_data[:total_elements].reshape(target_shape)
+        flux_channels = []
+        for channel_index in range(c):
+            start = channel_index * channel_size
+            end = start + channel_size
+            channel_tensor = flat_data[start:end].reshape((h, w), order="C")
+            _raise_if_non_finite(
+                channel_tensor,
+                f"Flux channel {channel_index + 1} tensor after reshape",
+                input_filepath,
+            )
+            flux_channels.append(channel_tensor)
+
+        flux_tensor = np.stack(flux_channels, axis=2)
         _raise_if_non_finite(flux_tensor, "Flux tensor after reshape", input_filepath)
         _print_tensor_summary(flux_tensor, "flux_tensor")
         print(f"✅ Flux tensor shape: {flux_tensor.shape}")

@@ -55,8 +55,13 @@ That means:
 - 144 cells in Y direction
 - 46 cells in Z direction
 - 10 atmospheric variables
+The unpacking follows the same explicit channel-split style used for the flux and fuel files:
 
-In other words, each of the 10 variables has values on a 144 x 144 x 46 3D grid.
+- the flat ASC list is divided into 46 consecutive z-level blocks
+- each z-level block is divided into 10 consecutive field blocks
+- each field block is reshaped into a 144 x 144 matrix with `order="C"`
+
+In other words, each of the 10 variables has values on a 144 x 144 x 46 3D grid, but the raw list is unpacked as 46 z-level groups of 10 two-dimensional matrices.
 
 ## Flux file: `KINGNSM04ASC.flux.xxxx`
 
