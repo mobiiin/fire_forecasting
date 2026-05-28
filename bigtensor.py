@@ -340,7 +340,7 @@ def merge_timestamp(
     
 
 def process_all_files(
-    keep_z_levels_list=(5,),
+    keep_z_levels_list=(8,),
     start_ts=286,
     end_ts=1999,
     output_root="tensors",
@@ -389,7 +389,7 @@ def process_all_files(
             print(f"🎉 Saved tensor for timestamp {ts:04d} with keep_z_levels={keep_z_levels}.")
 
 
-def process_single_version(keep_z_levels=5, start_ts=286, end_ts=1999):
+def process_single_version(keep_z_levels=8, start_ts=286, end_ts=1999):
     """Backward-compatible wrapper for a single dataset version."""
     process_all_files(
         keep_z_levels_list=(keep_z_levels,),
@@ -409,7 +409,7 @@ def build_argument_parser():
         "--keep-z-levels",
         nargs="+",
         type=int,
-        default=[5],
+        default=[8],
         help="One or more z-depths to keep from the 46-level ASC file, e.g. --keep-z-levels 5 10 15.",
     )
     parser.add_argument(

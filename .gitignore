@@ -12,7 +12,7 @@ tensors/
 artifacts/
 outputs/
 configs/artifacts/
-
+fuel_layout_diagnostics/
 
 # Raw simulation outputs and large derived files
 KINGNSM04ASC.*

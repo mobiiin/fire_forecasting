@@ -1,10 +1,10 @@
-data_dir: ../keepz_05
+data_dir: ../keepz_08
 file_pattern: "*.npy"
 input_sequence_length: 6
 prediction_horizon: 1
-target_channel: 55
-input_channel_count: 50
-task_type: regression
+target_channel: 84
+
+task_type: multitask
 fire_threshold: 0.5
 use_patches: false
 use_patches_for_eval: false
@@ -16,25 +16,66 @@ val_fraction: 0.15
 test_fraction: 0.15
 batch_size: 4
 learning_rate: 0.0001
-epochs: 10
+epochs: 50
 num_workers: 4
 device: auto
 
+input_channel_count: 86
+input_channel_indices: null
+
+channel_layout:
+  atmospheric_channels: [0, 79]
+  flux_channels: [80, 81, 82, 83]
+  fuel_channels: [84, 85]
+  surface_fuel_channel: 84
+  canopy_fuel_channel: 85
+  flux_mask_channel: 80
+
+engineered_features:
+  enabled: true
+  add_flux_delta: true
+  add_fuel_delta: true
+  add_step_consumed_fuel: true
+  add_cumulative_consumed_fuel: true
+  initial_fuel_mode: first_dataset_frame
+  clamp_consumed_fuel_nonnegative: true
+
+multitask:
+  output_mode: surface_canopy_consumed_plus_mask
+  surface_fuel_channel: 84
+  canopy_fuel_channel: 85
+  flux_mask_channel: 80
+  mask_target_type: active_flux
+  flux_fire_threshold: 0.05
+  consumed_fuel_threshold: 0.01
+  clamp_consumed_fuel_targets_nonnegative: true
+  regression_loss: weighted_huber
+  segmentation_loss: bce_dice
+  surface_loss_weight: 1.0
+  canopy_loss_weight: 1.0
+  segmentation_loss_weight: 1.0
+  active_fire_weight: 10.0
+  background_weight: 1.0
+
+target_normalization:
+  enabled: false
+  method: zscore
+
 model:
   name: convlstm_unet
-  input_channels: 50
-  hidden_channels: [32, 64, 128]
+  input_channels: 96
+  hidden_dim: 64
   kernel_size: 3
   num_layers: 1
   dropout: 0.0
-  output_channels: 1
-  bidirectional: false
+  output_channels: 3
+  output_activation: null
 
 normalization:
   path: ./artifacts/normalization_stats.npz
   method: zscore
   epsilon: 1.0e-06
-  normalize_target: true
+  normalize_target: false
 
 checkpoint:
   path: ./artifacts/checkpoints/convlstm_unet.pt
@@ -42,7 +83,7 @@ checkpoint:
   monitor: val_loss
 
 visualization:
-  output_path: ./outputs/visualizations
+  output_path: ./outputs/visualizations_multitask
   cmap: inferno
   dpi: 150
   target_threshold: 0.5

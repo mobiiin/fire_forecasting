@@ -117,6 +117,10 @@ def build_model_from_config(config, input_channels: int):
 	"""Build a ``ConvLSTMUNet`` from a configuration dictionary."""
 
 	model_config = config.get("model", config)
+	task_type = str(config.get("task_type", model_config.get("task_type", "regression"))).lower()
+	output_activation = model_config.get("output_activation")
+	if task_type == "multitask":
+		output_activation = None
 	return ConvLSTMUNet(
 		input_channels=input_channels,
 		output_channels=int(model_config.get("output_channels", 1)),
@@ -126,7 +130,7 @@ def build_model_from_config(config, input_channels: int):
 		unet_base_channels=int(model_config.get("unet_base_channels", 64)),
 		unet_depth=int(model_config.get("unet_depth", 4)),
 		dropout=float(model_config.get("dropout", 0.0)),
-		output_activation=model_config.get("output_activation"),
+		output_activation=output_activation,
 	)
 
 

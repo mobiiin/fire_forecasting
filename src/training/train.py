@@ -11,6 +11,14 @@ from pathlib import Path
 from typing import Any, Mapping
 
 try:
+	import matplotlib
+	matplotlib.use("Agg", force=True)
+	import matplotlib.pyplot as plt
+except ImportError:  # pragma: no cover - environment-specific fallback
+	matplotlib = None
+	plt = None
+
+try:
 	from tqdm.auto import tqdm  # type: ignore[import-not-found]
 except ImportError:  # pragma: no cover - environment-specific fallback
 	tqdm = None
@@ -164,12 +172,51 @@ def _denormalize_target_tensors_for_metrics(loader, y_pred: torch.Tensor, y_true
 	target_std = getattr(dataset, "target_std", None)
 	task_type = str(getattr(dataset, "task_type", "regression")).lower()
 
-	if not normalize_target or task_type != "regression" or target_mean is None or target_std is None:
+	if not normalize_target or target_mean is None or target_std is None:
 		return y_pred, y_true
 
-	mean_tensor = torch.as_tensor(float(target_mean), dtype=y_pred.dtype, device=y_pred.device)
-	std_tensor = torch.as_tensor(max(float(target_std), 1e-6), dtype=y_pred.dtype, device=y_pred.device)
-	return y_pred * std_tensor + mean_tensor, y_true * std_tensor + mean_tensor
+	if task_type == "regression":
+		mean_tensor = torch.as_tensor(float(target_mean), dtype=y_pred.dtype, device=y_pred.device)
+		std_tensor = torch.as_tensor(max(float(target_std), 1e-6), dtype=y_pred.dtype, device=y_pred.device)
+		return y_pred * std_tensor + mean_tensor, y_true * std_tensor + mean_tensor
+
+	if task_type == "multitask":
+		mean_array = torch.as_tensor(target_mean, dtype=y_pred.dtype, device=y_pred.device).reshape(1, -1, 1, 1)
+		std_array = torch.as_tensor(target_std, dtype=y_pred.dtype, device=y_pred.device).reshape(1, -1, 1, 1)
+		std_array = torch.clamp(std_array, min=1e-6)
+		y_pred = y_pred.clone()
+		y_true = y_true.clone()
+		regression_channels = min(int(mean_array.shape[1]), 2)
+		y_pred[:, :regression_channels] = y_pred[:, :regression_channels] * std_array[:, :regression_channels] + mean_array[:, :regression_channels]
+		y_true[:, :regression_channels] = y_true[:, :regression_channels] * std_array[:, :regression_channels] + mean_array[:, :regression_channels]
+		return y_pred, y_true
+
+	return y_pred, y_true
+
+
+def _coerce_loss_result(loss_result: Any) -> tuple[torch.Tensor, dict[str, float]]:
+	"""Normalize a loss-module output into a scalar loss tensor plus loggable components."""
+
+	if torch is None:
+		raise ImportError("PyTorch is required to process training losses.")
+	if torch.is_tensor(loss_result):
+		return loss_result, {}
+	if isinstance(loss_result, Mapping):
+		if "total_loss" not in loss_result:
+			raise KeyError("Loss mapping outputs must include a 'total_loss' tensor.")
+		total_loss = loss_result["total_loss"]
+		if not torch.is_tensor(total_loss):
+			raise TypeError("loss_result['total_loss'] must be a tensor.")
+		components: dict[str, float] = {}
+		for key, value in loss_result.items():
+			if key == "total_loss":
+				continue
+			if torch.is_tensor(value):
+				components[str(key)] = float(value.detach().item())
+			else:
+				components[str(key)] = float(value)
+		return total_loss, components
+	raise TypeError(f"Unsupported loss result type: {type(loss_result)!r}.")
 
 
 def _run_epoch(
@@ -195,6 +242,7 @@ def _run_epoch(
 	total_samples = 0
 	total_loss = 0.0
 	metric_totals: dict[str, float] = defaultdict(float)
+	loss_component_totals: dict[str, float] = defaultdict(float)
 	progress_bar = tqdm(loader, desc=desc, total=len(loader), leave=False) if tqdm is not None else loader
 
 	for batch in progress_bar:
@@ -228,7 +276,8 @@ def _run_epoch(
 						f"Model output channels {y_pred.shape[1]} do not match target channels {y_batch.shape[1]}."
 					)
 
-				loss = criterion(y_pred, y_batch)
+				loss_result = criterion(y_pred, y_batch)
+				loss, batch_loss_components = _coerce_loss_result(loss_result)
 
 			if train:
 				if scaler is not None and mixed_precision:
@@ -247,6 +296,8 @@ def _run_epoch(
 		batch_size = int(x_batch.shape[0])
 		total_samples += batch_size
 		total_loss += float(loss.detach().item()) * batch_size
+		for component_name, component_value in batch_loss_components.items():
+			loss_component_totals[component_name] += float(component_value) * batch_size
 
 		metric_prediction, metric_target = _denormalize_target_tensors_for_metrics(
 			loader,
@@ -259,6 +310,8 @@ def _run_epoch(
 
 		if tqdm is not None and hasattr(progress_bar, "set_postfix"):
 			postfix = {"loss": f"{float(loss.detach().item()):.5f}"}
+			for component_name, component_value in batch_loss_components.items():
+				postfix[component_name] = f"{float(component_value):.5f}"
 			for metric_name, metric_value in batch_metrics.items():
 				postfix[metric_name] = f"{float(metric_value):.5f}"
 			progress_bar.set_postfix(postfix)
@@ -267,6 +320,8 @@ def _run_epoch(
 		raise ValueError(f"The {desc} DataLoader produced no samples.")
 
 	results = {f"{desc}_loss": total_loss / total_samples}
+	for component_name, total_value in loss_component_totals.items():
+		results[f"{desc}_{component_name}"] = total_value / total_samples
 	for metric_name, total_value in metric_totals.items():
 		results[f"{desc}_{metric_name}"] = total_value / total_samples
 	return results
@@ -359,6 +414,156 @@ def _rename_result_prefix(results: Mapping[str, float], source_prefix: str, targ
 	return renamed
 
 
+def _coerce_history_rows(raw_history: Any) -> list[dict[str, float | int]]:
+	"""Normalize checkpointed training history into a list of numeric row dictionaries."""
+
+	if not isinstance(raw_history, list):
+		return []
+
+	history_rows: list[dict[str, float | int]] = []
+	for raw_row in raw_history:
+		if not isinstance(raw_row, dict):
+			continue
+
+		row: dict[str, float | int] = {}
+		for key, value in raw_row.items():
+			if isinstance(value, bool):
+				row[str(key)] = int(value)
+			elif isinstance(value, int):
+				row[str(key)] = value
+			elif isinstance(value, float):
+				row[str(key)] = float(value)
+		if row:
+			history_rows.append(row)
+
+	return history_rows
+
+
+def _select_plot_metric_name(
+	history_rows: list[dict[str, float | int]],
+	test_results: Mapping[str, float],
+) -> str | None:
+	"""Choose the most useful non-loss metric to show beside the loss curves."""
+
+	available_metrics: set[str] = set()
+	for row in history_rows:
+		for key in row:
+			if key.startswith(("train_", "val_")) and not key.endswith("loss"):
+				available_metrics.add(key.split("_", 1)[1])
+
+	for key in test_results:
+		if key.startswith("test_") and not key.endswith("loss"):
+			available_metrics.add(key.split("_", 1)[1])
+
+	preferred_metrics = (
+		"accuracy",
+		"mask_dice",
+		"mask_iou",
+		"surface_consumed_mae",
+		"canopy_consumed_mae",
+		"iou",
+		"dice",
+		"precision",
+		"recall",
+		"rmse",
+		"mae",
+		"active_region_mae",
+		"active_mae",
+	)
+	for metric_name in preferred_metrics:
+		if metric_name in available_metrics:
+			return metric_name
+
+	if not available_metrics:
+		return None
+	return sorted(available_metrics)[0]
+
+
+def _save_training_curves_figure(
+	checkpoint_path: Path,
+	history_rows: list[dict[str, float | int]],
+	test_results: Mapping[str, float],
+) -> Path | None:
+	"""Save a train/validation/test loss-and-metric figure beside a checkpoint."""
+
+	if plt is None or not history_rows:
+		return None
+
+	epochs = [int(row["epoch"]) for row in history_rows if "epoch" in row]
+	if not epochs:
+		return None
+
+	plot_path = checkpoint_path.with_name(f"{checkpoint_path.stem}_training_curves.png")
+	plot_path.parent.mkdir(parents=True, exist_ok=True)
+
+	fig, axes = plt.subplots(1, 2, figsize=(14, 5), dpi=150, constrained_layout=True)
+
+	loss_axis = axes[0]
+	train_losses = [float(row["train_loss"]) for row in history_rows if "train_loss" in row]
+	val_losses = [float(row["val_loss"]) for row in history_rows if "val_loss" in row]
+	if train_losses:
+		loss_axis.plot(epochs[: len(train_losses)], train_losses, color="tab:blue", linewidth=2.0, label="Train loss")
+	if val_losses:
+		loss_axis.plot(epochs[: len(val_losses)], val_losses, color="tab:orange", linewidth=2.0, label="Validation loss")
+	if "test_loss" in test_results:
+		loss_axis.axhline(
+			float(test_results["test_loss"]),
+			color="tab:green",
+			linestyle="--",
+			linewidth=1.8,
+			label="Test loss",
+		)
+	loss_axis.set_title("Loss")
+	loss_axis.set_xlabel("Epoch")
+	loss_axis.set_ylabel("Loss")
+	loss_axis.grid(True, alpha=0.3)
+	loss_axis.legend()
+
+	metric_axis = axes[1]
+	metric_name = _select_plot_metric_name(history_rows, test_results)
+	if metric_name is None:
+		metric_axis.axis("off")
+		metric_axis.text(
+			0.5,
+			0.5,
+			"No accuracy or metric history available.",
+			ha="center",
+			va="center",
+			fontsize=11,
+		)
+	else:
+		train_metric_key = f"train_{metric_name}"
+		val_metric_key = f"val_{metric_name}"
+		test_metric_key = f"test_{metric_name}"
+
+		train_metric = [float(row[train_metric_key]) for row in history_rows if train_metric_key in row]
+		val_metric = [float(row[val_metric_key]) for row in history_rows if val_metric_key in row]
+		if train_metric:
+			metric_axis.plot(epochs[: len(train_metric)], train_metric, color="tab:blue", linewidth=2.0, label=f"Train {metric_name}")
+		if val_metric:
+			metric_axis.plot(epochs[: len(val_metric)], val_metric, color="tab:orange", linewidth=2.0, label=f"Validation {metric_name}")
+		if test_metric_key in test_results:
+			metric_axis.axhline(
+				float(test_results[test_metric_key]),
+				color="tab:green",
+				linestyle="--",
+				linewidth=1.8,
+				label=f"Test {metric_name}",
+			)
+		if metric_name == "accuracy":
+			metric_axis.set_ylim(0.0, 1.0)
+		metric_axis.set_title("Accuracy" if metric_name == "accuracy" else metric_name.replace("_", " ").title())
+		metric_axis.set_xlabel("Epoch")
+		metric_axis.set_ylabel("Score")
+		metric_axis.grid(True, alpha=0.3)
+		metric_axis.legend()
+
+	fig.suptitle("Training History", fontsize=14)
+	fig.savefig(plot_path, bbox_inches="tight")
+	plt.close(fig)
+	return plot_path
+
+
 def train_model(config_path: str | Path) -> dict[str, Any]:
 	"""Train the ConvLSTM U-Net according to the provided YAML config."""
 
@@ -413,6 +618,7 @@ def train_model(config_path: str | Path) -> dict[str, Any]:
 	start_epoch = 0
 	best_val_loss = math.inf
 	resumed_from_checkpoint = False
+	history_rows: list[dict[str, float | int]] = []
 
 	if resume_enabled and latest_checkpoint_path.exists():
 		logger.info("Resuming from checkpoint: %s", latest_checkpoint_path)
@@ -425,17 +631,10 @@ def train_model(config_path: str | Path) -> dict[str, Any]:
 		start_epoch = int(checkpoint.get("epoch", -1)) + 1
 		best_val_loss = float(checkpoint.get("best_val_loss", math.inf))
 		resumed_from_checkpoint = True
+		history_rows = _coerce_history_rows(checkpoint.get("history", []))
 
 	if start_epoch >= epochs:
-		logger.info("Checkpoint already covers requested epochs (%s). Skipping training.", epochs)
-		return {
-			"start_epoch": start_epoch,
-			"epochs": epochs,
-			"best_val_loss": best_val_loss,
-			"latest_checkpoint_path": str(latest_checkpoint_path),
-			"best_checkpoint_path": str(best_checkpoint_path),
-			"resumed_from_checkpoint": resumed_from_checkpoint,
-		}
+		logger.info("Checkpoint already covers requested epochs (%s). Skipping training and running final evaluation.", epochs)
 
 	training_log_path = Path("outputs/training_log.csv").resolve()
 	training_log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -454,7 +653,7 @@ def train_model(config_path: str | Path) -> dict[str, Any]:
 		float(config.get("active_threshold", config.get("fire_threshold", 0.5))),
 	)
 
-	final_epoch_summary: dict[str, Any] = {}
+	final_epoch_summary: dict[str, Any] = dict(history_rows[-1]) if history_rows else {}
 	for epoch_index in range(start_epoch, epochs):
 		epoch_number = epoch_index + 1
 		logger.info("Epoch %s/%s", epoch_number, epochs)
@@ -492,7 +691,27 @@ def train_model(config_path: str | Path) -> dict[str, Any]:
 		else:
 			scheduler.step()
 
-		if val_loss < best_val_loss:
+		next_best_val_loss = min(best_val_loss, val_loss)
+		row = {
+			"epoch": epoch_number,
+			"learning_rate": _current_lr(optimizer),
+			"train_loss": train_results["train_loss"],
+			"val_loss": val_results["val_loss"],
+			"best_val_loss": next_best_val_loss,
+			"use_patches_train": int(bool(config.get("use_patches", False))),
+			"use_patches_eval": int(bool(config.get("use_patches_for_eval", False))),
+			"patch_size": int(config.get("patch_size", 64)),
+		}
+		for metric_name, metric_value in train_results.items():
+			if metric_name != "train_loss":
+				row[metric_name] = metric_value
+		for metric_name, metric_value in val_results.items():
+			if metric_name != "val_loss":
+				row[metric_name] = metric_value
+
+		history_rows.append(row)
+		is_best_epoch = val_loss < best_val_loss
+		if is_best_epoch:
 			best_val_loss = val_loss
 			save_checkpoint(
 				best_checkpoint_path,
@@ -504,6 +723,7 @@ def train_model(config_path: str | Path) -> dict[str, Any]:
 				best_val_loss=best_val_loss,
 				input_channels=input_channels,
 				resumed_from_checkpoint=resumed_from_checkpoint,
+				history=history_rows,
 			)
 			if not best_checkpoint_path.exists():
 				raise RuntimeError(f"Best checkpoint was not created at: {best_checkpoint_path}")
@@ -518,26 +738,10 @@ def train_model(config_path: str | Path) -> dict[str, Any]:
 			best_val_loss=best_val_loss,
 			input_channels=input_channels,
 			resumed_from_checkpoint=resumed_from_checkpoint,
+			history=history_rows,
 		)
 		if not latest_checkpoint_path.exists():
 			raise RuntimeError(f"Latest checkpoint was not created at: {latest_checkpoint_path}")
-
-		row = {
-			"epoch": epoch_number,
-			"learning_rate": _current_lr(optimizer),
-			"train_loss": train_results["train_loss"],
-			"val_loss": val_results["val_loss"],
-			"best_val_loss": best_val_loss,
-			"use_patches_train": int(bool(config.get("use_patches", False))),
-			"use_patches_eval": int(bool(config.get("use_patches_for_eval", False))),
-			"patch_size": int(config.get("patch_size", 64)),
-		}
-		for metric_name, metric_value in train_results.items():
-			if metric_name != "train_loss":
-				row[metric_name] = metric_value
-		for metric_name, metric_value in val_results.items():
-			if metric_name != "val_loss":
-				row[metric_name] = metric_value
 
 		_log_to_csv(training_log_path, row, append=append_log)
 		if not training_log_path.exists():
@@ -559,6 +763,7 @@ def train_model(config_path: str | Path) -> dict[str, Any]:
 		model.load_state_dict(checkpoint["model_state_dict"])
 
 	test_results: dict[str, float] = {}
+	test_plot_results: dict[str, float] = {}
 	if len(test_loader.dataset) > 0:
 		test_results = _run_epoch(
 			model=model,
@@ -571,12 +776,20 @@ def train_model(config_path: str | Path) -> dict[str, Any]:
 			output_channels=output_channels,
 			train=False,
 		)
-		logger.info("Test loss: %.6f", test_results["val_loss"])
-		for metric_name, metric_value in test_results.items():
-			if metric_name != "val_loss":
-				logger.info("Test %s: %.6f", metric_name.removeprefix("val_"), metric_value)
+		test_plot_results = _rename_result_prefix(test_results, "val_", "test_")
+		logger.info("Test loss: %.6f", test_plot_results["test_loss"])
+		for metric_name, metric_value in test_plot_results.items():
+			if metric_name != "test_loss":
+				logger.info("Test %s: %.6f", metric_name.removeprefix("test_"), metric_value)
 	else:
 		logger.info("Test split is empty; skipping final evaluation.")
+
+	training_curve_paths: list[str] = []
+	for checkpoint_path in (latest_checkpoint_path, best_checkpoint_path):
+		figure_path = _save_training_curves_figure(checkpoint_path, history_rows, test_plot_results)
+		if figure_path is not None and str(figure_path) not in training_curve_paths:
+			training_curve_paths.append(str(figure_path))
+			logger.info("Saved training curves: %s", figure_path)
 
 	return {
 		"start_epoch": start_epoch,
@@ -585,6 +798,7 @@ def train_model(config_path: str | Path) -> dict[str, Any]:
 		"latest_checkpoint_path": str(latest_checkpoint_path),
 		"best_checkpoint_path": str(best_checkpoint_path),
 		"training_log_path": str(training_log_path),
+		"training_curve_paths": training_curve_paths,
 		"final_epoch_summary": final_epoch_summary,
 		"test_results": test_results,
 	}

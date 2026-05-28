@@ -10,251 +10,160 @@ from typing import Any, Mapping
 import numpy as np
 
 try:
-    import torch  # type: ignore[import-not-found]
-    from torch.utils.data import DataLoader  # type: ignore[import-not-found]
+	import torch  # type: ignore[import-not-found]
 except ImportError:  # pragma: no cover - environment-specific fallback
-    torch = None
-    DataLoader = None
+	torch = None
 
 from src.config import load_config
-from src.data.dataset import FireSequenceDataset, _sort_chronologically
-from src.data.preprocessing import load_normalization_stats
-from src.data.splits import chronological_split_indices
+from src.data.dataset import _count_engineered_channels, _resolve_multitask_config, create_dataloaders
 from src.models.convlstm_unet import build_model_from_config
 from src.training.losses import get_loss_function
 
 
-def _resolve_path(base_path: Path, configured_path: str | Path) -> Path:
-    """Resolve config-relative paths."""
-
-    path = Path(configured_path).expanduser()
-    if path.is_absolute():
-        return path.resolve()
-    return (base_path.parent / path).resolve()
-
-
 def _print_environment_info() -> None:
-    """Print Python/PyTorch/CUDA environment details."""
+	"""Print Python/PyTorch/CUDA environment details."""
 
-    print("Environment")
-    print(f"  Python: {platform.python_version()}")
-    if torch is None:
-        print("  PyTorch: not installed")
-        print("  CUDA available: False")
-        return
-
-    print(f"  PyTorch: {torch.__version__}")
-    cuda_available = torch.cuda.is_available()
-    print(f"  CUDA available: {cuda_available}")
-    if cuda_available:
-        print(f"  CUDA device: {torch.cuda.get_device_name(0)}")
+	print("Environment")
+	print(f"  Python: {platform.python_version()}")
+	if torch is None:
+		print("  PyTorch: not installed")
+		print("  CUDA available: False")
+		return
+	print(f"  PyTorch: {torch.__version__}")
+	print(f"  CUDA available: {torch.cuda.is_available()}")
+	if torch.cuda.is_available():
+		print(f"  CUDA device: {torch.cuda.get_device_name(0)}")
 
 
-def _validate_required_keys(config: Mapping[str, Any], keys: list[str]) -> None:
-    """Validate required top-level config keys."""
+def _tensor_stats(array_like) -> dict[str, float]:
+	"""Compute min/max/mean/std for a tensor-like value."""
 
-    missing = [key for key in keys if key not in config]
-    if missing:
-        raise KeyError(f"Missing required config key(s): {', '.join(missing)}")
-
-
-def _discover_files(config: Mapping[str, Any], config_path: Path) -> list[Path]:
-    """Discover and chronologically sort dataset files."""
-
-    data_dir = _resolve_path(config_path, str(config["data_dir"]))
-    file_pattern = str(config["file_pattern"])
-    if not data_dir.exists():
-        raise FileNotFoundError(f"Data directory does not exist: {data_dir}")
-
-    files = _sort_chronologically(list(data_dir.glob(file_pattern)))
-    if not files:
-        raise FileNotFoundError(f"No files found in '{data_dir}' using pattern '{file_pattern}'.")
-
-    print(f"Discovered {len(files)} files in {data_dir}")
-    return files
+	if torch is not None and torch.is_tensor(array_like):
+		array = array_like.detach().cpu().to(torch.float32).numpy()
+	else:
+		array = np.asarray(array_like, dtype=np.float32)
+	finite_values = array[np.isfinite(array)]
+	if finite_values.size == 0:
+		return {"min": float("nan"), "max": float("nan"), "mean": float("nan"), "std": float("nan")}
+	return {
+		"min": float(finite_values.min()),
+		"max": float(finite_values.max()),
+		"mean": float(finite_values.mean()),
+		"std": float(finite_values.std()),
+	}
 
 
-def _print_first_tensor_stats(files: list[Path]) -> tuple[int, int, int]:
-    """Load first tensor and print shape/statistics."""
+def _format_stats(label: str, stats: Mapping[str, float]) -> str:
+	"""Format a stats dictionary consistently."""
 
-    first_tensor = np.load(files[0], allow_pickle=False)
-    if first_tensor.ndim != 3:
-        raise ValueError(
-            f"Expected first tensor rank to be 3 ((H, W, C)), got shape {first_tensor.shape} at {files[0]}"
-        )
-
-    h, w, c = first_tensor.shape
-    finite_mask = np.isfinite(first_tensor)
-    finite_values = first_tensor[finite_mask]
-    if finite_values.size == 0:
-        raise ValueError(f"First tensor has no finite values: {files[0]}")
-
-    print("First tensor stats")
-    print(f"  path: {files[0]}")
-    print(f"  shape: {first_tensor.shape}")
-    print(f"  dtype: {first_tensor.dtype}")
-    print(f"  min: {float(finite_values.min()):.6g}")
-    print(f"  max: {float(finite_values.max()):.6g}")
-    print(f"  mean: {float(finite_values.mean()):.6g}")
-    print(f"  std: {float(finite_values.std()):.6g}")
-    print(f"  NaN count: {int(np.isnan(first_tensor).sum())}")
-    print(f"  Inf count: {int(np.isinf(first_tensor).sum())}")
-
-    return int(h), int(w), int(c)
-
-
-def _build_datasets(config: Mapping[str, Any], files: list[Path], normalization_stats) -> tuple[FireSequenceDataset, FireSequenceDataset, FireSequenceDataset]:
-    """Create train/val/test datasets with chronological splits."""
-
-    input_sequence_length = int(config["input_sequence_length"])
-    prediction_horizon = int(config["prediction_horizon"])
-    input_channel_count = int(config.get("input_channel_count", config.get("model", {}).get("input_channels", 0)))
-    if input_channel_count <= 0:
-        raise KeyError("Config must define a positive input_channel_count or model.input_channels.")
-    split_indices = chronological_split_indices(
-        num_timesteps=len(files),
-        input_sequence_length=input_sequence_length,
-        prediction_horizon=prediction_horizon,
-        train_fraction=float(config.get("train_fraction", 0.7)),
-        val_fraction=float(config.get("val_fraction", 0.15)),
-        test_fraction=float(config.get("test_fraction", 0.15)),
-    )
-
-    print("Chronological sample counts")
-    print(f"  train: {len(split_indices['train'])}")
-    print(f"  val:   {len(split_indices['val'])}")
-    print(f"  test:  {len(split_indices['test'])}")
-
-    common_kwargs = {
-        "file_paths": files,
-        "input_sequence_length": input_sequence_length,
-        "prediction_horizon": prediction_horizon,
-        "target_channel": int(config["target_channel"]),
-        "input_channel_count": input_channel_count,
-        "task_type": str(config.get("task_type", "regression")),
-        "fire_threshold": float(config.get("fire_threshold", 0.5)),
-        "normalization_stats": normalization_stats,
-        "normalize_target": bool(config.get("normalization", {}).get("normalize_target", False)),
-        "patch_size": int(config.get("patch_size", 64)),
-        "active_patch_probability": float(config.get("active_patch_probability", 0.7)),
-        "active_threshold": float(config.get("active_threshold", config.get("fire_threshold", 0.5))),
-    }
-
-    train_dataset = FireSequenceDataset(
-        sample_indices=split_indices["train"],
-        use_patches=bool(config.get("use_patches", False)),
-        **common_kwargs,
-    )
-    val_dataset = FireSequenceDataset(
-        sample_indices=split_indices["val"],
-        use_patches=bool(config.get("use_patches_for_eval", False)),
-        **common_kwargs,
-    )
-    test_dataset = FireSequenceDataset(
-        sample_indices=split_indices["test"],
-        use_patches=bool(config.get("use_patches_for_eval", False)),
-        **common_kwargs,
-    )
-
-    return train_dataset, val_dataset, test_dataset
+	return (
+		f"{label}: min={stats['min']:.6g} max={stats['max']:.6g} "
+		f"mean={stats['mean']:.6g} std={stats['std']:.6g}"
+	)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    """Build CLI parser."""
+	"""Build CLI parser."""
 
-    parser = argparse.ArgumentParser(description="Sanity-check the wildfire forecasting project.")
-    parser.add_argument("--config", default="configs/default.yaml", help="Path to YAML config file.")
-    return parser
+	parser = argparse.ArgumentParser(description="Sanity-check the wildfire forecasting project.")
+	parser.add_argument("--config", default="configs/default.yaml", help="Path to YAML config file.")
+	return parser
 
 
 def main() -> None:
-    """Run project sanity checks end-to-end."""
+	"""Run project sanity checks end-to-end."""
 
-    args = build_arg_parser().parse_args()
-    config_path = Path(args.config).expanduser().resolve()
-    config = load_config(config_path)
+	args = build_arg_parser().parse_args()
+	if torch is None:
+		raise ImportError("PyTorch is required for sanity_check_project.py.")
+	config_path = Path(args.config).expanduser().resolve()
+	config = load_config(config_path)
+	config["config_path"] = str(config_path)
 
-    _print_environment_info()
-    if torch is None or DataLoader is None:
-        raise ImportError(
-            "PyTorch is required for sanity_check_project.py. Install torch and retry."
-        )
+	_print_environment_info()
+	train_loader, _, _ = create_dataloaders(config)
+	if len(train_loader.dataset) == 0:
+		raise ValueError("Train dataset is empty; cannot run sanity checks.")
 
-    _validate_required_keys(
-        config,
-        ["data_dir", "file_pattern", "input_sequence_length", "prediction_horizon", "target_channel"],
-    )
+	first_file = train_loader.dataset.file_paths[0]
+	first_tensor = np.load(first_file, allow_pickle=False)
+	if first_tensor.shape != (144, 144, 86):
+		raise ValueError(f"Expected one raw tensor shaped (144, 144, 86), got {first_tensor.shape} at {first_file}.")
+	print("Raw data")
+	print(f"  path: {first_file}")
+	print(f"  shape: {first_tensor.shape}")
 
-    files = _discover_files(config, config_path)
-    _, _, c = _print_first_tensor_stats(files)
+	x_batch, y_batch = next(iter(train_loader))[:2]
+	if x_batch.ndim != 5:
+		raise ValueError(f"Expected X batch shape (B, T, C, H, W), got {tuple(x_batch.shape)}")
+	if y_batch.ndim != 4:
+		raise ValueError(f"Expected y batch shape (B, C, H, W), got {tuple(y_batch.shape)}")
 
-    target_channel = int(config["target_channel"])
-    if target_channel < 0 or target_channel >= c:
-        raise ValueError(
-            f"target_channel out of range: got {target_channel}, but channel count is {c}."
-        )
+	task_type = str(config.get("task_type", "regression")).lower()
+	model = build_model_from_config(config, input_channels=int(x_batch.shape[2]))
+	device_name = str(config.get("device", "auto")).lower()
+	if device_name == "auto":
+		device_name = "cuda" if torch.cuda.is_available() else "cpu"
+	if device_name == "cuda" and not torch.cuda.is_available():
+		device_name = "cpu"
+	device = torch.device(device_name)
+	model = model.to(device)
+	x_batch = x_batch.to(device)
+	y_batch = y_batch.to(device)
 
-    normalization_stats = None
-    normalization_cfg = config.get("normalization", {})
-    normalization_path = normalization_cfg.get("path")
-    if normalization_path:
-        stats_path = _resolve_path(config_path, normalization_path)
-        if stats_path.exists():
-            normalization_stats = load_normalization_stats(stats_path)
-            print(f"Loaded normalization stats: {stats_path}")
-        else:
-            print("Warning: normalization stats not found.")
-            print("Run: python scripts/compute_normalization.py --config configs/default.yaml")
+	with torch.no_grad():
+		y_pred = model(x_batch)
 
-    train_dataset, val_dataset, test_dataset = _build_datasets(config, files, normalization_stats)
+	criterion = get_loss_function(config)
+	loss_result = criterion(y_pred, y_batch)
+	total_loss = loss_result["total_loss"] if isinstance(loss_result, dict) else loss_result
+	if not torch.isfinite(total_loss):
+		raise ValueError(f"Loss is non-finite: {float(total_loss.item())}")
 
-    batch_size = int(config.get("batch_size", 4))
-    num_workers = int(config.get("num_workers", 0))
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, drop_last=False)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, drop_last=False)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, drop_last=False)
+	engineered_channel_count = _count_engineered_channels(config)
+	print("Channels")
+	print(f"  base input channels: {int(config.get('input_channel_count', 0))}")
+	print(f"  engineered channels: {engineered_channel_count}")
+	print(f"  total input channels: {int(x_batch.shape[2])}")
 
-    if len(train_loader.dataset) == 0:
-        raise ValueError("Train dataset is empty; cannot run sanity forward pass.")
+	if task_type == "multitask":
+		multitask = _resolve_multitask_config(config)
+		print(f"  surface_fuel_channel: {multitask['surface_fuel_channel']}")
+		print(f"  canopy_fuel_channel: {multitask['canopy_fuel_channel']}")
+		print(f"  flux_mask_channel: {multitask['flux_mask_channel']}")
+		print(f"  mask_target_type: {multitask['mask_target_type']}")
+		if multitask["mask_target_type"] == "active_flux":
+			print("  channel 2 label: mask = future flux channel > flux_fire_threshold")
+		else:
+			print("  channel 2 label: mask = max(initial fuel - future surface/canopy fuel) > consumed_fuel_threshold")
 
-    x_batch, y_batch = next(iter(train_loader))[:2]
-    if x_batch.ndim != 5:
-        raise ValueError(f"Expected X batch shape (B, T, C, H, W), got {tuple(x_batch.shape)}")
-    if y_batch.ndim != 4:
-        raise ValueError(f"Expected y batch shape (B, 1, H, W), got {tuple(y_batch.shape)}")
-    if y_batch.shape[1] != 1:
-        raise ValueError(f"Expected y channel dimension 1, got {y_batch.shape[1]}")
+	expected_y_channels = 3 if task_type == "multitask" else 1
+	if y_batch.shape[1] != expected_y_channels:
+		raise ValueError(f"Expected y channel dimension {expected_y_channels}, got {y_batch.shape[1]}")
+	if tuple(y_pred.shape) != tuple(y_batch.shape):
+		raise ValueError(f"Expected model output shape {tuple(y_batch.shape)}, got {tuple(y_pred.shape)}")
 
-    print(f"Batch shapes: X={tuple(x_batch.shape)}, y={tuple(y_batch.shape)}")
-    print(f"Dataset lengths: train={len(train_loader.dataset)}, val={len(val_loader.dataset)}, test={len(test_loader.dataset)}")
+	print("Shapes")
+	print(f"  X batch shape: {tuple(x_batch.shape)}")
+	print(f"  y batch shape: {tuple(y_batch.shape)}")
+	print(f"  model output shape: {tuple(y_pred.shape)}")
 
-    device_name = str(config.get("device", "auto")).lower()
-    if device_name == "auto":
-        device_name = "cuda" if torch.cuda.is_available() else "cpu"
-    if device_name == "cuda" and not torch.cuda.is_available():
-        device_name = "cpu"
-    device = torch.device(device_name)
+	if task_type == "multitask":
+		surface_stats = _tensor_stats(y_batch[:, 0])
+		canopy_stats = _tensor_stats(y_batch[:, 1])
+		mask_values = torch.unique(y_batch[:, 2]).detach().cpu().numpy()
+		if not np.all(np.isin(mask_values, np.asarray([0.0, 1.0], dtype=np.float32))):
+			raise ValueError(f"Multitask mask contains values other than 0 and 1: {mask_values}")
+		print(_format_stats("  y[:, 0] surface consumed fuel", surface_stats))
+		print(_format_stats("  y[:, 1] canopy consumed fuel", canopy_stats))
+		print(f"  y[:, 2] unique values: {mask_values.tolist()}")
+		print(f"  y[:, 2] active pixel fraction: {float(y_batch[:, 2].float().mean().item()):.6f}")
+	else:
+		print(_format_stats("  y batch", _tensor_stats(y_batch)))
 
-    model = build_model_from_config(config, input_channels=int(x_batch.shape[2])).to(device)
-    x_batch = x_batch.to(device)
-    y_batch = y_batch.to(device)
-
-    with torch.no_grad():
-        y_pred = model(x_batch)
-
-    if y_pred.shape != y_batch.shape:
-        raise ValueError(
-            f"Output shape mismatch: expected {tuple(y_batch.shape)}, got {tuple(y_pred.shape)}"
-        )
-
-    criterion = get_loss_function(config)
-    loss_value = criterion(y_pred, y_batch)
-    if not torch.isfinite(loss_value):
-        raise ValueError(f"Loss is non-finite: {float(loss_value.item())}")
-
-    print(f"Single forward pass loss: {float(loss_value.item()):.6f}")
-    print("Sanity check passed")
+	print(f"Finite total loss: {float(total_loss.item()):.6f}")
+	print("Sanity check passed")
 
 
 if __name__ == "__main__":
-    main()
+	main()

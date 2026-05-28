@@ -39,6 +39,26 @@ The 10 variables are:
 9. CLOUD MR - cloud mixing ratio, g/kg
 10. SMOKE MR - smoke mixing ratio, g/kg
 
+
+#### meeeting notes:
+generate horizontal wind speed, new feature
+also add the delta of fuel and flux to the input data
+also add the consumed fuel to the inoput cahnnel. 
+maybe look into feature extraction, or new feature representation method to figure out whats the best way to feed the input data to the model. 
+
+change the 5 cells along z to 8. so that it keep the atmospheric data till one kilometer above ground.
+
+add the terrain info from terrain file as an input feature
+
+add raw satelite data as input. 
+also look into the input feartures and figure out which one is more important and contributing to the results
+
+upsample tolumne fire and use it for testing
+
+ask hossein about the gabriel work 
+
+#####
+
 ## Meaning of 46
 
 The `46` used in the code is the number of vertical grid cells in the model, also called the Z dimension or vertical levels.

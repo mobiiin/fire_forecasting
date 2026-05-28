@@ -128,6 +128,76 @@ def ensure_finite_map(channel_map: np.ndarray, file_path: Path, channel_index: i
     return channel_map
 
 
+def crop_channel_map(
+    channel_map: np.ndarray,
+    patch_top: int | None = None,
+    patch_left: int | None = None,
+    patch_size: int | None = None,
+) -> np.ndarray:
+    """Crop a 2D channel map to match an evaluation patch when requested."""
+
+    channel_map = np.asarray(channel_map, dtype=np.float32)
+    if patch_top is None and patch_left is None and patch_size is None:
+        return channel_map
+    if patch_top is None or patch_left is None or patch_size is None:
+        raise ValueError("patch_top, patch_left, and patch_size must be provided together.")
+
+    patch_top = int(patch_top)
+    patch_left = int(patch_left)
+    patch_size = int(patch_size)
+    patch_bottom = patch_top + patch_size
+    patch_right = patch_left + patch_size
+    cropped = channel_map[patch_top:patch_bottom, patch_left:patch_right]
+    if cropped.shape != (patch_size, patch_size):
+        raise ValueError(
+            "Patch crop produced an unexpected shape. "
+            f"Expected {(patch_size, patch_size)}, got {cropped.shape}."
+        )
+    return np.asarray(cropped, dtype=np.float32)
+
+
+def build_persistence_sample(
+    config: Mapping[str, Any],
+    files: Sequence[Path],
+    target_channel: int,
+    sample_start: int,
+    patch_top: int | None = None,
+    patch_left: int | None = None,
+    patch_size: int | None = None,
+) -> dict[str, Any]:
+    """Load the raw current/target maps for one test sample and form the persistence baseline."""
+
+    input_last_index = int(sample_start) + int(config["input_sequence_length"]) - 1
+    target_index = input_last_index + int(config["prediction_horizon"])
+    current_file = Path(files[input_last_index]).expanduser().resolve()
+    target_file = Path(files[target_index]).expanduser().resolve()
+
+    current_tensor = load_tensor(current_file)
+    target_tensor = load_tensor(target_file)
+    current_map = ensure_finite_map(current_tensor[:, :, target_channel], current_file, target_channel)
+    true_future_map = ensure_finite_map(target_tensor[:, :, target_channel], target_file, target_channel)
+
+    current_map = crop_channel_map(current_map, patch_top=patch_top, patch_left=patch_left, patch_size=patch_size)
+    true_future_map = crop_channel_map(
+        true_future_map,
+        patch_top=patch_top,
+        patch_left=patch_left,
+        patch_size=patch_size,
+    )
+    persistence_prediction = np.asarray(current_map, dtype=np.float32).copy()
+
+    return {
+        "sample_start": int(sample_start),
+        "input_last_index": input_last_index,
+        "target_index": target_index,
+        "current_file": current_file,
+        "target_file": target_file,
+        "current_map": current_map,
+        "true_future_map": true_future_map,
+        "persistence_prediction": persistence_prediction,
+    }
+
+
 def regression_metrics(
     prediction: np.ndarray,
     target: np.ndarray,
@@ -364,17 +434,18 @@ def evaluate_persistence_for_channel(
             print(f"Threshold metrics enabled at threshold={threshold_value}")
 
     for test_position, sample_start in enumerate(test_indices):
-        input_last_index = sample_start + int(config["input_sequence_length"]) - 1
-        target_index = input_last_index + int(config["prediction_horizon"])
-        current_file = files[input_last_index]
-        target_file = files[target_index]
-
-        current_tensor = load_tensor(current_file)
-        target_tensor = load_tensor(target_file)
-        current_map = ensure_finite_map(current_tensor[:, :, target_channel], current_file, target_channel)
-        true_future_map = ensure_finite_map(target_tensor[:, :, target_channel], target_file, target_channel)
+        sample_record = build_persistence_sample(
+            config=config,
+            files=files,
+            target_channel=target_channel,
+            sample_start=sample_start,
+        )
+        current_file = Path(sample_record["current_file"])
+        target_file = Path(sample_record["target_file"])
+        current_map = np.asarray(sample_record["current_map"], dtype=np.float32)
+        true_future_map = np.asarray(sample_record["true_future_map"], dtype=np.float32)
         target_maps.append(true_future_map)
-        persistence_prediction = np.asarray(current_map, dtype=np.float32).copy()
+        persistence_prediction = np.asarray(sample_record["persistence_prediction"], dtype=np.float32)
 
         sample_regression_metrics = regression_metrics(
             prediction=persistence_prediction,

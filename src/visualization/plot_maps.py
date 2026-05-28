@@ -145,3 +145,194 @@ def plot_prediction_grid(
 	fig.savefig(output_path, bbox_inches="tight")
 	plt.close(fig)
 	return output_path
+
+
+def plot_model_vs_persistence_grid(
+	last_input_target_map,
+	ground_truth_map,
+	persistence_prediction_map,
+	model_prediction_map,
+	output_path: str | Path,
+	title: str,
+	cmap: str = "inferno",
+	error_cmap: str = "magma",
+	dpi: int = 150,
+) -> Path:
+	"""Save a 6-panel model-vs-persistence comparison figure."""
+
+	last_input_target_map = _as_2d_array(last_input_target_map)
+	ground_truth_map = _as_2d_array(ground_truth_map)
+	persistence_prediction_map = _as_2d_array(persistence_prediction_map)
+	model_prediction_map = _as_2d_array(model_prediction_map)
+
+	persistence_error_map = np.abs(persistence_prediction_map - ground_truth_map)
+	model_error_map = np.abs(model_prediction_map - ground_truth_map)
+	shared_vmin, shared_vmax = _finite_min_max(
+		last_input_target_map,
+		ground_truth_map,
+		persistence_prediction_map,
+		model_prediction_map,
+	)
+	error_vmin, error_vmax = _finite_min_max(persistence_error_map, model_error_map)
+
+	fig, axes = plt.subplots(2, 3, figsize=(18, 10), dpi=dpi, constrained_layout=True)
+	panel_specs = [
+		("Last input target map", last_input_target_map, cmap, shared_vmin, shared_vmax),
+		("Ground truth future target", ground_truth_map, cmap, shared_vmin, shared_vmax),
+		("Persistence prediction", persistence_prediction_map, cmap, shared_vmin, shared_vmax),
+		("Model prediction", model_prediction_map, cmap, shared_vmin, shared_vmax),
+		("Persistence absolute error", persistence_error_map, error_cmap, error_vmin, error_vmax),
+		("Model absolute error", model_error_map, error_cmap, error_vmin, error_vmax),
+	]
+
+	value_axes = []
+	error_axes = []
+	value_image = None
+	error_image = None
+	for axis, (panel_title, panel_data, panel_cmap, vmin, vmax) in zip(axes.flatten(), panel_specs):
+		image = axis.imshow(panel_data, origin="lower", cmap=panel_cmap, vmin=vmin, vmax=vmax)
+		axis.set_title(panel_title)
+		axis.set_xticks([])
+		axis.set_yticks([])
+		if "error" in panel_title.lower():
+			error_axes.append(axis)
+			if error_image is None:
+				error_image = image
+		else:
+			value_axes.append(axis)
+			if value_image is None:
+				value_image = image
+
+	if value_image is not None and value_axes:
+		fig.colorbar(value_image, ax=value_axes, fraction=0.03, pad=0.02)
+	if error_image is not None and error_axes:
+		fig.colorbar(error_image, ax=error_axes, fraction=0.03, pad=0.02)
+
+	fig.suptitle(title, fontsize=14)
+	output_path = Path(output_path).expanduser().resolve()
+	output_path.parent.mkdir(parents=True, exist_ok=True)
+	fig.savefig(output_path, bbox_inches="tight")
+	plt.close(fig)
+	return output_path
+
+
+def plot_multitask_prediction_grid(
+	current_surface_fuel,
+	true_future_surface_fuel,
+	pred_future_surface_fuel,
+	current_canopy_fuel,
+	true_future_canopy_fuel,
+	pred_future_canopy_fuel,
+	true_mask,
+	pred_mask_probability,
+	pred_mask,
+	output_path: str | Path,
+	title: str,
+	cmap: str = "inferno",
+	error_cmap: str = "magma",
+	mask_cmap: str = "viridis",
+	dpi: int = 150,
+) -> Path:
+	"""Save a 12-panel visualization for one multitask wildfire forecast sample."""
+
+	current_surface_fuel = _as_2d_array(current_surface_fuel)
+	true_future_surface_fuel = _as_2d_array(true_future_surface_fuel)
+	pred_future_surface_fuel = _as_2d_array(pred_future_surface_fuel)
+	current_canopy_fuel = _as_2d_array(current_canopy_fuel)
+	true_future_canopy_fuel = _as_2d_array(true_future_canopy_fuel)
+	pred_future_canopy_fuel = _as_2d_array(pred_future_canopy_fuel)
+	true_mask = _as_2d_array(true_mask)
+	pred_mask_probability = _as_2d_array(pred_mask_probability)
+	pred_mask = _as_2d_array(pred_mask)
+
+	surface_error = np.abs(pred_future_surface_fuel - true_future_surface_fuel)
+	canopy_error = np.abs(pred_future_canopy_fuel - true_future_canopy_fuel)
+	surface_vmin, surface_vmax = _finite_min_max(current_surface_fuel, true_future_surface_fuel, pred_future_surface_fuel)
+	canopy_vmin, canopy_vmax = _finite_min_max(current_canopy_fuel, true_future_canopy_fuel, pred_future_canopy_fuel)
+	error_vmin, error_vmax = _finite_min_max(surface_error, canopy_error)
+
+	fig, axes = plt.subplots(4, 3, figsize=(18, 20), dpi=dpi, constrained_layout=True)
+	panel_specs = [
+		("Current surface fuel", current_surface_fuel, cmap, surface_vmin, surface_vmax),
+		("True future surface fuel", true_future_surface_fuel, cmap, surface_vmin, surface_vmax),
+		("Predicted future surface fuel", pred_future_surface_fuel, cmap, surface_vmin, surface_vmax),
+		("Surface fuel prediction error", surface_error, error_cmap, error_vmin, error_vmax),
+		("Current canopy fuel", current_canopy_fuel, cmap, canopy_vmin, canopy_vmax),
+		("True future canopy fuel", true_future_canopy_fuel, cmap, canopy_vmin, canopy_vmax),
+		("Predicted future canopy fuel", pred_future_canopy_fuel, cmap, canopy_vmin, canopy_vmax),
+		("Canopy fuel prediction error", canopy_error, error_cmap, error_vmin, error_vmax),
+		("True mask", true_mask, mask_cmap, 0.0, 1.0),
+		("Predicted mask probability", pred_mask_probability, mask_cmap, 0.0, 1.0),
+		("Predicted binary mask", pred_mask, mask_cmap, 0.0, 1.0),
+		("Predicted / true perimeter contours", pred_mask_probability, mask_cmap, 0.0, 1.0),
+	]
+
+	for axis, (panel_title, panel_data, panel_cmap, vmin, vmax) in zip(axes.flatten(), panel_specs):
+		image = axis.imshow(panel_data, origin="lower", cmap=panel_cmap, vmin=vmin, vmax=vmax)
+		axis.set_title(panel_title)
+		axis.set_xticks([])
+		axis.set_yticks([])
+		if panel_title == "Predicted / true perimeter contours":
+			_draw_contours(axis, true_mask, pred_mask_probability, threshold=0.5)
+		fig.colorbar(image, ax=axis, fraction=0.046, pad=0.04)
+
+	fig.suptitle(title, fontsize=14)
+	output_path = Path(output_path).expanduser().resolve()
+	output_path.parent.mkdir(parents=True, exist_ok=True)
+	fig.savefig(output_path, bbox_inches="tight")
+	plt.close(fig)
+	return output_path
+
+
+def plot_reconstructed_fuel_beds_grid(
+	current_surface_fuel,
+	true_future_surface_fuel,
+	pred_future_surface_fuel,
+	current_canopy_fuel,
+	true_future_canopy_fuel,
+	pred_future_canopy_fuel,
+	output_path: str | Path,
+	title: str,
+	cmap: str = "inferno",
+	error_cmap: str = "magma",
+	dpi: int = 150,
+) -> Path:
+	"""Save an 8-panel reconstructed-fuel-bed comparison figure."""
+
+	current_surface_fuel = _as_2d_array(current_surface_fuel)
+	true_future_surface_fuel = _as_2d_array(true_future_surface_fuel)
+	pred_future_surface_fuel = _as_2d_array(pred_future_surface_fuel)
+	current_canopy_fuel = _as_2d_array(current_canopy_fuel)
+	true_future_canopy_fuel = _as_2d_array(true_future_canopy_fuel)
+	pred_future_canopy_fuel = _as_2d_array(pred_future_canopy_fuel)
+	surface_error = np.abs(pred_future_surface_fuel - true_future_surface_fuel)
+	canopy_error = np.abs(pred_future_canopy_fuel - true_future_canopy_fuel)
+
+	surface_vmin, surface_vmax = _finite_min_max(current_surface_fuel, true_future_surface_fuel, pred_future_surface_fuel)
+	canopy_vmin, canopy_vmax = _finite_min_max(current_canopy_fuel, true_future_canopy_fuel, pred_future_canopy_fuel)
+	error_vmin, error_vmax = _finite_min_max(surface_error, canopy_error)
+
+	fig, axes = plt.subplots(2, 4, figsize=(20, 10), dpi=dpi, constrained_layout=True)
+	panel_specs = [
+		("Current surface fuel", current_surface_fuel, cmap, surface_vmin, surface_vmax),
+		("True future surface fuel", true_future_surface_fuel, cmap, surface_vmin, surface_vmax),
+		("Predicted future surface fuel", pred_future_surface_fuel, cmap, surface_vmin, surface_vmax),
+		("Surface fuel error", surface_error, error_cmap, error_vmin, error_vmax),
+		("Current canopy fuel", current_canopy_fuel, cmap, canopy_vmin, canopy_vmax),
+		("True future canopy fuel", true_future_canopy_fuel, cmap, canopy_vmin, canopy_vmax),
+		("Predicted future canopy fuel", pred_future_canopy_fuel, cmap, canopy_vmin, canopy_vmax),
+		("Canopy fuel error", canopy_error, error_cmap, error_vmin, error_vmax),
+	]
+	for axis, (panel_title, panel_data, panel_cmap, vmin, vmax) in zip(axes.flatten(), panel_specs):
+		image = axis.imshow(panel_data, origin="lower", cmap=panel_cmap, vmin=vmin, vmax=vmax)
+		axis.set_title(panel_title)
+		axis.set_xticks([])
+		axis.set_yticks([])
+		fig.colorbar(image, ax=axis, fraction=0.046, pad=0.04)
+
+	fig.suptitle(title, fontsize=14)
+	output_path = Path(output_path).expanduser().resolve()
+	output_path.parent.mkdir(parents=True, exist_ok=True)
+	fig.savefig(output_path, bbox_inches="tight")
+	plt.close(fig)
+	return output_path

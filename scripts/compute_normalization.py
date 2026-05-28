@@ -1,243 +1,201 @@
-"""Compute channel-wise normalization statistics from training input timestamps."""
+"""Compute channel-wise normalization statistics from training samples."""
 
 from __future__ import annotations
 
 import argparse
-import re
 from pathlib import Path
 
 import numpy as np
 
 from src.config import load_config
-from src.data.preprocessing import compute_channel_stats
+from src.data.dataset import FireSequenceDataset, _sort_chronologically
 from src.data.splits import chronological_split_indices
 
 
-def resolve_path(base_path: Path, configured_path: str) -> Path:
-    """Resolve a configured path relative to the config file location."""
+def _resolve_path(base_path: Path, configured_path: str | Path) -> Path:
+	"""Resolve a configured path relative to the config file location."""
 
-    path = Path(configured_path).expanduser()
-    if path.is_absolute():
-        return path.resolve()
-    return (base_path.parent / path).resolve()
-
-
-def discover_files(data_dir: Path, file_pattern: str) -> list[Path]:
-    """Find and chronologically sort files matching the configured pattern."""
-
-    files = list(data_dir.glob(file_pattern))
-    if not files:
-        raise FileNotFoundError(
-            f"No files found in '{data_dir}' using pattern '{file_pattern}'."
-        )
-    return sort_chronologically(files)
+	path = Path(configured_path).expanduser()
+	if path.is_absolute():
+		return path.resolve()
+	return (base_path.parent / path).resolve()
 
 
-def extract_numeric_suffix(name: str) -> int | None:
-    """Extract a trailing numeric suffix from a filename stem."""
+def _update_running_stats(
+	array: np.ndarray,
+	count: int,
+	mean: np.ndarray | None,
+	m2: np.ndarray | None,
+	channel_min: np.ndarray | None,
+	channel_max: np.ndarray | None,
+) -> tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+	"""Update running per-channel stats from an array shaped (..., C)."""
 
-    match = re.search(r"(\d+)$", name)
-    return int(match.group(1)) if match else None
+	flat = np.asarray(array, dtype=np.float64).reshape(-1, array.shape[-1])
+	file_count = flat.shape[0]
+	file_mean = flat.mean(axis=0)
+	file_min = flat.min(axis=0)
+	file_max = flat.max(axis=0)
+	centered = flat - file_mean
+	file_m2 = np.sum(centered * centered, axis=0)
 
+	if mean is None or m2 is None or channel_min is None or channel_max is None:
+		return file_count, file_mean, file_m2, file_min, file_max
 
-def sort_chronologically(files: list[Path]) -> list[Path]:
-    """Sort by trailing numeric suffix when available, otherwise lexicographically."""
-
-    numeric_suffixes = [extract_numeric_suffix(file_path.stem) for file_path in files]
-    if all(value is not None for value in numeric_suffixes):
-        return [path for _, path in sorted(zip(numeric_suffixes, files), key=lambda pair: pair[0])]
-    return sorted(files, key=lambda path: path.name)
-
-
-def training_input_file_indices(
-    num_timesteps: int,
-    input_sequence_length: int,
-    prediction_horizon: int,
-    train_fraction: float,
-    val_fraction: float,
-    test_fraction: float,
-) -> list[int]:
-    """Return raw file indices that appear in the training input windows only."""
-
-    splits = chronological_split_indices(
-        num_timesteps=num_timesteps,
-        input_sequence_length=input_sequence_length,
-        prediction_horizon=prediction_horizon,
-        train_fraction=train_fraction,
-        val_fraction=val_fraction,
-        test_fraction=test_fraction,
-    )
-
-    training_indices: set[int] = set()
-    for start_index in splits["train"]:
-        training_indices.update(range(start_index, start_index + input_sequence_length))
-
-    return sorted(training_indices)
-
-
-def training_target_file_indices(
-    num_timesteps: int,
-    input_sequence_length: int,
-    prediction_horizon: int,
-    train_fraction: float,
-    val_fraction: float,
-    test_fraction: float,
-) -> list[int]:
-    """Return raw file indices that appear as training targets only."""
-
-    splits = chronological_split_indices(
-        num_timesteps=num_timesteps,
-        input_sequence_length=input_sequence_length,
-        prediction_horizon=prediction_horizon,
-        train_fraction=train_fraction,
-        val_fraction=val_fraction,
-        test_fraction=test_fraction,
-    )
-
-    target_indices: set[int] = set()
-    for start_index in splits["train"]:
-        target_indices.add(start_index + input_sequence_length - 1 + prediction_horizon)
-
-    return sorted(target_indices)
-
-
-def training_relevant_file_indices(
-    num_timesteps: int,
-    input_sequence_length: int,
-    prediction_horizon: int,
-    train_fraction: float,
-    val_fraction: float,
-    test_fraction: float,
-) -> list[int]:
-    """Return the union of training input and target raw timestamp indices."""
-
-    input_indices = training_input_file_indices(
-        num_timesteps=num_timesteps,
-        input_sequence_length=input_sequence_length,
-        prediction_horizon=prediction_horizon,
-        train_fraction=train_fraction,
-        val_fraction=val_fraction,
-        test_fraction=test_fraction,
-    )
-    target_indices = training_target_file_indices(
-        num_timesteps=num_timesteps,
-        input_sequence_length=input_sequence_length,
-        prediction_horizon=prediction_horizon,
-        train_fraction=train_fraction,
-        val_fraction=val_fraction,
-        test_fraction=test_fraction,
-    )
-    return sorted(set(input_indices).union(target_indices))
+	delta = file_mean - mean
+	total_count = count + file_count
+	mean = mean + delta * (file_count / total_count)
+	m2 = m2 + file_m2 + (delta * delta) * (count * file_count / total_count)
+	channel_min = np.minimum(channel_min, file_min)
+	channel_max = np.maximum(channel_max, file_max)
+	return total_count, mean, m2, channel_min, channel_max
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    """Create the command-line interface for normalization computation."""
+	"""Create the command-line interface for normalization computation."""
 
-    parser = argparse.ArgumentParser(description="Compute normalization statistics.")
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="configs/default.yaml",
-        help="Path to the YAML configuration file.",
-    )
-    return parser
+	parser = argparse.ArgumentParser(description="Compute normalization statistics.")
+	parser.add_argument("--config", type=str, default="configs/default.yaml", help="Path to the YAML configuration file.")
+	return parser
 
 
 def main() -> None:
-    """Compute and save normalization statistics for the training split only."""
+	"""Compute and save normalization statistics for the training split only."""
 
-    args = build_arg_parser().parse_args()
-    config_path = Path(args.config).expanduser().resolve()
-    config = load_config(config_path)
+	args = build_arg_parser().parse_args()
+	config_path = Path(args.config).expanduser().resolve()
+	config = load_config(config_path)
+	config["config_path"] = str(config_path)
 
-    for required_key in ("data_dir", "file_pattern", "input_sequence_length", "prediction_horizon", "train_fraction", "val_fraction", "test_fraction", "target_channel"):
-        if required_key not in config:
-            raise KeyError(f"Config is missing required key '{required_key}'.")
+	for required_key in ("data_dir", "file_pattern", "input_sequence_length", "prediction_horizon", "train_fraction", "val_fraction", "test_fraction"):
+		if required_key not in config:
+			raise KeyError(f"Config is missing required key '{required_key}'.")
 
-    data_dir = resolve_path(config_path, str(config["data_dir"]))
-    file_pattern = str(config["file_pattern"])
+	normalization_config = dict(config.get("normalization", {}))
+	if "path" not in normalization_config:
+		raise KeyError("Config is missing normalization.path.")
 
-    normalization_config = config.get("normalization", {})
-    if "path" not in normalization_config:
-        raise KeyError("Config is missing normalization.path.")
+	data_dir = _resolve_path(config_path, config["data_dir"])
+	file_pattern = str(config["file_pattern"])
+	if not data_dir.exists():
+		raise FileNotFoundError(f"Data directory does not exist: {data_dir}")
+	files = _sort_chronologically(list(data_dir.glob(file_pattern)))
+	if not files:
+		raise FileNotFoundError(f"No files found in '{data_dir}' using pattern '{file_pattern}'.")
 
-    if not data_dir.exists():
-        raise FileNotFoundError(f"Data directory does not exist: {data_dir}")
+	splits = chronological_split_indices(
+		num_timesteps=len(files),
+		input_sequence_length=int(config["input_sequence_length"]),
+		prediction_horizon=int(config["prediction_horizon"]),
+		train_fraction=float(config["train_fraction"]),
+		val_fraction=float(config["val_fraction"]),
+		test_fraction=float(config["test_fraction"]),
+	)
+	if not splits["train"]:
+		raise ValueError("No training samples were found for normalization.")
 
-    files = discover_files(data_dir, file_pattern)
-    if not files:
-        raise FileNotFoundError(
-            f"No files found in '{data_dir}' using pattern '{file_pattern}'."
-        )
+	train_dataset = FireSequenceDataset(
+		file_paths=files,
+		sample_indices=splits["train"],
+		input_sequence_length=int(config["input_sequence_length"]),
+		prediction_horizon=int(config["prediction_horizon"]),
+		target_channel=int(config.get("target_channel", 0)),
+		input_channel_count=int(config.get("input_channel_count", config.get("model", {}).get("input_channels", 0))),
+		input_channel_indices=config.get("input_channel_indices"),
+		task_type=str(config.get("task_type", config.get("training", {}).get("task_type", "regression"))),
+		fire_threshold=float(config.get("fire_threshold", config.get("training", {}).get("fire_threshold", 0.5))),
+		use_patches=False,
+		patch_size=int(config.get("patch_size", 64)),
+		active_patch_probability=float(config.get("active_patch_probability", 0.7)),
+		active_threshold=float(config.get("active_threshold", config.get("fire_threshold", 0.5))),
+		normalization_stats=None,
+		normalize_target=False,
+		config=config,
+	)
 
-    training_indices = training_input_file_indices(
-        num_timesteps=len(files),
-        input_sequence_length=int(config["input_sequence_length"]),
-        prediction_horizon=int(config["prediction_horizon"]),
-        train_fraction=float(config["train_fraction"]),
-        val_fraction=float(config["val_fraction"]),
-        test_fraction=float(config["test_fraction"]),
-    )
+	count = 0
+	mean = None
+	m2 = None
+	channel_min = None
+	channel_max = None
+	target_count = 0
+	target_mean = None
+	target_m2 = None
+	target_min = None
+	target_max = None
+	task_type = str(config.get("task_type", "regression")).lower()
+	target_normalization_config = dict(config.get("target_normalization", {}))
+	normalize_targets = bool(target_normalization_config.get("enabled", False))
 
-    if not training_indices:
-        raise ValueError("No valid training input timestamps were found for normalization.")
-    training_target_indices = training_target_file_indices(
-        num_timesteps=len(files),
-        input_sequence_length=int(config["input_sequence_length"]),
-        prediction_horizon=int(config["prediction_horizon"]),
-        train_fraction=float(config["train_fraction"]),
-        val_fraction=float(config["val_fraction"]),
-        test_fraction=float(config["test_fraction"]),
-    )
-    if not training_target_indices:
-        raise ValueError("No valid training target timestamps were found for normalization.")
-    training_relevant_indices = training_relevant_file_indices(
-        num_timesteps=len(files),
-        input_sequence_length=int(config["input_sequence_length"]),
-        prediction_horizon=int(config["prediction_horizon"]),
-        train_fraction=float(config["train_fraction"]),
-        val_fraction=float(config["val_fraction"]),
-        test_fraction=float(config["test_fraction"]),
-    )
-    if not training_relevant_indices:
-        raise ValueError("No valid training timestamps were found for normalization.")
+	for sample_index in range(len(train_dataset)):
+		x_tensor, y_tensor = train_dataset[sample_index][:2]
+		x_array = x_tensor.detach().cpu().numpy().transpose(0, 2, 3, 1)
+		count, mean, m2, channel_min, channel_max = _update_running_stats(x_array, count, mean, m2, channel_min, channel_max)
 
-    input_channel_count = int(config.get("input_channel_count", config.get("model", {}).get("input_channels", 0)))
-    if input_channel_count <= 0:
-        raise KeyError("Config must define a positive input_channel_count or model.input_channels.")
-    target_channel = int(config["target_channel"])
+		if not normalize_targets:
+			continue
+		y_array = y_tensor.detach().cpu().numpy().transpose(1, 2, 0)
+		if task_type == "regression":
+			y_array = y_array[:, :, :1]
+		elif task_type == "multitask":
+			y_array = y_array[:, :, :2]
+		else:
+			continue
+		target_count, target_mean, target_m2, target_min, target_max = _update_running_stats(
+			y_array,
+			target_count,
+			target_mean,
+			target_m2,
+			target_min,
+			target_max,
+		)
 
-    training_files = [files[index] for index in training_relevant_indices]
-    training_target_files = [files[index] for index in training_target_indices]
-    eps = float(normalization_config.get("epsilon", 1e-6))
-    stats = compute_channel_stats(training_files, channel_indices=None, eps=eps)
-    target_stats = compute_channel_stats(training_target_files, channel_indices=slice(target_channel, target_channel + 1), eps=eps)
-    stats["target_mean"] = target_stats["mean"][0]
-    stats["target_std"] = target_stats["std"][0]
-    stats["target_min"] = target_stats["min"][0]
-    stats["target_max"] = target_stats["max"][0]
-    stats["input_channel_count"] = np.asarray(input_channel_count)
+	if mean is None or m2 is None or channel_min is None or channel_max is None:
+		raise ValueError("Failed to compute any input normalization statistics.")
 
-    output_path = resolve_path(config_path, str(normalization_config["path"]))
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(output_path, **stats)
+	eps = float(normalization_config.get("epsilon", 1e-6))
+	variance = m2 / max(count, 1)
+	std = np.sqrt(np.maximum(variance, 0.0))
+	std = np.maximum(std, eps)
+	stats: dict[str, np.ndarray] = {
+		"mean": mean.astype(np.float32),
+		"std": std.astype(np.float32),
+		"min": channel_min.astype(np.float32),
+		"max": channel_max.astype(np.float32),
+		"input_channel_count": np.asarray(train_dataset.total_input_channels, dtype=np.int64),
+		"base_input_channel_count": np.asarray(train_dataset.base_input_channel_count, dtype=np.int64),
+		"engineered_channel_count": np.asarray(train_dataset.engineered_channel_count, dtype=np.int64),
+	}
 
-    channel_mean = stats["mean"]
-    channel_std = stats["std"]
-    near_zero_std = int(np.sum(channel_std <= max(eps, 1e-6) * 10.0))
+	if normalize_targets and target_mean is not None and target_m2 is not None and target_min is not None and target_max is not None:
+		target_variance = target_m2 / max(target_count, 1)
+		target_std = np.sqrt(np.maximum(target_variance, 0.0))
+		target_std = np.maximum(target_std, eps)
+		if task_type == "regression":
+			stats["target_mean"] = np.asarray(target_mean[0], dtype=np.float32)
+			stats["target_std"] = np.asarray(target_std[0], dtype=np.float32)
+			stats["target_min"] = np.asarray(target_min[0], dtype=np.float32)
+			stats["target_max"] = np.asarray(target_max[0], dtype=np.float32)
+		elif task_type == "multitask":
+			stats["multitask_target_mean"] = target_mean.astype(np.float32)
+			stats["multitask_target_std"] = target_std.astype(np.float32)
 
-    print(f"C: {channel_mean.shape[0]}")
-    print(f"global channel mean range: {channel_mean.min():.6g} to {channel_mean.max():.6g}")
-    print(f"global channel std range: {channel_std.min():.6g} to {channel_std.max():.6g}")
-    print(f"channels with near-zero std: {near_zero_std}")
-    print(f"input_channel_count: {input_channel_count}")
-    print(f"target channel: {target_channel}")
-    print(f"target mean: {float(stats['target_mean']):.6g}")
-    print(f"target std: {float(stats['target_std']):.6g}")
-    print(f"target min: {float(stats['target_min']):.6g}")
-    print(f"target max: {float(stats['target_max']):.6g}")
-    print(f"output path: {output_path}")
+	output_path = _resolve_path(config_path, normalization_config["path"])
+	output_path.parent.mkdir(parents=True, exist_ok=True)
+	np.savez_compressed(output_path, **stats)
+
+	channel_mean = stats["mean"]
+	channel_std = stats["std"]
+	near_zero_std = int(np.sum(channel_std <= max(eps, 1e-6) * 10.0))
+	print(f"C: {channel_mean.shape[0]}")
+	print(f"base input channels: {train_dataset.base_input_channel_count}")
+	print(f"engineered channels: {train_dataset.engineered_channel_count}")
+	print(f"total input channels: {train_dataset.total_input_channels}")
+	print(f"global channel mean range: {channel_mean.min():.6g} to {channel_mean.max():.6g}")
+	print(f"global channel std range: {channel_std.min():.6g} to {channel_std.max():.6g}")
+	print(f"channels with near-zero std: {near_zero_std}")
+	print(f"output path: {output_path}")
 
 
 if __name__ == "__main__":
-    main()
+	main()
