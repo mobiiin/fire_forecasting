@@ -8,7 +8,7 @@ data_dir: ../keepz_08
 
 # External final-test dataset directory.
 # Options: null to disable external testing, or any relative/absolute directory path.
-test_data_dir: null
+test_data_dir: ../keepz_08_tuo
 
 # Glob pattern for the main dataset files.
 # Options: any glob accepted by pathlib.Path.glob, e.g. "*.npy", "frame_*.npy".
@@ -95,7 +95,7 @@ learning_rate: 0.0001
 
 # Total training epochs.
 # Options: any positive integer >= 1.
-epochs: 5
+epochs: 20
 
 # Number of DataLoader workers.
 # Options: any integer >= 0.
@@ -108,6 +108,36 @@ num_workers: 4
 # - cuda
 # - gpu   # alias for cuda
 device: auto
+
+# External test spatial handling policy.
+# Supported options:
+# - direct: feed native external-test H/W directly to the model
+# - pad_to_train_size: pad to train_height/train_width, run inference, crop back to native H/W
+# - pad_to_multiple: pad to the next multiple of pad_multiple, run inference, crop back
+# - auto: try direct first, then pad_to_multiple, then pad_to_train_size
+external_test_spatial:
+  mode: auto
+
+  # Training spatial size reference used by pad_to_train_size.
+  # Options: any positive integers >= 1.
+  train_height: 144
+  train_width: 144
+
+  # Multiple used by pad_to_multiple.
+  # Options: any positive integer >= 1.
+  pad_multiple: 16
+
+  # Padding value for normalized model inputs.
+  # Options: any float. 0.0 is the natural default for z-score normalized inputs.
+  pad_value_normalized: 0.0
+
+  # Crop model outputs back to the original native-grid H/W after padded inference.
+  # Options: true, false
+  crop_output_to_original_size: true
+
+  # Resize-based inference is intentionally not used by default because it changes physical scale.
+  # Options: true, false
+  allow_resize: false
 
 # Number of raw/base channels to take before adding engineered channels.
 # Options: any integer in [1, C_raw].

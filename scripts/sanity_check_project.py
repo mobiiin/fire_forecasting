@@ -25,6 +25,7 @@ from src.data.dataset import (
 	create_dataloaders,
 	resolve_engineered_feature_slices,
 )
+from src.data.spatial_transforms import infer_with_external_test_spatial_handling
 from src.models.convlstm_unet import build_model_from_config
 from src.training.losses import get_loss_function
 
@@ -220,6 +221,31 @@ def main() -> None:
 		print(f"  y[:, 2] active pixel fraction: {float(y_batch[:, 2].float().mean().item()):.6f}")
 	else:
 		print(_format_stats("  y batch", _tensor_stats(y_batch)))
+
+	if test_loader is not None and len(test_loader.dataset) > 0:
+		external_first_file = test_loader.dataset.file_paths[0]
+		external_raw = np.load(external_first_file, allow_pickle=False)
+		print("External test spatial check")
+		print(f"  external raw path: {external_first_file}")
+		print(f"  external raw shape: {tuple(external_raw.shape)}")
+		external_batch = next(iter(test_loader))
+		external_x, external_y = external_batch[:2]
+		print(f"  external X before spatial handling: {tuple(external_x.shape)}")
+		external_x_device = external_x.to(device)
+		external_spatial_result = infer_with_external_test_spatial_handling(model, external_x_device, config)
+		external_pred = external_spatial_result["y_pred"]
+		external_model_input = external_spatial_result["x_model_input"]
+		print(f"  external spatial mode used: {external_spatial_result['mode_used']}")
+		if external_spatial_result.get("warning"):
+			print(f"  warning: {external_spatial_result['warning']}")
+		print(f"  external X fed to model: {tuple(external_model_input.shape)}")
+		print(f"  external prediction after crop: {tuple(external_pred.shape)}")
+		print(f"  external y shape: {tuple(external_y.shape)}")
+		if tuple(external_pred.shape[-2:]) != tuple(external_y.shape[-2:]):
+			raise ValueError(
+				"External prediction spatial shape does not match external target after crop. "
+				f"Prediction={tuple(external_pred.shape)} target={tuple(external_y.shape)}."
+			)
 
 	print(f"Finite total loss: {float(total_loss.item()):.6f}")
 	print("Sanity check passed")

@@ -195,6 +195,8 @@ All commands below assume the Conda environment above is already active.
   `python scripts/train_convlstm_unet.py --config configs/default.yaml`
 - Evaluate the saved checkpoint on the external test dataset:
   `python scripts/test_model.py --config configs/default.yaml --checkpoint-kind best`
+- Probe model support for native and alternate spatial sizes without loading dataset files:
+  `python scripts/test_spatial_size_compatibility.py --config configs/default.yaml`
 - Visualize validation predictions:
   `python scripts/visualize_predictions.py --config configs/default.yaml --split val --num_samples 10`
 - Visualize external test predictions:

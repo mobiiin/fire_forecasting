@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 from typing import Any, Mapping
+import random
 
 import numpy as np
 
@@ -20,6 +21,7 @@ from src.config import load_config
 from src.data.dataset import FireSequenceDataset, _resolve_multitask_config, _sort_chronologically
 from src.data.preprocessing import inverse_normalize_channel_map as inverse_normalize_scalar_channel_map
 from src.data.preprocessing import load_normalization_stats
+from src.data.spatial_transforms import infer_with_external_test_spatial_handling
 from src.data.splits import chronological_split_indices, chronological_train_val_split_indices
 from src.models.convlstm_unet import build_model_from_config
 from src.training.checkpoints import latest_and_best_checkpoint_paths, load_checkpoint
@@ -243,7 +245,7 @@ def _crop_map_from_metadata(channel_map: np.ndarray, metadata: Mapping[str, Any]
 	return np.asarray(channel_map[patch_top : patch_top + patch_size, patch_left : patch_left + patch_size], dtype=np.float32)
 
 
-def _prediction_to_single_map(predicted: torch.Tensor, test_dataset: FireSequenceDataset, task_type: str) -> np.ndarray:
+def _prediction_to_single_map(predicted: Any, test_dataset: FireSequenceDataset, task_type: str) -> np.ndarray:
 	"""Convert a single-target model output tensor into a display-ready map."""
 
 	if task_type == "segmentation":
@@ -256,8 +258,8 @@ def _prediction_to_single_map(predicted: torch.Tensor, test_dataset: FireSequenc
 
 
 def _build_multitask_visualization_maps(
-	predicted: torch.Tensor,
-	y_sample: torch.Tensor,
+	predicted: Any,
+	y_sample: Any,
 	metadata: Mapping[str, Any],
 	config: Mapping[str, Any],
 	test_dataset: FireSequenceDataset,
@@ -314,7 +316,11 @@ def _build_multitask_visualization_maps(
 	}
 
 
-def visualize_predictions(config_path: str | Path, num_samples: int = 10, split: str = "val") -> list[Path]:
+def visualize_predictions(
+	config_path: str | Path,
+	num_samples: int = 10,
+	split: str = "val",
+) -> list[Path]:
 	"""Render chronological forecast visualizations for several test samples."""
 
 	if torch is None or DataLoader is None:
@@ -339,6 +345,19 @@ def visualize_predictions(config_path: str | Path, num_samples: int = 10, split:
 		raise ValueError(f"Requested {selected_split} dataset is empty; cannot visualize predictions.")
 	test_loader = _build_test_loader(test_dataset)
 	task_type = str(config.get("task_type", _get_section(config, "training").get("task_type", "regression"))).lower()
+	total_test_samples = len(test_loader.dataset)
+	sample_count = min(max(int(num_samples), 0), total_test_samples)
+	if sample_count == 0:
+		raise ValueError("num_samples must be positive when visualizing predictions.")
+	if selected_split == "test":
+		random_seed = int(config.get("seed", _get_section(config, "training").get("seed", 42)))
+		selected_indices = sorted(random.Random(random_seed).sample(range(total_test_samples), sample_count))
+		test_dataset = torch.utils.data.Subset(test_dataset, selected_indices)
+		test_loader = _build_test_loader(test_dataset)
+		max_samples = len(selected_indices)
+	else:
+		selected_indices = list(range(sample_count))
+		max_samples = sample_count
 	first_batch = next(iter(test_loader))
 	x_batch, y_batch = first_batch[:2]
 	if x_batch.ndim != 5 or y_batch.ndim != 4:
@@ -360,15 +379,21 @@ def visualize_predictions(config_path: str | Path, num_samples: int = 10, split:
 	dpi = int(visualization_config.get("dpi", 150))
 
 	saved_paths: list[Path] = []
-	max_samples = min(int(num_samples), len(test_loader.dataset))
 	with torch.no_grad():
 		for sample_index, batch in enumerate(test_loader):
-			if sample_index >= max_samples:
-				break
 			x_sample, y_sample, metadata = batch
 			metadata_dict = _metadata_to_dict(metadata)
-			x_sample = x_sample.to(device)
-			predicted = model(x_sample)
+			x_sample_device = x_sample.to(device)
+			spatial_note = ""
+			if selected_split == "test":
+				spatial_result = infer_with_external_test_spatial_handling(model, x_sample_device, config)
+				predicted = spatial_result["y_pred"]
+				if spatial_result.get("warning"):
+					logger.warning("%s", spatial_result["warning"])
+				if spatial_result["mode_used"] != "direct":
+					spatial_note = " | model inference used padding; predictions cropped back to native grid"
+			else:
+				predicted = model(x_sample_device)
 			output_name = _sample_output_name(metadata_dict)
 			output_path = output_dir / output_name
 			if output_path.exists():
@@ -376,6 +401,15 @@ def visualize_predictions(config_path: str | Path, num_samples: int = 10, split:
 
 			if task_type == "multitask":
 				plot_inputs = _build_multitask_visualization_maps(predicted, y_sample, metadata_dict, config, test_dataset)
+				if selected_split == "test":
+					native_height = int(y_sample.shape[-2])
+					native_width = int(y_sample.shape[-1])
+					title = (
+						f"external test native grid: {native_height}x{native_width} | "
+						f"sample {sample_index + 1}/{max_samples}{spatial_note}"
+					)
+				else:
+					title = f"{selected_split.capitalize()} multitask forecast | sample {sample_index + 1}/{max_samples}"
 				saved_path = plot_multitask_prediction_grid(
 					current_surface_fuel=plot_inputs["current_surface_fuel"],
 					true_future_surface_fuel=plot_inputs["true_future_surface_fuel"],
@@ -387,7 +421,7 @@ def visualize_predictions(config_path: str | Path, num_samples: int = 10, split:
 					pred_mask_probability=plot_inputs["pred_mask_probability"],
 					pred_mask=plot_inputs["pred_mask"],
 					output_path=output_path,
-					title=f"{selected_split.capitalize()} multitask forecast | sample {sample_index + 1}/{max_samples}",
+					title=title,
 					cmap=cmap,
 					dpi=dpi,
 				)
@@ -401,12 +435,21 @@ def visualize_predictions(config_path: str | Path, num_samples: int = 10, split:
 						test_dataset.target_mean,
 						test_dataset.target_std,
 					)
+				if selected_split == "test":
+					native_height = int(y_sample.shape[-2])
+					native_width = int(y_sample.shape[-1])
+					title = (
+						f"external test native grid: {native_height}x{native_width} | "
+						f"sample {sample_index + 1}/{max_samples}{spatial_note}"
+					)
+				else:
+					title = f"{selected_split.capitalize()} forecast | sample {sample_index + 1}/{max_samples}"
 				saved_path = plot_prediction_grid(
 					current_map=current_map,
 					ground_truth_map=ground_truth_map,
 					predicted_map=predicted_map,
 					output_path=output_path,
-					title=f"{selected_split.capitalize()} forecast | sample {sample_index + 1}/{max_samples}",
+					title=title,
 					threshold=0.5 if task_type == "segmentation" else float(config.get("fire_threshold", 0.5)),
 					cmap=cmap,
 					dpi=dpi,
@@ -551,7 +594,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
 		"--num_samples",
 		type=int,
 		default=10,
-		help="Number of chronological validation or external test samples to visualize.",
+		help="Number of validation samples to visualize, or number of random external test samples when --split test is selected.",
 	)
 	return parser
 
@@ -560,7 +603,11 @@ def main() -> None:
 	"""CLI entry point."""
 
 	args = build_argument_parser().parse_args()
-	visualize_predictions(args.config, num_samples=args.num_samples, split=args.split)
+	visualize_predictions(
+		args.config,
+		num_samples=args.num_samples,
+		split=args.split,
+	)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 import math
 from pathlib import Path
 from typing import Any, Mapping
@@ -16,17 +17,18 @@ except ImportError:  # pragma: no cover - environment-specific fallback
 
 from scripts.evaluate_persistence_baseline import warning_messages_for_target_channel
 from src.config import load_config
-from src.data.preprocessing import inverse_normalize_channel_map as inverse_normalize_scalar_channel_map
+from src.data.spatial_transforms import infer_with_external_test_spatial_handling
 from src.models.convlstm_unet import build_model_from_config
 from src.training.checkpoints import load_checkpoint
 from src.training.losses import get_loss_function
+from src.training.metrics import compute_metrics
 from src.training.train import (
+    _coerce_loss_result,
+    _denormalize_target_tensors_for_metrics,
     _ensure_config_path,
     _get_device,
     _infer_input_channels_from_loader,
-    _rename_result_prefix,
     _resolve_training_paths,
-    _run_epoch,
 )
 from src.data.dataset import create_dataloaders
 
@@ -59,41 +61,11 @@ def format_stats(label: str, stats: Mapping[str, float]) -> str:
     )
 
 
-def resolve_target_stats_for_inverse(dataset) -> tuple[float | None, float | None, str]:
-    """Resolve target normalization stats and record their source."""
-
-    normalization_stats = getattr(dataset, "normalization_stats", None)
-    target_channel = int(getattr(dataset, "target_channel", -1))
-    if normalization_stats is None:
-        return None, None, "none"
-
-    stats_mean = np.asarray(normalization_stats["mean"])
-    stats_std = np.asarray(normalization_stats["std"])
-    if 0 <= target_channel < stats_mean.shape[0] and target_channel < stats_std.shape[0]:
-        return (
-            float(stats_mean[target_channel]),
-            float(stats_std[target_channel]),
-            "normalization_stats['mean/std'][target_channel]",
-        )
-
-    if "target_mean" in normalization_stats and "target_std" in normalization_stats:
-        return (
-            float(np.asarray(normalization_stats["target_mean"])),
-            float(np.asarray(normalization_stats["target_std"])),
-            "normalization_stats['target_mean/std']",
-        )
-
-    return None, None, "missing"
-
-
-def generate_scale_diagnostics(model, test_loader, device: torch.device, diagnostics_path: Path) -> str:
+def generate_scale_diagnostics(model, test_loader, device: torch.device, diagnostics_path: Path, config) -> str:
     """Run the first three test batches and record scale diagnostics."""
 
     dataset = test_loader.dataset
     target_channel = int(getattr(dataset, "target_channel", -1))
-    target_mean, target_std, target_stat_source = resolve_target_stats_for_inverse(dataset)
-    dataset_target_mean = getattr(dataset, "target_mean", None)
-    dataset_target_std = getattr(dataset, "target_std", None)
     input_channel_count = int(getattr(dataset, "input_channel_count", -1))
 
     lines = []
@@ -101,11 +73,6 @@ def generate_scale_diagnostics(model, test_loader, device: torch.device, diagnos
     lines.append(f"target_channel: {target_channel}")
     lines.append(f"input_channel_count: {input_channel_count}")
     lines.append(f"normalize_target: {bool(getattr(dataset, 'normalize_target', False))}")
-    lines.append(f"target_stat_source: {target_stat_source}")
-    lines.append(f"target_mean_used_for_inverse: {target_mean}")
-    lines.append(f"target_std_used_for_inverse: {target_std}")
-    lines.append(f"dataset.target_mean: {dataset_target_mean}")
-    lines.append(f"dataset.target_std: {dataset_target_std}")
     for warning_message in warning_messages_for_target_channel(target_channel, input_channel_count):
         lines.append(f"WARNING: {warning_message}")
     lines.append("")
@@ -120,27 +87,23 @@ def generate_scale_diagnostics(model, test_loader, device: torch.device, diagnos
 
             x_batch = batch[0].to(device)
             y_batch = batch[1].to(device)
-            y_pred = model(x_batch)
-
-            if target_mean is not None and target_std is not None and bool(getattr(dataset, "normalize_target", False)):
-                y_true_inverse = inverse_normalize_scalar_channel_map(
-                    y_batch.detach().cpu().numpy(),
-                    target_mean,
-                    target_std,
-                )
-                y_pred_inverse = inverse_normalize_scalar_channel_map(
-                    y_pred.detach().cpu().numpy(),
-                    target_mean,
-                    target_std,
-                )
-            else:
-                y_true_inverse = y_batch.detach().cpu().numpy()
-                y_pred_inverse = y_pred.detach().cpu().numpy()
+            spatial_result = infer_with_external_test_spatial_handling(model, x_batch, config)
+            y_pred = spatial_result["y_pred"]
+            x_model_input = spatial_result["x_model_input"]
+            y_pred_metric, y_true_metric = _denormalize_target_tensors_for_metrics(test_loader, y_pred.detach(), y_batch.detach())
+            y_true_inverse = y_true_metric.detach().cpu().numpy()
+            y_pred_inverse = y_pred_metric.detach().cpu().numpy()
 
             abs_error_inverse = np.abs(y_pred_inverse - y_true_inverse)
 
             lines.append(f"Batch {batch_index}")
-            lines.append(format_stats("X normalized", tensor_stats(x_batch)))
+            lines.append(f"spatial_mode_used: {spatial_result['mode_used']}")
+            lines.append(f"native_input_shape: {tuple(x_batch.shape)}")
+            lines.append(f"model_input_shape: {tuple(x_model_input.shape)}")
+            lines.append(f"prediction_shape_after_crop: {tuple(y_pred.shape)}")
+            lines.append(f"target_shape: {tuple(y_batch.shape)}")
+            lines.append(format_stats("X native normalized", tensor_stats(x_batch)))
+            lines.append(format_stats("X fed to model", tensor_stats(x_model_input)))
             lines.append(format_stats("y dataset", tensor_stats(y_batch)))
             lines.append(format_stats("y_pred raw model output", tensor_stats(y_pred)))
             lines.append(format_stats("y_true inverse", tensor_stats(y_true_inverse)))
@@ -153,6 +116,78 @@ def generate_scale_diagnostics(model, test_loader, device: torch.device, diagnos
     diagnostics_path.write_text(diagnostics_text + "\n", encoding="utf-8")
     print(diagnostics_text)
     return diagnostics_text
+
+
+def evaluate_external_test_loader(model, test_loader, criterion, config, device: torch.device) -> tuple[dict[str, float], dict[str, Any]]:
+    """Evaluate an external test loader with native-grid or padded spatial handling."""
+
+    model.eval()
+    total_samples = 0
+    total_loss = 0.0
+    metric_totals: dict[str, float] = defaultdict(float)
+    loss_component_totals: dict[str, float] = defaultdict(float)
+    mode_counts: dict[str, int] = defaultdict(int)
+    first_batch_summary: dict[str, Any] | None = None
+    warning_message: str | None = None
+
+    with torch.no_grad():
+        for batch_index, batch in enumerate(test_loader):
+            if not isinstance(batch, (tuple, list)) or len(batch) < 2:
+                raise TypeError("Expected external test batches to contain input and target tensors.")
+            x_batch = batch[0].to(device)
+            y_batch = batch[1].to(device)
+
+            spatial_result = infer_with_external_test_spatial_handling(model, x_batch, config)
+            y_pred = spatial_result["y_pred"]
+            x_model_input = spatial_result["x_model_input"]
+            if tuple(y_pred.shape) != tuple(y_batch.shape):
+                raise ValueError(
+                    "External test prediction shape does not match target shape after spatial handling. "
+                    f"Prediction={tuple(y_pred.shape)} target={tuple(y_batch.shape)} mode={spatial_result['mode_used']}."
+                )
+
+            loss_result = criterion(y_pred, y_batch)
+            loss, batch_loss_components = _coerce_loss_result(loss_result)
+
+            metric_prediction, metric_target = _denormalize_target_tensors_for_metrics(
+                test_loader,
+                y_pred.detach(),
+                y_batch.detach(),
+            )
+            batch_metrics = compute_metrics(metric_prediction, metric_target, config)
+
+            batch_size = int(x_batch.shape[0])
+            total_samples += batch_size
+            total_loss += float(loss.detach().item()) * batch_size
+            for component_name, component_value in batch_loss_components.items():
+                loss_component_totals[component_name] += float(component_value) * batch_size
+            for metric_name, metric_value in batch_metrics.items():
+                metric_totals[metric_name] += float(metric_value) * batch_size
+            mode_counts[str(spatial_result["mode_used"])] += batch_size
+
+            if first_batch_summary is None:
+                first_batch_summary = {
+                    "native_input_shape": tuple(x_batch.shape),
+                    "model_input_shape": tuple(x_model_input.shape),
+                    "prediction_shape": tuple(y_pred.shape),
+                    "target_shape": tuple(y_batch.shape),
+                    "mode_used": str(spatial_result["mode_used"]),
+                }
+                warning_message = spatial_result.get("warning")
+
+    if total_samples == 0:
+        raise ValueError("External test loader produced no samples.")
+
+    results = {"test_loss": total_loss / total_samples}
+    for component_name, total_value in loss_component_totals.items():
+        results[f"test_{component_name}"] = total_value / total_samples
+    for metric_name, total_value in metric_totals.items():
+        results[f"test_{metric_name}"] = total_value / total_samples
+    return results, {
+        "mode_counts": dict(mode_counts),
+        "first_batch": first_batch_summary or {},
+        "warning": warning_message,
+    }
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -203,8 +238,6 @@ def main() -> None:
     for warning_message in warning_messages_for_target_channel(target_channel, input_channel_count):
         print(f"WARNING: {warning_message}")
 
-    input_sequence_length = int(config.get("input_sequence_length", 1))
-    output_channels = int(config.get("model", {}).get("output_channels", 1))
     input_channels = _infer_input_channels_from_loader(train_loader)
     device = _get_device(config)
 
@@ -222,26 +255,30 @@ def main() -> None:
     checkpoint = load_checkpoint(resolved_checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
 
-    raw_results = _run_epoch(
+    test_results, spatial_summary = evaluate_external_test_loader(
         model=model,
-        loader=test_loader,
+        test_loader=test_loader,
         criterion=criterion,
         config=config,
         device=device,
-        input_sequence_length=input_sequence_length,
-        input_channels=input_channels,
-        output_channels=output_channels,
-        train=False,
     )
-    test_results = _rename_result_prefix(raw_results, "val_", "test_")
 
     diagnostics_path = Path("artifacts/logs/test_scale_diagnostics.txt").expanduser().resolve()
-    generate_scale_diagnostics(model, test_loader, device, diagnostics_path)
+    generate_scale_diagnostics(model, test_loader, device, diagnostics_path, config)
 
     print(f"checkpoint: {resolved_checkpoint_path}")
     print(f"external test dataset path: {config.get('test_data_dir')}")
     print(f"external test files: {len(getattr(test_loader.dataset, 'file_paths', []))}")
     print(f"external test samples: {len(test_loader.dataset)}")
+    if spatial_summary.get("first_batch"):
+        print(f"external X before spatial handling: {spatial_summary['first_batch']['native_input_shape']}")
+        print(f"external X fed to model: {spatial_summary['first_batch']['model_input_shape']}")
+        print(f"external prediction after crop: {spatial_summary['first_batch']['prediction_shape']}")
+        print(f"external y shape: {spatial_summary['first_batch']['target_shape']}")
+        print(f"external spatial mode used on first batch: {spatial_summary['first_batch']['mode_used']}")
+    if spatial_summary.get("warning"):
+        print(f"WARNING: {spatial_summary['warning']}")
+    print(f"external spatial mode counts: {spatial_summary['mode_counts']}")
     print(f"target_channel: {target_channel}")
     for metric_name, metric_value in test_results.items():
         print(f"{metric_name}: {metric_value:.6f}")

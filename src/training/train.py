@@ -35,6 +35,7 @@ except ImportError:  # pragma: no cover - environment-specific fallback
 
 from src.config import load_config
 from src.data.dataset import create_dataloaders
+from src.data.spatial_transforms import infer_with_external_test_spatial_handling
 from src.models.convlstm_unet import build_model_from_config
 from src.training.checkpoints import latest_and_best_checkpoint_paths, load_checkpoint, save_checkpoint
 from src.training.losses import get_loss_function
@@ -325,6 +326,68 @@ def _run_epoch(
 	for metric_name, total_value in metric_totals.items():
 		results[f"{desc}_{metric_name}"] = total_value / total_samples
 	return results
+
+
+def _run_external_test_epoch_with_spatial_handling(
+	model: nn.Module,
+	loader,
+	criterion,
+	config: Mapping[str, Any],
+	device: torch.device,
+) -> tuple[dict[str, float], dict[str, int]]:
+	"""Evaluate an external test loader using direct inference or padded fallback."""
+
+	model.eval()
+	total_samples = 0
+	total_loss = 0.0
+	metric_totals: dict[str, float] = defaultdict(float)
+	loss_component_totals: dict[str, float] = defaultdict(float)
+	mode_counts: dict[str, int] = defaultdict(int)
+
+	for batch in loader:
+		x_batch, y_batch = _as_batch(batch)
+		if not torch.is_tensor(x_batch) or not torch.is_tensor(y_batch):
+			raise TypeError("Expected tensor batches from the external test DataLoader.")
+
+		x_batch = x_batch.to(device, non_blocking=True)
+		y_batch = y_batch.to(device, non_blocking=True)
+		with torch.no_grad():
+			spatial_result = infer_with_external_test_spatial_handling(model, x_batch, config)
+			y_pred = spatial_result["y_pred"]
+
+		if tuple(y_pred.shape) != tuple(y_batch.shape):
+			raise ValueError(
+				"External test prediction shape does not match target shape after spatial handling. "
+				f"Prediction={tuple(y_pred.shape)} target={tuple(y_batch.shape)} mode={spatial_result['mode_used']}."
+			)
+
+		loss_result = criterion(y_pred, y_batch)
+		loss, batch_loss_components = _coerce_loss_result(loss_result)
+		batch_size = int(x_batch.shape[0])
+		total_samples += batch_size
+		total_loss += float(loss.detach().item()) * batch_size
+		for component_name, component_value in batch_loss_components.items():
+			loss_component_totals[component_name] += float(component_value) * batch_size
+
+		metric_prediction, metric_target = _denormalize_target_tensors_for_metrics(
+			loader,
+			y_pred.detach(),
+			y_batch.detach(),
+		)
+		batch_metrics = compute_metrics(metric_prediction, metric_target, config)
+		for metric_name, metric_value in batch_metrics.items():
+			metric_totals[metric_name] += float(metric_value) * batch_size
+		mode_counts[str(spatial_result["mode_used"])] += batch_size
+
+	if total_samples == 0:
+		raise ValueError("The external test DataLoader produced no samples.")
+
+	results = {"test_loss": total_loss / total_samples}
+	for component_name, total_value in loss_component_totals.items():
+		results[f"test_{component_name}"] = total_value / total_samples
+	for metric_name, total_value in metric_totals.items():
+		results[f"test_{metric_name}"] = total_value / total_samples
+	return results, dict(mode_counts)
 
 
 def _resolve_training_paths(config: Mapping[str, Any]) -> tuple[Path, Path]:
@@ -768,19 +831,16 @@ def train_model(config_path: str | Path) -> dict[str, Any]:
 		if best_checkpoint_path.exists():
 			checkpoint = load_checkpoint(best_checkpoint_path, map_location=device)
 			model.load_state_dict(checkpoint["model_state_dict"])
-		test_results = _run_epoch(
+		test_plot_results, spatial_mode_counts = _run_external_test_epoch_with_spatial_handling(
 			model=model,
 			loader=test_loader,
 			criterion=criterion,
 			config=config,
 			device=device,
-			input_sequence_length=input_sequence_length,
-			input_channels=input_channels,
-			output_channels=output_channels,
-			train=False,
 		)
-		test_plot_results = _rename_result_prefix(test_results, "val_", "test_")
+		test_results = dict(test_plot_results)
 		logger.info("External test loss: %.6f", test_plot_results["test_loss"])
+		logger.info("External test spatial mode counts: %s", spatial_mode_counts)
 		for metric_name, metric_value in test_plot_results.items():
 			if metric_name != "test_loss":
 				logger.info("External test %s: %.6f", metric_name.removeprefix("test_"), metric_value)
@@ -834,8 +894,6 @@ def evaluate_model_on_test_set(
 	if len(test_loader.dataset) == 0:
 		raise ValueError("External test dataset is empty; cannot evaluate the model.")
 
-	input_sequence_length = int(config.get("input_sequence_length", 1))
-	output_channels = int(_get_section(config, "model").get("output_channels", 1))
 	input_channels = _infer_input_channels_from_loader(train_loader)
 	device = _get_device(config)
 
@@ -861,20 +919,16 @@ def evaluate_model_on_test_set(
 	checkpoint = load_checkpoint(resolved_checkpoint_path, map_location=device)
 	model.load_state_dict(checkpoint["model_state_dict"])
 
-	raw_results = _run_epoch(
+	test_results, spatial_mode_counts = _run_external_test_epoch_with_spatial_handling(
 		model=model,
 		loader=test_loader,
 		criterion=criterion,
 		config=config,
 		device=device,
-		input_sequence_length=input_sequence_length,
-		input_channels=input_channels,
-		output_channels=output_channels,
-		train=False,
 	)
-	test_results = _rename_result_prefix(raw_results, "val_", "test_")
 
 	logger.info("External test evaluation complete on %s samples.", len(test_loader.dataset))
+	logger.info("External test spatial mode counts: %s", spatial_mode_counts)
 	for metric_name, metric_value in test_results.items():
 		logger.info("%s=%.6f", metric_name, metric_value)
 

@@ -993,11 +993,11 @@ def create_dataloaders(config):
 				raise FileNotFoundError(
 					f"No external test files found in '{test_data_dir}' using pattern '{external_test_file_pattern}'."
 				)
+			external_test_dataset_kwargs = {**dataset_kwargs, "file_paths": external_test_files}
 			test_dataset = FireSequenceDataset(
-				file_paths=external_test_files,
 				sample_indices=None,
 				use_patches=use_eval_patches,
-				**dataset_kwargs,
+				**external_test_dataset_kwargs,
 			)
 	else:
 		test_dataset = FireSequenceDataset(sample_indices=split_indices["test"], use_patches=use_eval_patches, **dataset_kwargs)

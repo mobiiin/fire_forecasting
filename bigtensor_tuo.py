@@ -408,7 +408,7 @@ def build_argument_parser():
         "--keep-z-levels",
         nargs="+",
         type=int,
-        default=[5],
+        default=[8],
         help="One or more z-depths to keep from the 46-level ASC file, e.g. --keep-z-levels 5 10 15.",
     )
     parser.add_argument(
