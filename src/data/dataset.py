@@ -20,7 +20,7 @@ except ImportError:  # pragma: no cover - environment-specific fallback
 		pass
 
 from src.data.preprocessing import load_normalization_stats, normalize_channel_map, normalize_tensor
-from src.data.splits import chronological_split_indices
+from src.data.splits import chronological_split_indices, chronological_train_val_split_indices
 
 
 def _extract_numeric_suffix(name: str) -> int | None:
@@ -140,6 +140,22 @@ def _resolve_engineered_features_config(config: Mapping[str, Any]) -> dict[str, 
 	}
 
 
+def _resolve_atmospheric_features_config(config: Mapping[str, Any]) -> dict[str, Any]:
+	"""Resolve atmospheric engineered-feature flags with defaults."""
+
+	section = _get_section(config, "atmospheric_features")
+	return {
+		"enabled": bool(section.get("enabled", False)),
+		"num_vertical_levels": int(section.get("num_vertical_levels", 8)),
+		"variables_per_level": int(section.get("variables_per_level", 10)),
+		"add_horizontal_wind_speed": bool(section.get("add_horizontal_wind_speed", False)),
+		"add_low_level_mean_wind_speed": bool(section.get("add_low_level_mean_wind_speed", False)),
+		"add_updraft": bool(section.get("add_updraft", False)),
+		"low_level_indices": [int(index) for index in section.get("low_level_indices", [0, 1, 2])],
+		"epsilon": float(section.get("epsilon", 1e-6)),
+	}
+
+
 def _resolve_multitask_config(config: Mapping[str, Any]) -> dict[str, Any]:
 	"""Resolve multitask config with channel-layout fallbacks."""
 
@@ -172,8 +188,8 @@ def _resolve_target_normalization_config(config: Mapping[str, Any]) -> dict[str,
 	}
 
 
-def _count_engineered_channels(config: Mapping[str, Any]) -> int:
-	"""Count the number of engineered input channels that will be appended."""
+def _count_fuel_flux_engineered_channels(config: Mapping[str, Any]) -> int:
+	"""Count the number of fuel/flux engineered input channels that will be appended."""
 
 	engineered = _resolve_engineered_features_config(config)
 	if not engineered["enabled"]:
@@ -194,10 +210,147 @@ def _count_engineered_channels(config: Mapping[str, Any]) -> int:
 	return total
 
 
+def count_atmospheric_engineered_channels(config: Mapping[str, Any]) -> int:
+	"""Count the number of atmospheric engineered channels that will be appended."""
+
+	atmospheric = _resolve_atmospheric_features_config(config)
+	if not atmospheric["enabled"]:
+		return 0
+
+	num_vertical_levels = int(atmospheric["num_vertical_levels"])
+	total = 0
+	if atmospheric["add_horizontal_wind_speed"]:
+		total += num_vertical_levels
+	if atmospheric["add_low_level_mean_wind_speed"]:
+		total += 1
+	if atmospheric["add_updraft"]:
+		total += num_vertical_levels
+	return total
+
+
+def _count_engineered_channels(config: Mapping[str, Any]) -> int:
+	"""Count the total number of engineered input channels that will be appended."""
+
+	return _count_fuel_flux_engineered_channels(config) + count_atmospheric_engineered_channels(config)
+
+
 def _slice_channels(frame: np.ndarray, channel_indices: Sequence[int]) -> np.ndarray:
 	"""Slice a frame with an explicit channel list."""
 
 	return np.asarray(frame[:, :, list(channel_indices)], dtype=np.float32)
+
+
+def build_atmospheric_features(frame: np.ndarray, config: Mapping[str, Any]) -> np.ndarray:
+	"""Build atmospheric engineered features from one raw frame."""
+
+	atmospheric = _resolve_atmospheric_features_config(config)
+	if not atmospheric["enabled"]:
+		if frame.ndim != 3:
+			raise ValueError(f"build_atmospheric_features expects a raw frame shaped (H, W, C), got {frame.shape}.")
+		height, width = int(frame.shape[0]), int(frame.shape[1])
+		return np.zeros((height, width, 0), dtype=np.float32)
+
+	raw_frame = np.asarray(frame, dtype=np.float32)
+	if raw_frame.ndim != 3:
+		raise ValueError(f"build_atmospheric_features expects a raw frame shaped (H, W, C), got {raw_frame.shape}.")
+
+	num_vertical_levels = int(atmospheric["num_vertical_levels"])
+	variables_per_level = int(atmospheric["variables_per_level"])
+	required_raw_channels = num_vertical_levels * variables_per_level
+	if num_vertical_levels <= 0:
+		raise ValueError(f"atmospheric_features.num_vertical_levels must be positive, got {num_vertical_levels}.")
+	if variables_per_level <= 0:
+		raise ValueError(f"atmospheric_features.variables_per_level must be positive, got {variables_per_level}.")
+	if required_raw_channels > raw_frame.shape[2]:
+		raise ValueError(
+			"Atmospheric engineered features require more raw channels than are available. "
+			f"Need {required_raw_channels} from num_vertical_levels * variables_per_level, got {raw_frame.shape[2]}."
+		)
+
+	low_level_indices = [int(index) for index in atmospheric["low_level_indices"]]
+	invalid_low_levels = [index for index in low_level_indices if index < 0 or index >= num_vertical_levels]
+	if invalid_low_levels:
+		raise ValueError(
+			"atmospheric_features.low_level_indices contain invalid z-level indices. "
+			f"Valid range is [0, {num_vertical_levels - 1}], got {invalid_low_levels}."
+		)
+	if atmospheric["add_low_level_mean_wind_speed"] and not low_level_indices:
+		raise ValueError("atmospheric_features.low_level_indices cannot be empty when add_low_level_mean_wind_speed is enabled.")
+
+	epsilon = max(float(atmospheric["epsilon"]), 0.0)
+	per_frame_features: list[np.ndarray] = []
+	u_levels: list[np.ndarray] = []
+	v_levels: list[np.ndarray] = []
+
+	for z_level in range(num_vertical_levels):
+		base_index = z_level * variables_per_level
+		u_values = np.asarray(raw_frame[:, :, base_index + 0], dtype=np.float32)
+		v_values = np.asarray(raw_frame[:, :, base_index + 1], dtype=np.float32)
+		w_values = np.asarray(raw_frame[:, :, base_index + 2], dtype=np.float32)
+		u_levels.append(u_values)
+		v_levels.append(v_values)
+		if atmospheric["add_horizontal_wind_speed"]:
+			wind_speed = np.sqrt(u_values * u_values + v_values * v_values + epsilon).astype(np.float32, copy=False)
+			per_frame_features.append(wind_speed[:, :, None].astype(np.float32, copy=False))
+		if atmospheric["add_updraft"]:
+			updraft = np.maximum(w_values, 0.0)
+			per_frame_features.append(None)  # placeholder to preserve deterministic order after low-level mean
+
+	if atmospheric["add_low_level_mean_wind_speed"]:
+		selected_u = np.stack([u_levels[index] for index in low_level_indices], axis=0)
+		selected_v = np.stack([v_levels[index] for index in low_level_indices], axis=0)
+		mean_low_u = np.mean(selected_u, axis=0)
+		mean_low_v = np.mean(selected_v, axis=0)
+		low_level_mean_wind_speed = np.sqrt(mean_low_u * mean_low_u + mean_low_v * mean_low_v + epsilon).astype(np.float32, copy=False)
+		per_frame_features.append(low_level_mean_wind_speed[:, :, None].astype(np.float32, copy=False))
+
+	if atmospheric["add_updraft"]:
+		updraft_features: list[np.ndarray] = []
+		for z_level in range(num_vertical_levels):
+			base_index = z_level * variables_per_level
+			w_values = np.asarray(raw_frame[:, :, base_index + 2], dtype=np.float32)
+			updraft_features.append(np.maximum(w_values, 0.0)[:, :, None].astype(np.float32, copy=False))
+		per_frame_features = [feature for feature in per_frame_features if feature is not None] + updraft_features
+
+	if not per_frame_features:
+		height, width = int(raw_frame.shape[0]), int(raw_frame.shape[1])
+		return np.zeros((height, width, 0), dtype=np.float32)
+	return np.concatenate(per_frame_features, axis=-1).astype(np.float32, copy=False)
+
+
+def resolve_engineered_feature_slices(config: Mapping[str, Any], base_input_channel_count: int) -> dict[str, slice]:
+	"""Resolve deterministic channel slices for all engineered feature groups."""
+
+	offset = int(base_input_channel_count)
+	atmospheric = _resolve_atmospheric_features_config(config)
+	engineered = _resolve_engineered_features_config(config)
+	layout = _resolve_channel_layout(config)
+	slices: dict[str, slice] = {}
+
+	if atmospheric["enabled"] and atmospheric["add_horizontal_wind_speed"]:
+		num_levels = int(atmospheric["num_vertical_levels"])
+		slices["horizontal_wind_speed"] = slice(offset, offset + num_levels)
+		offset += num_levels
+	if atmospheric["enabled"] and atmospheric["add_low_level_mean_wind_speed"]:
+		slices["low_level_mean_wind_speed"] = slice(offset, offset + 1)
+		offset += 1
+	if atmospheric["enabled"] and atmospheric["add_updraft"]:
+		num_levels = int(atmospheric["num_vertical_levels"])
+		slices["updraft"] = slice(offset, offset + num_levels)
+		offset += num_levels
+	if engineered["enabled"] and engineered["add_flux_delta"]:
+		slices["flux_delta"] = slice(offset, offset + len(layout["flux_channels"]))
+		offset += len(layout["flux_channels"])
+	if engineered["enabled"] and engineered["add_fuel_delta"]:
+		slices["fuel_delta"] = slice(offset, offset + len(layout["fuel_channels"]))
+		offset += len(layout["fuel_channels"])
+	if engineered["enabled"] and engineered["add_step_consumed_fuel"]:
+		slices["step_consumed_fuel"] = slice(offset, offset + len(layout["fuel_channels"]))
+		offset += len(layout["fuel_channels"])
+	if engineered["enabled"] and engineered["add_cumulative_consumed_fuel"]:
+		slices["cumulative_consumed_fuel"] = slice(offset, offset + len(layout["fuel_channels"]))
+		offset += len(layout["fuel_channels"])
+	return slices
 
 
 def _load_initial_fuel_map(file_paths: Sequence[Path], config: Mapping[str, Any]) -> np.ndarray:
@@ -223,7 +376,9 @@ def build_engineered_features(
 	"""Build leakage-safe engineered features from current and previous frames only."""
 
 	engineered = _resolve_engineered_features_config(config)
-	if not engineered["enabled"]:
+	atmospheric_count = count_atmospheric_engineered_channels(config)
+	fuel_flux_count = _count_fuel_flux_engineered_channels(config)
+	if atmospheric_count + fuel_flux_count <= 0:
 		height, width = int(input_frames.shape[1]), int(input_frames.shape[2])
 		return np.zeros((int(input_frames.shape[0]), height, width, 0), dtype=np.float32)
 
@@ -233,36 +388,51 @@ def build_engineered_features(
 	if raw_frames.ndim != 4:
 		raise ValueError(f"build_engineered_features expects raw input_frames shaped (T, H, W, C), got {raw_frames.shape}.")
 
-	initial_fuel = _load_initial_fuel_map(resolved_paths, config)
+	initial_fuel = None
+	if engineered["enabled"] and engineered["add_cumulative_consumed_fuel"]:
+		initial_fuel = _load_initial_fuel_map(resolved_paths, config)
 	feature_frames: list[np.ndarray] = []
 	for timestep_index in range(raw_frames.shape[0]):
 		global_frame_index = int(start_index) + timestep_index
 		current_frame = raw_frames[timestep_index]
-		if global_frame_index > 0:
-			previous_frame = np.load(resolved_paths[global_frame_index - 1], mmap_mode="r", allow_pickle=False)
-		else:
-			previous_frame = current_frame
-
-		current_flux = _slice_channels(current_frame, layout["flux_channels"])
-		previous_flux = _slice_channels(previous_frame, layout["flux_channels"])
-		current_fuel = _slice_channels(current_frame, layout["fuel_channels"])
-		previous_fuel = _slice_channels(previous_frame, layout["fuel_channels"])
 
 		per_timestep_features: list[np.ndarray] = []
-		if engineered["add_flux_delta"]:
-			per_timestep_features.append(current_flux - previous_flux)
-		if engineered["add_fuel_delta"]:
-			per_timestep_features.append(current_fuel - previous_fuel)
-		if engineered["add_step_consumed_fuel"]:
-			step_consumed = previous_fuel - current_fuel
-			if engineered["clamp_consumed_fuel_nonnegative"]:
-				step_consumed = np.maximum(step_consumed, 0.0)
-			per_timestep_features.append(step_consumed)
-		if engineered["add_cumulative_consumed_fuel"]:
-			cumulative_consumed = initial_fuel - current_fuel
-			if engineered["clamp_consumed_fuel_nonnegative"]:
-				cumulative_consumed = np.maximum(cumulative_consumed, 0.0)
-			per_timestep_features.append(cumulative_consumed)
+		atmospheric_features = build_atmospheric_features(current_frame, config)
+		if atmospheric_features.shape[-1] != atmospheric_count:
+			raise ValueError(
+				"Atmospheric engineered feature count mismatch. "
+				f"Expected {atmospheric_count}, got {atmospheric_features.shape[-1]}."
+			)
+		if atmospheric_features.shape[-1] > 0:
+			per_timestep_features.append(atmospheric_features)
+
+		if engineered["enabled"]:
+			if global_frame_index > 0:
+				previous_frame = np.load(resolved_paths[global_frame_index - 1], mmap_mode="r", allow_pickle=False)
+			else:
+				previous_frame = current_frame
+
+			current_flux = _slice_channels(current_frame, layout["flux_channels"])
+			previous_flux = _slice_channels(previous_frame, layout["flux_channels"])
+			current_fuel = _slice_channels(current_frame, layout["fuel_channels"])
+			previous_fuel = _slice_channels(previous_frame, layout["fuel_channels"])
+
+			if engineered["add_flux_delta"]:
+				per_timestep_features.append(current_flux - previous_flux)
+			if engineered["add_fuel_delta"]:
+				per_timestep_features.append(current_fuel - previous_fuel)
+			if engineered["add_step_consumed_fuel"]:
+				step_consumed = previous_fuel - current_fuel
+				if engineered["clamp_consumed_fuel_nonnegative"]:
+					step_consumed = np.maximum(step_consumed, 0.0)
+				per_timestep_features.append(step_consumed)
+			if engineered["add_cumulative_consumed_fuel"]:
+				if initial_fuel is None:
+					raise ValueError("initial_fuel must be available when add_cumulative_consumed_fuel is enabled.")
+				cumulative_consumed = initial_fuel - current_fuel
+				if engineered["clamp_consumed_fuel_nonnegative"]:
+					cumulative_consumed = np.maximum(cumulative_consumed, 0.0)
+				per_timestep_features.append(cumulative_consumed)
 
 		if per_timestep_features:
 			feature_frames.append(np.concatenate(per_timestep_features, axis=-1).astype(np.float32, copy=False))
@@ -432,9 +602,12 @@ class FireSequenceDataset(Dataset):
 				f"input_channel_indices must stay within [0, {self.num_channels - 1}], got {self.base_input_channel_indices}."
 			)
 		self.base_input_channel_count = len(self.base_input_channel_indices)
-		self.engineered_channel_count = _count_engineered_channels(self.config)
+		self.fuel_flux_engineered_channel_count = _count_fuel_flux_engineered_channels(self.config)
+		self.atmospheric_engineered_channel_count = count_atmospheric_engineered_channels(self.config)
+		self.engineered_channel_count = self.fuel_flux_engineered_channel_count + self.atmospheric_engineered_channel_count
 		self.total_input_channels = self.base_input_channel_count + self.engineered_channel_count
 		self.input_channels_after_engineering = self.total_input_channels
+		self.engineered_feature_slices = resolve_engineered_feature_slices(self.config, self.base_input_channel_count)
 
 		max_valid_start = len(self.file_paths) - self.input_sequence_length - self.prediction_horizon
 		if max_valid_start < 0:
@@ -709,6 +882,8 @@ class FireSequenceDataset(Dataset):
 				"current_file_path": str(current_file_path),
 				"target_file_path": str(target_file_path),
 				"input_channel_count_base": int(self.base_input_channel_count),
+				"fuel_flux_engineered_channel_count": int(self.fuel_flux_engineered_channel_count),
+				"atmospheric_engineered_channel_count": int(self.atmospheric_engineered_channel_count),
 				"engineered_channel_count": int(self.engineered_channel_count),
 				"total_input_channels": int(self.total_input_channels),
 			}
@@ -748,15 +923,31 @@ def create_dataloaders(config):
 	input_channel_count = int(config.get("input_channel_count", config.get("model", {}).get("input_channels", 0)))
 	if input_channel_count <= 0:
 		raise KeyError("Config must define a positive input_channel_count or model.input_channels.")
-
-	split_indices = chronological_split_indices(
-		num_timesteps=len(files),
-		input_sequence_length=input_sequence_length,
-		prediction_horizon=prediction_horizon,
-		train_fraction=float(config.get("train_fraction", 0.7)),
-		val_fraction=float(config.get("val_fraction", 0.15)),
-		test_fraction=float(config.get("test_fraction", 0.15)),
-	)
+	split_mode = str(config.get("split_mode", "train_val_test")).lower()
+	train_fraction = float(config.get("train_fraction", 0.7))
+	val_fraction = float(config.get("val_fraction", 0.15))
+	test_fraction = float(config.get("test_fraction", 0.15))
+	if split_mode == "train_val_external_test":
+		split_indices = {
+			**chronological_train_val_split_indices(
+				num_timesteps=len(files),
+				input_sequence_length=input_sequence_length,
+				prediction_horizon=prediction_horizon,
+				train_fraction=train_fraction,
+				val_fraction=val_fraction,
+			),
+			"test": [],
+		}
+	else:
+		split_indices = chronological_split_indices(
+			num_timesteps=len(files),
+			input_sequence_length=input_sequence_length,
+			prediction_horizon=prediction_horizon,
+			train_fraction=train_fraction,
+			val_fraction=val_fraction,
+			test_fraction=test_fraction,
+			split_mode=split_mode,
+		)
 
 	normalization_stats = None
 	normalization_config = _get_section(config, "normalization")
@@ -789,7 +980,27 @@ def create_dataloaders(config):
 
 	train_dataset = FireSequenceDataset(sample_indices=split_indices["train"], use_patches=use_train_patches, **dataset_kwargs)
 	val_dataset = FireSequenceDataset(sample_indices=split_indices["val"], use_patches=use_eval_patches, **dataset_kwargs)
-	test_dataset = FireSequenceDataset(sample_indices=split_indices["test"], use_patches=use_eval_patches, **dataset_kwargs)
+	test_dataset = None
+	test_data_dir_value = config.get("test_data_dir")
+	if split_mode == "train_val_external_test":
+		if test_data_dir_value not in (None, "", "null"):
+			test_data_dir = _resolve_path(config_path, test_data_dir_value)
+			external_test_file_pattern = str(config.get("external_test_file_pattern", file_pattern))
+			if not test_data_dir.exists():
+				raise FileNotFoundError(f"External test data directory does not exist: {test_data_dir}")
+			external_test_files = _sort_chronologically(list(test_data_dir.glob(external_test_file_pattern)))
+			if not external_test_files:
+				raise FileNotFoundError(
+					f"No external test files found in '{test_data_dir}' using pattern '{external_test_file_pattern}'."
+				)
+			test_dataset = FireSequenceDataset(
+				file_paths=external_test_files,
+				sample_indices=None,
+				use_patches=use_eval_patches,
+				**dataset_kwargs,
+			)
+	else:
+		test_dataset = FireSequenceDataset(sample_indices=split_indices["test"], use_patches=use_eval_patches, **dataset_kwargs)
 
 	batch_size = int(config.get("batch_size", 4))
 	num_workers = int(config.get("num_workers", 0))
@@ -809,14 +1020,16 @@ def create_dataloaders(config):
 		pin_memory=torch.cuda.is_available(),
 		drop_last=False,
 	)
-	test_loader = DataLoader(
-		test_dataset,
-		batch_size=batch_size,
-		shuffle=False,
-		num_workers=num_workers,
-		pin_memory=torch.cuda.is_available(),
-		drop_last=False,
-	)
+	test_loader = None
+	if test_dataset is not None:
+		test_loader = DataLoader(
+			test_dataset,
+			batch_size=batch_size,
+			shuffle=False,
+			num_workers=num_workers,
+			pin_memory=torch.cuda.is_available(),
+			drop_last=False,
+		)
 	return train_loader, val_loader, test_loader
 
 

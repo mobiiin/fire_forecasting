@@ -6,12 +6,26 @@ import math
 from typing import Dict, List
 
 
+def _validate_nonnegative_fraction(name: str, fraction: float) -> None:
+	"""Validate that one split fraction is non-negative."""
+
+	if fraction < 0.0:
+		raise ValueError(f"{name} must be non-negative, got {fraction}.")
+
+
 def _validate_fractions(
 	train_fraction: float,
 	val_fraction: float,
 	test_fraction: float,
 ) -> None:
 	"""Validate split fractions before computing indices."""
+
+	for name, fraction in (
+		("train_fraction", train_fraction),
+		("val_fraction", val_fraction),
+		("test_fraction", test_fraction),
+	):
+		_validate_nonnegative_fraction(name, fraction)
 
 	total = train_fraction + val_fraction + test_fraction
 	if not math.isclose(total, 1.0, rel_tol=1e-6, abs_tol=1e-6):
@@ -20,27 +34,21 @@ def _validate_fractions(
 			f"Got train={train_fraction}, val={val_fraction}, test={test_fraction}, total={total}."
 		)
 
-	for name, fraction in (
-		("train_fraction", train_fraction),
-		("val_fraction", val_fraction),
-		("test_fraction", test_fraction),
-	):
-		if fraction < 0.0:
-			raise ValueError(f"{name} must be non-negative, got {fraction}.")
 
-
-def _segment_lengths(
-	num_timesteps: int,
+def _validate_train_val_fractions(
 	train_fraction: float,
 	val_fraction: float,
-	test_fraction: float,
-) -> tuple[int, int, int]:
-	"""Convert fractions into contiguous raw time-segment lengths."""
+) -> None:
+	"""Validate fractions for train/validation-only chronological splitting."""
 
-	train_length = int(math.floor(num_timesteps * train_fraction))
-	val_length = int(math.floor(num_timesteps * val_fraction))
-	test_length = num_timesteps - train_length - val_length
-	return train_length, val_length, test_length
+	_validate_nonnegative_fraction("train_fraction", train_fraction)
+	_validate_nonnegative_fraction("val_fraction", val_fraction)
+	total = train_fraction + val_fraction
+	if not math.isclose(total, 1.0, rel_tol=1e-6, abs_tol=1e-6):
+		raise ValueError(
+			"For split_mode='train_val_external_test', train_fraction + val_fraction must sum to 1.0. "
+			f"Got train={train_fraction}, val={val_fraction}, total={total}."
+		)
 
 
 def _sample_starts_for_segment(
@@ -57,6 +65,49 @@ def _sample_starts_for_segment(
 	return list(range(segment_start, latest_start + 1))
 
 
+def chronological_train_val_split_indices(
+	num_timesteps: int,
+	input_sequence_length: int,
+	prediction_horizon: int,
+	train_fraction: float,
+	val_fraction: float,
+) -> Dict[str, List[int]]:
+	"""Split forecasting sample indices chronologically into train and validation only."""
+
+	if num_timesteps <= 0:
+		raise ValueError(f"num_timesteps must be positive, got {num_timesteps}.")
+	if input_sequence_length <= 0:
+		raise ValueError(f"input_sequence_length must be positive, got {input_sequence_length}.")
+	if prediction_horizon < 0:
+		raise ValueError(f"prediction_horizon must be non-negative, got {prediction_horizon}.")
+
+	_validate_train_val_fractions(train_fraction, val_fraction)
+
+	max_valid_start = num_timesteps - input_sequence_length - prediction_horizon
+	if max_valid_start < 0:
+		raise ValueError(
+			"Not enough timesteps to form a single valid sample. "
+			f"Need at least input_sequence_length + prediction_horizon = "
+			f"{input_sequence_length + prediction_horizon}, got {num_timesteps}."
+		)
+
+	train_length = int(math.floor(num_timesteps * train_fraction))
+	val_segment_start = train_length
+	train = _sample_starts_for_segment(
+		segment_start=0,
+		segment_end=val_segment_start,
+		input_sequence_length=input_sequence_length,
+		prediction_horizon=prediction_horizon,
+	)
+	val = _sample_starts_for_segment(
+		segment_start=val_segment_start,
+		segment_end=num_timesteps,
+		input_sequence_length=input_sequence_length,
+		prediction_horizon=prediction_horizon,
+	)
+	return {"train": train, "val": val}
+
+
 def chronological_split_indices(
 	num_timesteps: int,
 	input_sequence_length: int,
@@ -64,24 +115,29 @@ def chronological_split_indices(
 	train_fraction: float,
 	val_fraction: float,
 	test_fraction: float,
+	split_mode: str = "train_val_test",
 ) -> Dict[str, List[int]]:
-	"""Split forecasting sample indices chronologically without time leakage.
+	"""Split forecasting sample indices chronologically.
 
-	A sample with start index ``i`` uses raw timestamps::
-
-		X = [i, i + 1, ..., i + input_sequence_length - 1]
-		y = i + input_sequence_length - 1 + prediction_horizon
-
-	The split is performed on the raw timestamp axis first and then converted
-	into valid sample start indices for each contiguous time block.
+	When ``split_mode == "train_val_external_test"``, the main dataset is split
+	into train and validation only, and the returned internal test split is empty.
 	"""
+
+	split_mode = str(split_mode).lower()
+	if split_mode == "train_val_external_test":
+		train_val = chronological_train_val_split_indices(
+			num_timesteps=num_timesteps,
+			input_sequence_length=input_sequence_length,
+			prediction_horizon=prediction_horizon,
+			train_fraction=train_fraction,
+			val_fraction=val_fraction,
+		)
+		return {"train": train_val["train"], "val": train_val["val"], "test": []}
 
 	if num_timesteps <= 0:
 		raise ValueError(f"num_timesteps must be positive, got {num_timesteps}.")
 	if input_sequence_length <= 0:
-		raise ValueError(
-			f"input_sequence_length must be positive, got {input_sequence_length}."
-		)
+		raise ValueError(f"input_sequence_length must be positive, got {input_sequence_length}.")
 	if prediction_horizon < 0:
 		raise ValueError(f"prediction_horizon must be non-negative, got {prediction_horizon}.")
 
@@ -95,60 +151,28 @@ def chronological_split_indices(
 			f"{input_sequence_length + prediction_horizon}, got {num_timesteps}."
 		)
 
-	train_length, val_length, test_length = _segment_lengths(
-		num_timesteps,
-		train_fraction,
-		val_fraction,
-		test_fraction,
-	)
-
-	train_segment_start = 0
+	train_length = int(math.floor(num_timesteps * train_fraction))
+	val_length = int(math.floor(num_timesteps * val_fraction))
 	val_segment_start = train_length
 	test_segment_start = train_length + val_length
 
-	train = _sample_starts_for_segment(
-		segment_start=train_segment_start,
-		segment_end=val_segment_start,
-		input_sequence_length=input_sequence_length,
-		prediction_horizon=prediction_horizon,
-	)
-	val = _sample_starts_for_segment(
-		segment_start=val_segment_start,
-		segment_end=test_segment_start,
-		input_sequence_length=input_sequence_length,
-		prediction_horizon=prediction_horizon,
-	)
-	test = _sample_starts_for_segment(
-		segment_start=test_segment_start,
-		segment_end=num_timesteps,
-		input_sequence_length=input_sequence_length,
-		prediction_horizon=prediction_horizon,
-	)
-
-	# The segment lengths are useful for debugging and can expose corner cases.
-	_ = (train_length, val_length, test_length, max_valid_start)
-
+	train = _sample_starts_for_segment(0, val_segment_start, input_sequence_length, prediction_horizon)
+	val = _sample_starts_for_segment(val_segment_start, test_segment_start, input_sequence_length, prediction_horizon)
+	test = _sample_starts_for_segment(test_segment_start, num_timesteps, input_sequence_length, prediction_horizon)
 	return {"train": train, "val": val, "test": test}
 
 
 if __name__ == "__main__":
-	splits = chronological_split_indices(
+	splits = chronological_train_val_split_indices(
 		num_timesteps=100,
 		input_sequence_length=6,
 		prediction_horizon=1,
-		train_fraction=0.7,
+		train_fraction=0.85,
 		val_fraction=0.15,
-		test_fraction=0.15,
 	)
-
 	assert splits["train"], "train split should not be empty for the demo case"
 	assert splits["val"], "val split should not be empty for the demo case"
-	assert splits["test"], "test split should not be empty for the demo case"
 	assert splits["train"] == sorted(splits["train"])
 	assert splits["val"] == sorted(splits["val"])
-	assert splits["test"] == sorted(splits["test"])
 	assert max(splits["train"]) < min(splits["val"])
-	assert max(splits["val"]) < min(splits["test"])
-	assert splits["train"][0] == 0
-	assert splits["train"][-1] + 6 + 1 <= 70
-	print("chronological_split_indices demo passed")
+	print("chronological_train_val_split_indices demo passed")

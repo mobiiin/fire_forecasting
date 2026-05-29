@@ -15,7 +15,16 @@ except ImportError:  # pragma: no cover - environment-specific fallback
 	torch = None
 
 from src.config import load_config
-from src.data.dataset import _count_engineered_channels, _resolve_multitask_config, create_dataloaders
+from src.data.dataset import (
+	_count_fuel_flux_engineered_channels,
+	_resolve_path,
+	_sort_chronologically,
+	count_atmospheric_engineered_channels,
+	_resolve_atmospheric_features_config,
+	_resolve_multitask_config,
+	create_dataloaders,
+	resolve_engineered_feature_slices,
+)
 from src.models.convlstm_unet import build_model_from_config
 from src.training.losses import get_loss_function
 
@@ -81,17 +90,50 @@ def main() -> None:
 	config["config_path"] = str(config_path)
 
 	_print_environment_info()
-	train_loader, _, _ = create_dataloaders(config)
-	if len(train_loader.dataset) == 0:
-		raise ValueError("Train dataset is empty; cannot run sanity checks.")
-
-	first_file = train_loader.dataset.file_paths[0]
+	data_dir = _resolve_path(config_path, config["data_dir"])
+	atmospheric = _resolve_atmospheric_features_config(config)
+	raw_files = _sort_chronologically(list(data_dir.glob(str(config["file_pattern"]))))
+	if not raw_files:
+		raise FileNotFoundError(f"No files found in '{data_dir}' using pattern '{config['file_pattern']}'.")
+	first_file = raw_files[0]
 	first_tensor = np.load(first_file, allow_pickle=False)
 	if first_tensor.shape != (144, 144, 86):
 		raise ValueError(f"Expected one raw tensor shaped (144, 144, 86), got {first_tensor.shape} at {first_file}.")
+	required_atmospheric_channels = int(atmospheric["num_vertical_levels"]) * int(atmospheric["variables_per_level"])
+	if atmospheric["enabled"] and required_atmospheric_channels > first_tensor.shape[2]:
+		print(
+			"WARNING: atmospheric_features.num_vertical_levels * variables_per_level exceeds the raw channel count. "
+			f"Need {required_atmospheric_channels}, raw file has {first_tensor.shape[2]}."
+		)
+	invalid_low_level_indices = [
+		int(index)
+		for index in atmospheric["low_level_indices"]
+		if int(index) < 0 or int(index) >= int(atmospheric["num_vertical_levels"])
+	]
+	if atmospheric["enabled"] and invalid_low_level_indices:
+		print(
+			"WARNING: atmospheric_features.low_level_indices contain invalid z-level indices: "
+			f"{invalid_low_level_indices}"
+		)
+
+	train_loader, val_loader, test_loader = create_dataloaders(config)
+	if len(train_loader.dataset) == 0:
+		raise ValueError("Train dataset is empty; cannot run sanity checks.")
+
 	print("Raw data")
 	print(f"  path: {first_file}")
 	print(f"  shape: {first_tensor.shape}")
+	print("Split info")
+	print(f"  split_mode: {config.get('split_mode', 'train_val_test')}")
+	print(f"  train_fraction: {config.get('train_fraction')}")
+	print(f"  val_fraction: {config.get('val_fraction')}")
+	print(f"  train samples: {len(train_loader.dataset)}")
+	print(f"  val samples: {len(val_loader.dataset)}")
+	if test_loader is None:
+		print("  external test samples: not configured")
+		print("  warning: no external test_data_dir configured; sanity check covers training/validation only")
+	else:
+		print(f"  external test samples: {len(test_loader.dataset)}")
 
 	x_batch, y_batch = next(iter(train_loader))[:2]
 	if x_batch.ndim != 5:
@@ -120,11 +162,22 @@ def main() -> None:
 	if not torch.isfinite(total_loss):
 		raise ValueError(f"Loss is non-finite: {float(total_loss.item())}")
 
-	engineered_channel_count = _count_engineered_channels(config)
+	base_input_channel_count = int(train_loader.dataset.base_input_channel_count)
+	fuel_flux_engineered_channel_count = _count_fuel_flux_engineered_channels(config)
+	atmospheric_engineered_channel_count = count_atmospheric_engineered_channels(config)
+	engineered_channel_slices = resolve_engineered_feature_slices(config, base_input_channel_count)
+	configured_model_input_channels = int(config.get("model", {}).get("input_channels", int(x_batch.shape[2])))
 	print("Channels")
-	print(f"  base input channels: {int(config.get('input_channel_count', 0))}")
-	print(f"  engineered channels: {engineered_channel_count}")
+	print(f"  base input channels: {base_input_channel_count}")
+	print(f"  fuel/flux engineered channels: {fuel_flux_engineered_channel_count}")
+	print(f"  atmospheric engineered channels: {atmospheric_engineered_channel_count}")
 	print(f"  total input channels: {int(x_batch.shape[2])}")
+	print(f"  model.input_channels: {configured_model_input_channels}")
+	if configured_model_input_channels != int(x_batch.shape[2]):
+		print(
+			"WARNING: model.input_channels does not match the actual dataset input width. "
+			f"Configured={configured_model_input_channels}, actual={int(x_batch.shape[2])}."
+		)
 
 	if task_type == "multitask":
 		multitask = _resolve_multitask_config(config)
@@ -147,6 +200,13 @@ def main() -> None:
 	print(f"  X batch shape: {tuple(x_batch.shape)}")
 	print(f"  y batch shape: {tuple(y_batch.shape)}")
 	print(f"  model output shape: {tuple(y_pred.shape)}")
+	if atmospheric_engineered_channel_count > 0:
+		if "horizontal_wind_speed" in engineered_channel_slices:
+			print(_format_stats("  horizontal wind speed channels", _tensor_stats(x_batch[:, :, engineered_channel_slices["horizontal_wind_speed"], :, :])))
+		if "low_level_mean_wind_speed" in engineered_channel_slices:
+			print(_format_stats("  low-level mean wind speed channel", _tensor_stats(x_batch[:, :, engineered_channel_slices["low_level_mean_wind_speed"], :, :])))
+		if "updraft" in engineered_channel_slices:
+			print(_format_stats("  updraft channels", _tensor_stats(x_batch[:, :, engineered_channel_slices["updraft"], :, :])))
 
 	if task_type == "multitask":
 		surface_stats = _tensor_stats(y_batch[:, 0])

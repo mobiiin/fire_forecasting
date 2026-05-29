@@ -1,102 +1,453 @@
+# Wildfire ConvLSTM U-Net default experiment config.
+# This file is intentionally verbose so it can also serve as an ablation reference.
+# Parameter values are unchanged; comments list the supported options or valid ranges.
+
+# Main dataset directory used for training/validation.
+# Options: any relative or absolute directory path containing one .npy file per timestamp.
 data_dir: ../keepz_08
+
+# External final-test dataset directory.
+# Options: null to disable external testing, or any relative/absolute directory path.
+test_data_dir: null
+
+# Glob pattern for the main dataset files.
+# Options: any glob accepted by pathlib.Path.glob, e.g. "*.npy", "frame_*.npy".
 file_pattern: "*.npy"
+
+# Glob pattern for external test files.
+# Options: any glob; if omitted in other configs, code falls back to file_pattern.
+external_test_file_pattern: "*.npy"
+
+# Number of historical frames fed into the model.
+# Options: any positive integer >= 1.
 input_sequence_length: 6
+
+# Forecast horizon in frames after the last input timestep.
+# Options: any integer >= 0.
 prediction_horizon: 1
+
+# Legacy single-target channel index used by regression/segmentation utilities.
+# Options: any valid raw channel index in [0, C_raw - 1].
+# In multitask mode this is mostly for backward-compatible scripts.
 target_channel: 84
 
+# Dataset split policy.
+# Supported options:
+# - train_val_external_test: main data_dir -> chronological train/val only, test_data_dir used for final testing
+# - train_val_test: legacy chronological train/val/test split within data_dir
+split_mode: train_val_external_test
+
+# Learning task.
+# Supported options:
+# - regression
+# - segmentation
+# - multitask
 task_type: multitask
+
+# Threshold used by several regression/segmentation utilities when turning scalar maps into active masks.
+# Options: any float threshold appropriate for the chosen target variable.
 fire_threshold: 0.5
+
+# Whether to sample spatial patches during training.
+# Options: true, false
 use_patches: false
+
+# Whether to use patches during validation/external test/inference utilities.
+# Options: true, false
 use_patches_for_eval: false
+
+# Patch size used when patch mode is enabled.
+# Options: any positive integer <= min(H, W).
 patch_size: 64
+
+# Probability of sampling a patch around active pixels when patch mode is enabled.
+# Options: float in [0, 1].
 active_patch_probability: 0.7
+
+# Activity threshold used for active-patch sampling and some weighted metrics/losses.
+# Options: any float threshold in the target's physical range.
 active_threshold: 0.5
-train_fraction: 0.7
+
+# Chronological train fraction for the main dataset.
+# Options:
+# - for split_mode=train_val_external_test: train_fraction + val_fraction must sum to 1.0
+# - for split_mode=train_val_test: train_fraction + val_fraction + test_fraction must sum to 1.0
+train_fraction: 0.85
+
+# Chronological validation fraction for the main dataset.
+# Options: see train_fraction rules above.
 val_fraction: 0.15
-test_fraction: 0.15
+
+# Chronological internal test fraction.
+# Options:
+# - 0.0 when using train_val_external_test
+# - positive fraction when using legacy train_val_test
+test_fraction: 0.0
+
+# Batch size for DataLoaders.
+# Options: any positive integer >= 1, limited by memory.
 batch_size: 4
+
+# Top-level learning rate fallback.
+# Options: any positive float > 0.
+# training.learning_rate would override this if added later.
 learning_rate: 0.0001
-epochs: 50
+
+# Total training epochs.
+# Options: any positive integer >= 1.
+epochs: 5
+
+# Number of DataLoader workers.
+# Options: any integer >= 0.
 num_workers: 4
+
+# Device selection.
+# Supported options in code:
+# - auto
+# - cpu
+# - cuda
+# - gpu   # alias for cuda
 device: auto
 
+# Number of raw/base channels to take before adding engineered channels.
+# Options: any integer in [1, C_raw].
 input_channel_count: 86
+
+# Explicit base input channel list.
+# Options:
+# - null: use channels [0, 1, ..., input_channel_count - 1]
+# - explicit list of valid raw channel indices
 input_channel_indices: null
 
 channel_layout:
+  # Informational atmospheric channel span.
+  # Options: any inclusive [start, end] pair describing where atmospheric channels live.
   atmospheric_channels: [0, 79]
+
+  # Raw flux channel indices used by engineered features and some masks.
+  # Options: any valid list of raw channel indices.
   flux_channels: [80, 81, 82, 83]
+
+  # Raw fuel channel indices used by engineered features and multitask targets.
+  # Options: any valid list of exactly two raw channel indices [surface, canopy].
   fuel_channels: [84, 85]
+
+  # Raw surface fuel channel index.
+  # Options: any valid raw channel index; defaults to fuel_channels[0] if omitted.
   surface_fuel_channel: 84
+
+  # Raw canopy fuel channel index.
+  # Options: any valid raw channel index; defaults to fuel_channels[1] if omitted.
   canopy_fuel_channel: 85
+
+  # Raw flux channel used to derive active-fire masks in active_flux mode.
+  # Options: any valid raw channel index; defaults to flux_channels[0] if omitted.
   flux_mask_channel: 80
 
 engineered_features:
+  # Master switch for fuel/flux engineered features.
+  # Options: true, false
   enabled: true
+
+  # Append current_flux - previous_flux for each configured flux channel.
+  # Options: true, false
   add_flux_delta: true
+
+  # Append current_fuel - previous_fuel for each configured fuel channel.
+  # Options: true, false
   add_fuel_delta: true
+
+  # Append previous_fuel - current_fuel for each configured fuel channel.
+  # Options: true, false
   add_step_consumed_fuel: true
+
+  # Append initial_fuel - current_fuel for each configured fuel channel.
+  # Options: true, false
   add_cumulative_consumed_fuel: true
+
+  # Initial-fuel reference strategy.
+  # Currently implemented options:
+  # - first_dataset_frame
   initial_fuel_mode: first_dataset_frame
+
+  # Clamp step/cumulative consumed-fuel engineered inputs to be nonnegative.
+  # Options: true, false
   clamp_consumed_fuel_nonnegative: true
 
+atmospheric_features:
+  # Master switch for atmospheric engineered features.
+  # Options: true, false
+  enabled: true
+
+  # Number of retained z-levels.
+  # Options: any positive integer >= 1, as long as num_vertical_levels * variables_per_level <= raw channel count.
+  num_vertical_levels: 8
+
+  # Number of atmospheric variables per z-level.
+  # Options: any positive integer >= 1.
+  variables_per_level: 10
+
+  # Append sqrt(U^2 + V^2 + epsilon) for every retained z-level.
+  # Options: true, false
+  add_horizontal_wind_speed: true
+
+  # Append one low-level mean wind-speed channel.
+  # Options: true, false
+  add_low_level_mean_wind_speed: true
+
+  # Append max(W, 0) for every retained z-level.
+  # Options: true, false
+  add_updraft: true
+
+  # Z-level indices used for the low-level mean wind feature.
+  # Options: any non-empty list of valid zero-based z-level indices in [0, num_vertical_levels - 1].
+  low_level_indices: [0, 1, 2]
+
+  # Small positive constant used in sqrt computations for wind speed.
+  # Options: any float >= 0.
+  epsilon: 1.0e-06
+
 multitask:
+  # Multitask output mode.
+  # Currently implemented options:
+  # - surface_canopy_consumed_plus_mask
   output_mode: surface_canopy_consumed_plus_mask
+
+  # Output/label channel mapping follows:
+  # y[:, 0] = surface consumed fuel
+  # y[:, 1] = canopy consumed fuel
+  # y[:, 2] = binary mask target
+
+  # Raw surface fuel channel used to build multitask regression targets.
+  # Options: any valid raw channel index.
   surface_fuel_channel: 84
+
+  # Raw canopy fuel channel used to build multitask regression targets.
+  # Options: any valid raw channel index.
   canopy_fuel_channel: 85
+
+  # Raw flux channel used to build the active_flux mask target.
+  # Options: any valid raw channel index.
   flux_mask_channel: 80
+
+  # Binary mask target definition.
+  # Supported options:
+  # - active_flux
+  # - burned_fuel
   mask_target_type: active_flux
+
+  # Threshold for active_flux mask_target_type.
+  # Options: any float threshold in the selected flux channel's range.
   flux_fire_threshold: 0.05
+
+  # Threshold for burned_fuel mask_target_type.
+  # Options: any float >= 0.
   consumed_fuel_threshold: 0.01
+
+  # Clamp consumed-fuel regression targets to be nonnegative.
+  # Options: true, false
   clamp_consumed_fuel_targets_nonnegative: true
+
+  # Multitask regression loss for channels 0 and 1.
+  # Supported options:
+  # - weighted_huber
+  # - weighted_mse
+  # - huber
+  # - mse
   regression_loss: weighted_huber
+
+  # Multitask segmentation loss for channel 2 logits.
+  # Supported options:
+  # - bce_dice
+  # - bce_with_logits
+  # - dice
+  # - focal
   segmentation_loss: bce_dice
+
+  # Weight for surface regression loss in total multitask loss.
+  # Options: any nonnegative float.
   surface_loss_weight: 1.0
+
+  # Weight for canopy regression loss in total multitask loss.
+  # Options: any nonnegative float.
   canopy_loss_weight: 1.0
+
+  # Weight for segmentation loss in total multitask loss.
+  # Options: any nonnegative float.
   segmentation_loss_weight: 1.0
+
+  # Weight applied to active pixels in weighted multitask losses.
+  # Options: any positive float > 0.
   active_fire_weight: 10.0
+
+  # Weight applied to background pixels in weighted multitask losses.
+  # Options: any positive float > 0.
   background_weight: 1.0
 
 target_normalization:
+  # Whether to normalize target channels.
+  # Options: true, false
+  # Note: for multitask, only channels 0 and 1 are normalized; the binary mask is never normalized.
   enabled: false
+
+  # Target normalization method.
+  # Currently implemented options:
+  # - zscore
   method: zscore
 
 model:
+  # Model family.
+  # Currently implemented/used here:
+  # - convlstm_unet
   name: convlstm_unet
-  input_channels: 96
+
+  # Total input channels after all enabled engineered features are appended.
+  # Options: any positive integer matching the actual dataset tensor width after engineering.
+  input_channels: 113
+
+  # ConvLSTM hidden dimension.
+  # Options: any positive integer >= 1.
   hidden_dim: 64
+
+  # ConvLSTM kernel size.
+  # Options: any positive integer >= 1.
   kernel_size: 3
+
+  # Number of ConvLSTM layers.
+  # Options: any positive integer >= 1.
   num_layers: 1
+
+  # Dropout probability in the model.
+  # Options: float in [0, 1).
   dropout: 0.0
+
+  # Output channels.
+  # Options: any positive integer >= 1.
+  # Common values:
+  # - 1 for regression/segmentation
+  # - 3 for the current multitask setup
   output_channels: 3
+
+  # Optional output activation at the model head.
+  # Supported options in code:
+  # - null
+  # - sigmoid
+  # - relu
+  # Note: multitask mode forces this to null internally.
   output_activation: null
 
 normalization:
+  # Saved normalization-stats file.
+  # Options: any relative or absolute .npz path.
   path: ./artifacts/normalization_stats.npz
+
+  # Input normalization method.
+  # Currently implemented options:
+  # - zscore
   method: zscore
+
+  # Minimum std floor / epsilon for normalization.
+  # Options: any positive float > 0.
   epsilon: 1.0e-06
+
+  # Legacy target-normalization flag used by older scripts.
+  # Options: true, false
+  # Prefer target_normalization.enabled for new configs.
   normalize_target: false
 
 checkpoint:
+  # Base checkpoint path. Training derives latest/best checkpoint filenames from this stem.
+  # Options: any relative or absolute file path.
   path: ./artifacts/checkpoints/convlstm_unet.pt
+
+  # Legacy/intended checkpoint behavior flag.
+  # Options: true, false
+  # Note: current training code always writes both latest and best checkpoints.
   save_best_only: true
+
+  # Metric name to monitor.
+  # Common/expected options: val_loss
+  # Note: current training code selects best checkpoint using validation loss directly.
   monitor: val_loss
 
 visualization:
+  # Output root directory for saved figures.
+  # Options: any relative or absolute directory path.
   output_path: ./outputs/visualizations_multitask
+
+  # Matplotlib colormap.
+  # Options: any valid matplotlib colormap string, e.g. inferno, viridis, magma, plasma, cividis.
   cmap: inferno
+
+  # Figure DPI.
+  # Options: any positive integer >= 1.
   dpi: 150
+
+  # Generic target threshold used by some visualization utilities.
+  # Options: any float threshold appropriate for the displayed target.
   target_threshold: 0.5
 
 training:
+  # Optimizer choice.
+  # Supported options:
+  # - adam
+  # - adamw
+  # - sgd
   optimizer: adamw
+
+  # Optimizer weight decay.
+  # Options: any float >= 0.
   weight_decay: 0.0
+
+  # Gradient clipping norm.
+  # Options:
+  # - positive float to enable clipping
+  # - 0 / 0.0 / null to disable clipping
   gradient_clip_norm: 1.0
+
+  # Enable automatic mixed precision during training.
+  # Options: true, false
+  # Only has effect on CUDA devices.
   mixed_precision: false
+
+  # Whether to run external test evaluation automatically after training.
+  # Options: true, false
+  run_external_test_after_training: false
+
+  # Learning-rate scheduler.
+  # Supported options:
+  # - reduce_on_plateau
+  # - plateau
+  # - cosine
+  # - cosineannealinglr
+  # - cosine_annealing
+  # - cosine_annealing_lr
   scheduler: reduce_on_plateau
+
+  # ReduceLROnPlateau factor.
+  # Options: positive float in (0, 1] typically.
   scheduler_factor: 0.5
+
+  # ReduceLROnPlateau patience in epochs.
+  # Options: integer >= 0.
   scheduler_patience: 5
 
+  # Optional training-only keys supported by code even though not set here:
+  # - learning_rate: positive float > 0
+  # - momentum: positive float, used with SGD
+  # - scheduler_min_lr: float >= 0, used with reduce_on_plateau
+  # - scheduler_eta_min: float >= 0, used with cosine schedulers
+  # - device: auto | cpu | cuda | gpu
+  # - seed: integer
+  # - eps: float > 0
+  # - huber_delta: float > 0
+  # - task_type: regression | segmentation | multitask
+
 logging:
+  # Logging level.
+  # Supported/common options: DEBUG, INFO, WARNING, ERROR, CRITICAL
   level: INFO
+
+  # Log directory.
+  # Options: any relative or absolute directory path.
   log_dir: ./artifacts/logs

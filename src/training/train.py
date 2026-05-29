@@ -634,14 +634,15 @@ def train_model(config_path: str | Path) -> dict[str, Any]:
 		history_rows = _coerce_history_rows(checkpoint.get("history", []))
 
 	if start_epoch >= epochs:
-		logger.info("Checkpoint already covers requested epochs (%s). Skipping training and running final evaluation.", epochs)
+		logger.info("Checkpoint already covers requested epochs (%s). Skipping training.", epochs)
 
 	training_log_path = Path("outputs/training_log.csv").resolve()
 	training_log_path.parent.mkdir(parents=True, exist_ok=True)
 	append_log = training_log_path.exists() and start_epoch > 0
 
 	logger.info("Starting training for %s epochs", epochs)
-	logger.info("Train samples: %s | Val samples: %s | Test samples: %s", len(train_loader.dataset), len(val_loader.dataset), len(test_loader.dataset))
+	test_sample_count = 0 if test_loader is None else len(test_loader.dataset)
+	logger.info("Train samples: %s | Val samples: %s | External test samples: %s", len(train_loader.dataset), len(val_loader.dataset), test_sample_count)
 	logger.info("Inferred input channels: %s", input_channels)
 	logger.info("Model output channels: %s", output_channels)
 	logger.info(
@@ -757,14 +758,16 @@ def train_model(config_path: str | Path) -> dict[str, Any]:
 			best_val_loss,
 		)
 
-	logger.info("Training complete. Loading best checkpoint for final test evaluation.")
-	if best_checkpoint_path.exists():
-		checkpoint = load_checkpoint(best_checkpoint_path, map_location=device)
-		model.load_state_dict(checkpoint["model_state_dict"])
-
 	test_results: dict[str, float] = {}
 	test_plot_results: dict[str, float] = {}
-	if len(test_loader.dataset) > 0:
+	run_external_test_after_training = bool(training_config.get("run_external_test_after_training", config.get("run_external_test_after_training", False)))
+	logger.info("Training complete. Best checkpoint selected using validation split.")
+	logger.info("Run scripts/test_model.py with test_data_dir configured for external testing.")
+	if run_external_test_after_training and test_loader is not None and len(test_loader.dataset) > 0:
+		logger.info("Loading best checkpoint for optional external test evaluation.")
+		if best_checkpoint_path.exists():
+			checkpoint = load_checkpoint(best_checkpoint_path, map_location=device)
+			model.load_state_dict(checkpoint["model_state_dict"])
 		test_results = _run_epoch(
 			model=model,
 			loader=test_loader,
@@ -777,12 +780,12 @@ def train_model(config_path: str | Path) -> dict[str, Any]:
 			train=False,
 		)
 		test_plot_results = _rename_result_prefix(test_results, "val_", "test_")
-		logger.info("Test loss: %.6f", test_plot_results["test_loss"])
+		logger.info("External test loss: %.6f", test_plot_results["test_loss"])
 		for metric_name, metric_value in test_plot_results.items():
 			if metric_name != "test_loss":
-				logger.info("Test %s: %.6f", metric_name.removeprefix("test_"), metric_value)
-	else:
-		logger.info("Test split is empty; skipping final evaluation.")
+				logger.info("External test %s: %.6f", metric_name.removeprefix("test_"), metric_value)
+	elif run_external_test_after_training:
+		logger.info("External test evaluation requested, but no external test dataset is configured.")
 
 	training_curve_paths: list[str] = []
 	for checkpoint_path in (latest_checkpoint_path, best_checkpoint_path):
@@ -809,7 +812,7 @@ def evaluate_model_on_test_set(
 	checkpoint_path: str | Path | None = None,
 	checkpoint_kind: str = "best",
 ) -> dict[str, Any]:
-	"""Load a trained checkpoint and evaluate it on the configured test split."""
+	"""Load a trained checkpoint and evaluate it on the configured external test dataset."""
 
 	if torch is None:
 		raise ImportError("PyTorch is required to evaluate the ConvLSTM U-Net model.")
@@ -823,8 +826,13 @@ def evaluate_model_on_test_set(
 	logger = setup_logging(log_level, str(log_dir / "test_convlstm_unet.log"))
 
 	train_loader, _, test_loader = create_dataloaders(config)
+	if test_loader is None:
+		raise ValueError(
+			"No external test_data_dir configured. This project now uses data_dir only for train/val. "
+			"Set test_data_dir in the config to evaluate on an external test dataset."
+		)
 	if len(test_loader.dataset) == 0:
-		raise ValueError("Test split is empty; cannot evaluate the model.")
+		raise ValueError("External test dataset is empty; cannot evaluate the model.")
 
 	input_sequence_length = int(config.get("input_sequence_length", 1))
 	output_channels = int(_get_section(config, "model").get("output_channels", 1))
@@ -866,7 +874,7 @@ def evaluate_model_on_test_set(
 	)
 	test_results = _rename_result_prefix(raw_results, "val_", "test_")
 
-	logger.info("Test evaluation complete on %s samples.", len(test_loader.dataset))
+	logger.info("External test evaluation complete on %s samples.", len(test_loader.dataset))
 	for metric_name, metric_value in test_results.items():
 		logger.info("%s=%.6f", metric_name, metric_value)
 

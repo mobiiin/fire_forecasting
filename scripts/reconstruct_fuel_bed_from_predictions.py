@@ -14,10 +14,10 @@ except ImportError:  # pragma: no cover - environment-specific fallback
 
 from src.visualization.plot_maps import plot_reconstructed_fuel_beds_grid
 from scripts.visualize_predictions import (
+	_build_dataset_for_split,
 	_build_checkpoint_path,
 	_build_model,
 	_build_multitask_visualization_maps,
-	_build_test_dataset,
 	_build_test_loader,
 	_ensure_config_path,
 	_get_section,
@@ -62,7 +62,10 @@ def main() -> None:
 		if resolved_normalization_path.exists():
 			normalization_stats = load_normalization_stats(resolved_normalization_path)
 
-	test_dataset = _build_test_dataset(config, normalization_stats)
+	reconstruction_split = "test" if config.get("test_data_dir") not in (None, "", "null") else "val"
+	if reconstruction_split == "val":
+		print("No external test_data_dir configured; reconstructing from validation samples.")
+	test_dataset = _build_dataset_for_split(config, normalization_stats, split=reconstruction_split)
 	test_loader = _build_test_loader(test_dataset)
 	input_channels = int(next(iter(test_loader))[0].shape[2])
 	device = _select_device(config)
@@ -99,7 +102,7 @@ def main() -> None:
 				true_future_canopy_fuel=plot_inputs["true_future_canopy_fuel"],
 				pred_future_canopy_fuel=plot_inputs["pred_future_canopy_fuel"],
 				output_path=output_path,
-				title=f"Reconstructed fuel beds | sample {sample_index + 1}/{max_samples}",
+				title=f"{reconstruction_split.capitalize()} reconstructed fuel beds | sample {sample_index + 1}/{max_samples}",
 				cmap=cmap,
 				dpi=dpi,
 			)

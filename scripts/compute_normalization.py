@@ -8,8 +8,13 @@ from pathlib import Path
 import numpy as np
 
 from src.config import load_config
-from src.data.dataset import FireSequenceDataset, _sort_chronologically
-from src.data.splits import chronological_split_indices
+from src.data.dataset import (
+	FireSequenceDataset,
+	_count_fuel_flux_engineered_channels,
+	count_atmospheric_engineered_channels,
+	_sort_chronologically,
+)
+from src.data.splits import chronological_split_indices, chronological_train_val_split_indices
 
 
 def _resolve_path(base_path: Path, configured_path: str | Path) -> Path:
@@ -67,7 +72,7 @@ def main() -> None:
 	config = load_config(config_path)
 	config["config_path"] = str(config_path)
 
-	for required_key in ("data_dir", "file_pattern", "input_sequence_length", "prediction_horizon", "train_fraction", "val_fraction", "test_fraction"):
+	for required_key in ("data_dir", "file_pattern", "input_sequence_length", "prediction_horizon", "train_fraction", "val_fraction"):
 		if required_key not in config:
 			raise KeyError(f"Config is missing required key '{required_key}'.")
 
@@ -83,14 +88,31 @@ def main() -> None:
 	if not files:
 		raise FileNotFoundError(f"No files found in '{data_dir}' using pattern '{file_pattern}'.")
 
-	splits = chronological_split_indices(
-		num_timesteps=len(files),
-		input_sequence_length=int(config["input_sequence_length"]),
-		prediction_horizon=int(config["prediction_horizon"]),
-		train_fraction=float(config["train_fraction"]),
-		val_fraction=float(config["val_fraction"]),
-		test_fraction=float(config["test_fraction"]),
-	)
+	split_mode = str(config.get("split_mode", "train_val_test")).lower()
+	train_fraction = float(config["train_fraction"])
+	val_fraction = float(config["val_fraction"])
+	test_fraction = float(config.get("test_fraction", 0.0))
+	if split_mode == "train_val_external_test":
+		splits = {
+			**chronological_train_val_split_indices(
+				num_timesteps=len(files),
+				input_sequence_length=int(config["input_sequence_length"]),
+				prediction_horizon=int(config["prediction_horizon"]),
+				train_fraction=train_fraction,
+				val_fraction=val_fraction,
+			),
+			"test": [],
+		}
+	else:
+		splits = chronological_split_indices(
+			num_timesteps=len(files),
+			input_sequence_length=int(config["input_sequence_length"]),
+			prediction_horizon=int(config["prediction_horizon"]),
+			train_fraction=train_fraction,
+			val_fraction=val_fraction,
+			test_fraction=test_fraction,
+			split_mode=split_mode,
+		)
 	if not splits["train"]:
 		raise ValueError("No training samples were found for normalization.")
 
@@ -112,6 +134,19 @@ def main() -> None:
 		normalize_target=False,
 		config=config,
 	)
+	first_x_tensor, _ = train_dataset[0][:2]
+	actual_input_channel_count = int(first_x_tensor.shape[1])
+	configured_model_input_channels = int(config.get("model", {}).get("input_channels", actual_input_channel_count))
+	if actual_input_channel_count != int(train_dataset.total_input_channels):
+		raise ValueError(
+			"Dataset-reported total_input_channels does not match actual sample tensor shape. "
+			f"Dataset reports {train_dataset.total_input_channels}, sample has {actual_input_channel_count}."
+		)
+	if configured_model_input_channels != actual_input_channel_count:
+		raise ValueError(
+			"model.input_channels does not match the actual engineered dataset input width. "
+			f"Configured model.input_channels={configured_model_input_channels}, actual dataset channels={actual_input_channel_count}."
+		)
 
 	count = 0
 	mean = None
@@ -164,6 +199,8 @@ def main() -> None:
 		"max": channel_max.astype(np.float32),
 		"input_channel_count": np.asarray(train_dataset.total_input_channels, dtype=np.int64),
 		"base_input_channel_count": np.asarray(train_dataset.base_input_channel_count, dtype=np.int64),
+		"fuel_flux_engineered_channel_count": np.asarray(train_dataset.fuel_flux_engineered_channel_count, dtype=np.int64),
+		"atmospheric_engineered_channel_count": np.asarray(train_dataset.atmospheric_engineered_channel_count, dtype=np.int64),
 		"engineered_channel_count": np.asarray(train_dataset.engineered_channel_count, dtype=np.int64),
 	}
 
@@ -187,10 +224,23 @@ def main() -> None:
 	channel_mean = stats["mean"]
 	channel_std = stats["std"]
 	near_zero_std = int(np.sum(channel_std <= max(eps, 1e-6) * 10.0))
+	if channel_mean.shape[0] != actual_input_channel_count or channel_std.shape[0] != actual_input_channel_count:
+		raise ValueError(
+			"Saved normalization stats length does not match actual dataset input channel count. "
+			f"Expected {actual_input_channel_count}, got mean={channel_mean.shape[0]} std={channel_std.shape[0]}."
+		)
+	fuel_flux_engineered_channel_count = _count_fuel_flux_engineered_channels(config)
+	atmospheric_engineered_channel_count = count_atmospheric_engineered_channels(config)
 	print(f"C: {channel_mean.shape[0]}")
-	print(f"base input channels: {train_dataset.base_input_channel_count}")
-	print(f"engineered channels: {train_dataset.engineered_channel_count}")
-	print(f"total input channels: {train_dataset.total_input_channels}")
+	print(f"split mode: {split_mode}")
+	print(f"train samples used for normalization: {len(splits['train'])}")
+	print(f"validation samples not used: {len(splits['val'])}")
+	print("external test dataset ignored for normalization")
+	print(f"raw/base input channels: {train_dataset.base_input_channel_count}")
+	print(f"fuel/flux engineered channels: {fuel_flux_engineered_channel_count}")
+	print(f"atmospheric engineered channels: {atmospheric_engineered_channel_count}")
+	print(f"total model input channels: {train_dataset.total_input_channels}")
+	print(f"saved stats shape: mean={channel_mean.shape} std={channel_std.shape}")
 	print(f"global channel mean range: {channel_mean.min():.6g} to {channel_mean.max():.6g}")
 	print(f"global channel std range: {channel_std.min():.6g} to {channel_std.max():.6g}")
 	print(f"channels with near-zero std: {near_zero_std}")

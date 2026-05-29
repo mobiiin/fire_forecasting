@@ -20,7 +20,7 @@ from src.config import load_config
 from src.data.dataset import FireSequenceDataset, _resolve_multitask_config, _sort_chronologically
 from src.data.preprocessing import inverse_normalize_channel_map as inverse_normalize_scalar_channel_map
 from src.data.preprocessing import load_normalization_stats
-from src.data.splits import chronological_split_indices
+from src.data.splits import chronological_split_indices, chronological_train_val_split_indices
 from src.models.convlstm_unet import build_model_from_config
 from src.training.checkpoints import latest_and_best_checkpoint_paths, load_checkpoint
 from src.utils.logging import setup_logging
@@ -77,33 +77,74 @@ def _discover_files(config: Mapping[str, Any]) -> list[Path]:
 	return files
 
 
-def _build_test_dataset(config: Mapping[str, Any], normalization_stats) -> FireSequenceDataset:
-	"""Build the chronological test split with metadata enabled."""
+def _build_dataset_for_split(config: Mapping[str, Any], normalization_stats, split: str) -> FireSequenceDataset:
+	"""Build a dataset for validation or external test visualization."""
 
-	files = _discover_files(config)
-	splits = chronological_split_indices(
-		num_timesteps=len(files),
-		input_sequence_length=int(config["input_sequence_length"]),
-		prediction_horizon=int(config["prediction_horizon"]),
-		train_fraction=float(config.get("train_fraction", 0.7)),
-		val_fraction=float(config.get("val_fraction", 0.15)),
-		test_fraction=float(config.get("test_fraction", 0.15)),
-	)
-	return FireSequenceDataset(
-		file_paths=files,
-		sample_indices=splits["test"],
-		input_sequence_length=int(config["input_sequence_length"]),
-		prediction_horizon=int(config["prediction_horizon"]),
-		target_channel=int(config.get("target_channel", 0)),
-		input_channel_count=int(config.get("input_channel_count", _get_section(config, "model").get("input_channels", 0))),
-		input_channel_indices=config.get("input_channel_indices"),
-		task_type=str(config.get("task_type", _get_section(config, "training").get("task_type", "regression"))),
-		fire_threshold=float(config.get("fire_threshold", _get_section(config, "training").get("fire_threshold", 0.5))),
-		normalization_stats=normalization_stats,
-		normalize_target=bool(_get_section(config, "target_normalization").get("enabled", _get_section(config, "normalization").get("normalize_target", False))),
-		return_metadata=True,
-		config=config,
-	)
+	split = str(split).lower()
+	input_sequence_length = int(config["input_sequence_length"])
+	prediction_horizon = int(config["prediction_horizon"])
+	common_kwargs = {
+		"input_sequence_length": input_sequence_length,
+		"prediction_horizon": prediction_horizon,
+		"target_channel": int(config.get("target_channel", 0)),
+		"input_channel_count": int(config.get("input_channel_count", _get_section(config, "model").get("input_channels", 0))),
+		"input_channel_indices": config.get("input_channel_indices"),
+		"task_type": str(config.get("task_type", _get_section(config, "training").get("task_type", "regression"))),
+		"fire_threshold": float(config.get("fire_threshold", _get_section(config, "training").get("fire_threshold", 0.5))),
+		"normalization_stats": normalization_stats,
+		"normalize_target": bool(_get_section(config, "target_normalization").get("enabled", _get_section(config, "normalization").get("normalize_target", False))),
+		"return_metadata": True,
+		"config": config,
+	}
+
+	if split == "val":
+		files = _discover_files(config)
+		split_mode = str(config.get("split_mode", "train_val_test")).lower()
+		if split_mode == "train_val_external_test":
+			splits = chronological_train_val_split_indices(
+				num_timesteps=len(files),
+				input_sequence_length=input_sequence_length,
+				prediction_horizon=prediction_horizon,
+				train_fraction=float(config.get("train_fraction", 0.85)),
+				val_fraction=float(config.get("val_fraction", 0.15)),
+			)
+		else:
+			splits = chronological_split_indices(
+				num_timesteps=len(files),
+				input_sequence_length=input_sequence_length,
+				prediction_horizon=prediction_horizon,
+				train_fraction=float(config.get("train_fraction", 0.7)),
+				val_fraction=float(config.get("val_fraction", 0.15)),
+				test_fraction=float(config.get("test_fraction", 0.15)),
+				split_mode=split_mode,
+			)
+		return FireSequenceDataset(file_paths=files, sample_indices=splits["val"], **common_kwargs)
+
+	if split == "test":
+		test_data_dir = config.get("test_data_dir")
+		if test_data_dir in (None, "", "null"):
+			raise ValueError(
+				"No external test_data_dir configured. This project now uses data_dir only for train/val. "
+				"Set test_data_dir in the config to visualize external test predictions."
+			)
+		config_path_value = config.get("config_path", config.get("_config_path"))
+		config_path = Path(config_path_value).expanduser().resolve() if config_path_value else None
+		test_data_dir_path = _resolve_path(config_path, test_data_dir)
+		external_file_pattern = str(config.get("external_test_file_pattern", config["file_pattern"]))
+		files = _sort_chronologically(list(test_data_dir_path.glob(external_file_pattern)))
+		if not files:
+			raise FileNotFoundError(
+				f"No external test files found in '{test_data_dir_path}' using pattern '{external_file_pattern}'."
+			)
+		return FireSequenceDataset(file_paths=files, sample_indices=None, **common_kwargs)
+
+	raise ValueError(f"split must be 'val' or 'test', got {split!r}.")
+
+
+def _build_test_dataset(config: Mapping[str, Any], normalization_stats) -> FireSequenceDataset:
+	"""Backward-compatible wrapper for external test visualization dataset."""
+
+	return _build_dataset_for_split(config, normalization_stats, split="test")
 
 
 def _build_test_loader(dataset):
@@ -273,7 +314,7 @@ def _build_multitask_visualization_maps(
 	}
 
 
-def visualize_predictions(config_path: str | Path, num_samples: int = 10) -> list[Path]:
+def visualize_predictions(config_path: str | Path, num_samples: int = 10, split: str = "val") -> list[Path]:
 	"""Render chronological forecast visualizations for several test samples."""
 
 	if torch is None or DataLoader is None:
@@ -292,9 +333,10 @@ def visualize_predictions(config_path: str | Path, num_samples: int = 10) -> lis
 		if resolved_normalization_path.exists():
 			normalization_stats = load_normalization_stats(resolved_normalization_path)
 
-	test_dataset = _build_test_dataset(config, normalization_stats)
+	selected_split = str(split).lower()
+	test_dataset = _build_dataset_for_split(config, normalization_stats, split=selected_split)
 	if len(test_dataset) == 0:
-		raise ValueError("Test split is empty; cannot visualize predictions.")
+		raise ValueError(f"Requested {selected_split} dataset is empty; cannot visualize predictions.")
 	test_loader = _build_test_loader(test_dataset)
 	task_type = str(config.get("task_type", _get_section(config, "training").get("task_type", "regression"))).lower()
 	first_batch = next(iter(test_loader))
@@ -345,7 +387,7 @@ def visualize_predictions(config_path: str | Path, num_samples: int = 10) -> lis
 					pred_mask_probability=plot_inputs["pred_mask_probability"],
 					pred_mask=plot_inputs["pred_mask"],
 					output_path=output_path,
-					title=f"Multitask forecast | sample {sample_index + 1}/{max_samples}",
+					title=f"{selected_split.capitalize()} multitask forecast | sample {sample_index + 1}/{max_samples}",
 					cmap=cmap,
 					dpi=dpi,
 				)
@@ -364,7 +406,7 @@ def visualize_predictions(config_path: str | Path, num_samples: int = 10) -> lis
 					ground_truth_map=ground_truth_map,
 					predicted_map=predicted_map,
 					output_path=output_path,
-					title=f"Forecast | sample {sample_index + 1}/{max_samples}",
+					title=f"{selected_split.capitalize()} forecast | sample {sample_index + 1}/{max_samples}",
 					threshold=0.5 if task_type == "segmentation" else float(config.get("fire_threshold", 0.5)),
 					cmap=cmap,
 					dpi=dpi,
@@ -504,7 +546,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
 	parser = argparse.ArgumentParser(description="Visualize ConvLSTM U-Net wildfire predictions.")
 	parser.add_argument("--config", default="configs/default.yaml", help="Path to the YAML configuration file.")
-	parser.add_argument("--num_samples", type=int, default=10, help="Number of chronological test samples to visualize.")
+	parser.add_argument("--split", choices=("val", "test"), default="val", help="Which split to visualize.")
+	parser.add_argument(
+		"--num_samples",
+		type=int,
+		default=10,
+		help="Number of chronological validation or external test samples to visualize.",
+	)
 	return parser
 
 
@@ -512,7 +560,7 @@ def main() -> None:
 	"""CLI entry point."""
 
 	args = build_argument_parser().parse_args()
-	visualize_predictions(args.config, num_samples=args.num_samples)
+	visualize_predictions(args.config, num_samples=args.num_samples, split=args.split)
 
 
 if __name__ == "__main__":

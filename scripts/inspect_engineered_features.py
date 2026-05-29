@@ -13,7 +13,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from src.config import load_config
-from src.data.dataset import FireSequenceDataset, _resolve_channel_layout, _resolve_engineered_features_config, _sort_chronologically
+from src.data.dataset import (
+	FireSequenceDataset,
+	_resolve_channel_layout,
+	_resolve_engineered_features_config,
+	count_atmospheric_engineered_channels,
+	resolve_engineered_feature_slices,
+	_sort_chronologically,
+)
 
 
 def _resolve_path(base_path: Path, configured_path: str | Path) -> Path:
@@ -71,28 +78,21 @@ def main() -> None:
 	last_timestep = x_array[-1]
 	base_channels = int(dataset.base_input_channel_count)
 	engineered_channels = int(dataset.engineered_channel_count)
+	atmospheric_engineered_channels = int(dataset.atmospheric_engineered_channel_count)
 	layout = _resolve_channel_layout(config)
 	engineered = _resolve_engineered_features_config(config)
+	engineered_slices = resolve_engineered_feature_slices(config, base_channels)
 
 	print(f"X shape: {tuple(x_array.shape)}")
 	print(f"y shape: {tuple(y_array.shape)}")
 	print(f"base input channels: {base_channels}")
+	print(f"atmospheric engineered channels: {atmospheric_engineered_channels}")
 	print(f"engineered channels: {engineered_channels}")
 
-	offset = base_channels
 	channel_ranges: list[tuple[str, tuple[int, int]]] = []
-	if engineered["add_flux_delta"]:
-		channel_ranges.append(("flux_delta", (offset, offset + len(layout["flux_channels"]) - 1)))
-		offset += len(layout["flux_channels"])
-	if engineered["add_fuel_delta"]:
-		channel_ranges.append(("fuel_delta", (offset, offset + len(layout["fuel_channels"]) - 1)))
-		offset += len(layout["fuel_channels"])
-	if engineered["add_step_consumed_fuel"]:
-		channel_ranges.append(("step_consumed_fuel", (offset, offset + len(layout["fuel_channels"]) - 1)))
-		offset += len(layout["fuel_channels"])
-	if engineered["add_cumulative_consumed_fuel"]:
-		channel_ranges.append(("cumulative_consumed_fuel", (offset, offset + len(layout["fuel_channels"]) - 1)))
-		offset += len(layout["fuel_channels"])
+	for feature_name, feature_slice in engineered_slices.items():
+		if feature_slice.stop > feature_slice.start:
+			channel_ranges.append((feature_name, (feature_slice.start, feature_slice.stop - 1)))
 	for name, (start, end) in channel_ranges:
 		print(f"{name}: channels [{start}, {end}]")
 
@@ -107,22 +107,32 @@ def main() -> None:
 		patch_size = int(patch_size)
 		current_frame = current_frame[patch_top : patch_top + patch_size, patch_left : patch_left + patch_size, :]
 
-	flux_delta_start = base_channels
-	fuel_delta_start = flux_delta_start + len(layout["flux_channels"])
-	step_consumed_start = fuel_delta_start + len(layout["fuel_channels"])
-	cumulative_start = step_consumed_start + len(layout["fuel_channels"])
+	if count_atmospheric_engineered_channels(config) > 0:
+		if "horizontal_wind_speed" in engineered_slices:
+			horizontal_slice = engineered_slices["horizontal_wind_speed"]
+			print(
+				f"horizontal wind speed: channels [{horizontal_slice.start}, {horizontal_slice.stop - 1}]"
+			)
+		if "low_level_mean_wind_speed" in engineered_slices:
+			low_level_slice = engineered_slices["low_level_mean_wind_speed"]
+			print(
+				f"low-level mean wind speed: channels [{low_level_slice.start}, {low_level_slice.stop - 1}]"
+			)
+		if "updraft" in engineered_slices:
+			updraft_slice = engineered_slices["updraft"]
+			print(f"updraft: channels [{updraft_slice.start}, {updraft_slice.stop - 1}]")
 
 	panel_specs = [
 		("Selected flux channel", current_frame[:, :, layout["flux_channels"][0]]),
-		("Selected flux delta", last_timestep[flux_delta_start]),
+		("Selected flux delta", last_timestep[engineered_slices["flux_delta"].start] if "flux_delta" in engineered_slices else np.zeros_like(y_array[0])),
 		("Surface fuel", current_frame[:, :, layout["surface_fuel_channel"]]),
 		("Canopy fuel", current_frame[:, :, layout["canopy_fuel_channel"]]),
-		("Surface fuel delta", last_timestep[fuel_delta_start + 0]),
-		("Canopy fuel delta", last_timestep[fuel_delta_start + 1]),
-		("Surface step consumed fuel", last_timestep[step_consumed_start + 0]),
-		("Canopy step consumed fuel", last_timestep[step_consumed_start + 1]),
-		("Surface cumulative consumed fuel", last_timestep[cumulative_start + 0]),
-		("Canopy cumulative consumed fuel", last_timestep[cumulative_start + 1]),
+		("Surface fuel delta", last_timestep[engineered_slices["fuel_delta"].start + 0] if "fuel_delta" in engineered_slices else np.zeros_like(y_array[0])),
+		("Canopy fuel delta", last_timestep[engineered_slices["fuel_delta"].start + 1] if "fuel_delta" in engineered_slices else np.zeros_like(y_array[0])),
+		("Surface step consumed fuel", last_timestep[engineered_slices["step_consumed_fuel"].start + 0] if "step_consumed_fuel" in engineered_slices else np.zeros_like(y_array[0])),
+		("Canopy step consumed fuel", last_timestep[engineered_slices["step_consumed_fuel"].start + 1] if "step_consumed_fuel" in engineered_slices else np.zeros_like(y_array[0])),
+		("Surface cumulative consumed fuel", last_timestep[engineered_slices["cumulative_consumed_fuel"].start + 0] if "cumulative_consumed_fuel" in engineered_slices else np.zeros_like(y_array[0])),
+		("Canopy cumulative consumed fuel", last_timestep[engineered_slices["cumulative_consumed_fuel"].start + 1] if "cumulative_consumed_fuel" in engineered_slices else np.zeros_like(y_array[0])),
 		("Target surface consumed fuel", y_array[0]),
 		("Target canopy consumed fuel", y_array[1]),
 		("Target mask", y_array[2]),

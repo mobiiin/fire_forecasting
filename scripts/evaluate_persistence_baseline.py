@@ -1,4 +1,4 @@
-"""Evaluate a persistence baseline on the configured wildfire test split."""
+"""Evaluate a persistence baseline on the configured external or internal test split."""
 
 from __future__ import annotations
 
@@ -62,6 +62,40 @@ def discover_files(config_path: Path, config: Mapping[str, Any]) -> list[Path]:
     if not files:
         raise FileNotFoundError(f"No files found in '{data_dir}' using pattern '{file_pattern}'.")
     return files
+
+
+def discover_external_test_files(config_path: Path, config: Mapping[str, Any]) -> list[Path]:
+    """Resolve and discover external test files from the config."""
+
+    test_data_dir = config.get("test_data_dir")
+    if test_data_dir in (None, "", "null"):
+        raise ValueError(
+            "No external test_data_dir configured. This project now uses data_dir only for train/val. "
+            "Set test_data_dir in the config to evaluate on an external test dataset."
+        )
+
+    data_dir = resolve_path(config_path, test_data_dir)
+    pattern = str(config.get("external_test_file_pattern", config.get("file_pattern", "*.npy")))
+    if not data_dir.exists():
+        raise FileNotFoundError(f"External test data directory does not exist: {data_dir}")
+
+    files = sort_chronologically(list(data_dir.glob(pattern)))
+    if not files:
+        raise FileNotFoundError(f"No external test files found in '{data_dir}' using pattern '{pattern}'.")
+    return files
+
+
+def all_valid_sample_indices(
+    num_timesteps: int,
+    input_sequence_length: int,
+    prediction_horizon: int,
+) -> list[int]:
+    """Return all valid chronological sample start indices for a dataset."""
+
+    max_start_index = num_timesteps - input_sequence_length - prediction_horizon
+    if max_start_index < 0:
+        return []
+    return list(range(max_start_index + 1))
 
 
 def load_tensor(file_path: Path) -> np.ndarray:
@@ -359,11 +393,15 @@ def evaluate_persistence_for_channel(
     output_dir: str | Path | None = None,
     verbose: bool = True,
 ) -> dict[str, Any]:
-    """Evaluate persistence for one channel on the same test split used by the model."""
+    """Evaluate persistence for one channel on the configured test dataset."""
 
     config_path = Path(config_path).expanduser().resolve()
     config = load_config(config_path)
-    files = discover_files(config_path, config)
+    split_mode = str(config.get("split_mode", "train_val_test")).lower()
+    if split_mode == "train_val_external_test":
+        files = discover_external_test_files(config_path, config)
+    else:
+        files = discover_files(config_path, config)
 
     required_keys = (
         "input_sequence_length",
@@ -386,17 +424,25 @@ def evaluate_persistence_for_channel(
         )
     input_channel_count = int(config.get("input_channel_count", _get_section(config, "model").get("input_channels", 0)))
 
-    splits = chronological_split_indices(
-        num_timesteps=len(files),
-        input_sequence_length=int(config["input_sequence_length"]),
-        prediction_horizon=int(config["prediction_horizon"]),
-        train_fraction=float(config["train_fraction"]),
-        val_fraction=float(config["val_fraction"]),
-        test_fraction=float(config["test_fraction"]),
-    )
-    test_indices = splits["test"]
+    if split_mode == "train_val_external_test":
+        test_indices = all_valid_sample_indices(
+            num_timesteps=len(files),
+            input_sequence_length=int(config["input_sequence_length"]),
+            prediction_horizon=int(config["prediction_horizon"]),
+        )
+    else:
+        splits = chronological_split_indices(
+            num_timesteps=len(files),
+            input_sequence_length=int(config["input_sequence_length"]),
+            prediction_horizon=int(config["prediction_horizon"]),
+            train_fraction=float(config["train_fraction"]),
+            val_fraction=float(config["val_fraction"]),
+            test_fraction=float(config["test_fraction"]),
+            split_mode=split_mode,
+        )
+        test_indices = splits["test"]
     if not test_indices:
-        raise ValueError("Test split is empty; cannot evaluate the persistence baseline.")
+        raise ValueError("External test dataset produced no valid samples; cannot evaluate the persistence baseline.")
 
     active_threshold = float(config.get("active_threshold", config.get("fire_threshold", 0.0)))
     metrics_config = _get_section(config, "metrics")
@@ -425,6 +471,8 @@ def evaluate_persistence_for_channel(
 
     if verbose:
         print(f"Discovered {len(files)} files")
+        if split_mode == "train_val_external_test":
+            print(f"External test dataset path: {config.get('test_data_dir')}")
         print(f"Target channel: {target_channel}")
         print(f"Test sample count: {len(test_indices)}")
         print(f"Active-region threshold: {active_threshold}")
@@ -476,7 +524,7 @@ def evaluate_persistence_for_channel(
                     predicted_map=persistence_prediction,
                     output_path=figure_path,
                     title=(
-                        f"Persistence baseline | test sample {test_position:05d} | "
+                        f"Persistence baseline | {'external test' if split_mode == 'train_val_external_test' else 'test'} sample {test_position:05d} | "
                         f"current {current_file.name} -> target {target_file.name} | ch {target_channel}"
                     ),
                     cmap=cmap,
@@ -552,7 +600,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     """Create the command-line parser."""
 
     parser = argparse.ArgumentParser(
-        description="Evaluate a persistence baseline on the configured wildfire test split."
+        description="Evaluate a persistence baseline on the configured wildfire test dataset."
     )
     parser.add_argument(
         "--config",
@@ -563,7 +611,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--num-visualizations",
         type=int,
         default=5,
-        help="Number of evenly spaced persistence-baseline visualizations to save from the test split.",
+        help="Number of evenly spaced persistence-baseline visualizations to save from the evaluated test dataset.",
     )
     parser.add_argument(
         "--compute-threshold-metrics",

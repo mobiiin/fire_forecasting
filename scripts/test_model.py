@@ -1,4 +1,4 @@
-"""Evaluate a trained ConvLSTM U-Net checkpoint on the test split with diagnostics."""
+"""Evaluate a trained ConvLSTM U-Net checkpoint on the external test split with diagnostics."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ try:
 except ImportError:  # pragma: no cover - environment-specific fallback
     torch = None
 
-from scripts.evaluate_persistence_baseline import evaluate_persistence_for_channel, warning_messages_for_target_channel
+from scripts.evaluate_persistence_baseline import warning_messages_for_target_channel
 from src.config import load_config
 from src.data.preprocessing import inverse_normalize_channel_map as inverse_normalize_scalar_channel_map
 from src.models.convlstm_unet import build_model_from_config
@@ -159,7 +159,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     """Create the command-line parser for standalone test evaluation."""
 
     parser = argparse.ArgumentParser(
-        description="Evaluate a trained ConvLSTM U-Net checkpoint on the test split."
+        description="Evaluate a trained ConvLSTM U-Net checkpoint on the external test split."
     )
     parser.add_argument(
         "--config",
@@ -183,15 +183,19 @@ def build_argument_parser() -> argparse.ArgumentParser:
 def main() -> None:
     """CLI entry point."""
 
+    args = build_argument_parser().parse_args()
     if torch is None:
         raise ImportError("PyTorch is required to evaluate the ConvLSTM U-Net model.")
-
-    args = build_argument_parser().parse_args()
     config = _ensure_config_path(load_config(args.config), args.config)
 
     train_loader, _, test_loader = create_dataloaders(config)
+    if test_loader is None:
+        raise ValueError(
+            "No external test_data_dir configured. This project now uses data_dir only for train/val. "
+            "Set test_data_dir in the config to evaluate on an external test dataset."
+        )
     if len(test_loader.dataset) == 0:
-        raise ValueError("Test split is empty; cannot evaluate the model.")
+        raise ValueError("External test dataset is empty; cannot evaluate the model.")
 
     dataset = test_loader.dataset
     target_channel = int(getattr(dataset, "target_channel", int(config["target_channel"])))
@@ -234,25 +238,13 @@ def main() -> None:
     diagnostics_path = Path("artifacts/logs/test_scale_diagnostics.txt").expanduser().resolve()
     generate_scale_diagnostics(model, test_loader, device, diagnostics_path)
 
-    persistence_results = evaluate_persistence_for_channel(
-        config_path=args.config,
-        target_channel=target_channel,
-        num_visualizations=0,
-        compute_threshold_metrics=False,
-        output_dir=None,
-        verbose=False,
-    )
-    persistence_mae = float(persistence_results["regression_metrics"]["test_mae"])
-    model_mae = float(test_results.get("test_mae", math.nan))
-    if np.isfinite(model_mae) and np.isfinite(persistence_mae) and persistence_mae > 0.0 and model_mae > 10.0 * persistence_mae:
-        print("WARNING: Model MAE is more than 10x worse than persistence MAE. This is likely a data/scale/target issue, not an architecture issue.")
-
     print(f"checkpoint: {resolved_checkpoint_path}")
-    print(f"test samples: {len(test_loader.dataset)}")
+    print(f"external test dataset path: {config.get('test_data_dir')}")
+    print(f"external test files: {len(getattr(test_loader.dataset, 'file_paths', []))}")
+    print(f"external test samples: {len(test_loader.dataset)}")
     print(f"target_channel: {target_channel}")
     for metric_name, metric_value in test_results.items():
         print(f"{metric_name}: {metric_value:.6f}")
-    print(f"persistence_test_mae: {persistence_mae:.6f}")
     print(f"diagnostics_file: {diagnostics_path}")
 
 

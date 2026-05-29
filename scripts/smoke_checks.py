@@ -48,6 +48,7 @@ def _check_chronological_split_no_leakage(config: dict, file_count: int) -> None
 	train_fraction = float(config.get("train_fraction", 0.7))
 	val_fraction = float(config.get("val_fraction", 0.15))
 	test_fraction = float(config.get("test_fraction", 0.15))
+	split_mode = str(config.get("split_mode", "train_val_test")).lower()
 	splits = chronological_split_indices(
 		num_timesteps=file_count,
 		input_sequence_length=t_in,
@@ -55,6 +56,7 @@ def _check_chronological_split_no_leakage(config: dict, file_count: int) -> None
 		train_fraction=train_fraction,
 		val_fraction=val_fraction,
 		test_fraction=test_fraction,
+		split_mode=split_mode,
 	)
 
 	train_end = int(np.floor(file_count * train_fraction))
@@ -66,7 +68,7 @@ def _check_chronological_split_no_leakage(config: dict, file_count: int) -> None
 			raise AssertionError("Train split leakage detected into val/test segment.")
 	for index in splits["val"]:
 		target_t = index + t_in - 1 + horizon
-		if target_t >= val_end:
+		if split_mode != "train_val_external_test" and target_t >= val_end:
 			raise AssertionError("Validation split leakage detected into test segment.")
 
 
@@ -78,6 +80,7 @@ def _check_normalization_training_only(config: dict, file_count: int) -> None:
 	train_fraction = float(config.get("train_fraction", 0.7))
 	val_fraction = float(config.get("val_fraction", 0.15))
 	test_fraction = float(config.get("test_fraction", 0.15))
+	split_mode = str(config.get("split_mode", "train_val_test")).lower()
 	splits = chronological_split_indices(
 		num_timesteps=file_count,
 		input_sequence_length=t_in,
@@ -85,6 +88,7 @@ def _check_normalization_training_only(config: dict, file_count: int) -> None:
 		train_fraction=train_fraction,
 		val_fraction=val_fraction,
 		test_fraction=test_fraction,
+		split_mode=split_mode,
 	)
 
 	train_end = int(np.floor(file_count * train_fraction))
@@ -128,7 +132,10 @@ def main() -> None:
 		if x_batch.ndim != 5 or y_batch.ndim != 4:
 			raise AssertionError("Unexpected dataloader tensor ranks.")
 		print(f"DataLoader shape check passed: X={tuple(x_batch.shape)}, y={tuple(y_batch.shape)}")
-		print(f"Split sample counts: train={len(train_loader.dataset)}, val={len(val_loader.dataset)}, test={len(test_loader.dataset)}")
+		if test_loader is None:
+			print(f"Split sample counts: train={len(train_loader.dataset)}, val={len(val_loader.dataset)}, external_test=not_configured")
+		else:
+			print(f"Split sample counts: train={len(train_loader.dataset)}, val={len(val_loader.dataset)}, external_test={len(test_loader.dataset)}")
 	except ImportError:
 		print("PyTorch unavailable: skipped dataloader/model smoke checks.")
 

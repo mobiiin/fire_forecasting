@@ -12,7 +12,7 @@ from typing import List, Sequence, Tuple
 import numpy as np
 
 from src.config import load_config
-from src.data.splits import chronological_split_indices
+from src.data.splits import chronological_split_indices, chronological_train_val_split_indices
 
 
 def resolve_path(base_path: Path, configured_path: str) -> Path:
@@ -342,21 +342,63 @@ def report_split_sample_counts(files: Sequence[Path], config: dict) -> None:
         "prediction_horizon",
         "train_fraction",
         "val_fraction",
-        "test_fraction",
     )
     missing = [key for key in required_keys if key not in config]
     if missing:
         raise KeyError(f"Config is missing required split key(s): {', '.join(missing)}")
 
+    split_mode = str(config.get("split_mode", "train_val_test")).lower()
+    train_fraction = float(config["train_fraction"])
+    val_fraction = float(config["val_fraction"])
+    if split_mode == "train_val_external_test":
+        splits = chronological_train_val_split_indices(
+            num_timesteps=len(files),
+            input_sequence_length=int(config["input_sequence_length"]),
+            prediction_horizon=int(config["prediction_horizon"]),
+            train_fraction=train_fraction,
+            val_fraction=val_fraction,
+        )
+        print(f"split_mode: {split_mode}")
+        print("valid forecasting samples by split:")
+        print(f"  train: {len(splits['train'])}")
+        print(f"  val:   {len(splits['val'])}")
+        print("  no internal test split")
+
+        test_data_dir = config.get("test_data_dir")
+        if test_data_dir in (None, "", "null"):
+            print("  external test dataset not configured")
+            return
+
+        config_path = Path(config.get("config_path", config.get("_config_path", "configs/default.yaml"))).expanduser().resolve()
+        external_dir = resolve_path(config_path, str(test_data_dir))
+        external_pattern = str(config.get("external_test_file_pattern", config["file_pattern"]))
+        external_files = discover_files(external_dir, external_pattern)
+        external_indices = list(
+            range(
+                max(
+                    0,
+                    len(external_files)
+                    - int(config["input_sequence_length"])
+                    - int(config["prediction_horizon"])
+                    + 1,
+                )
+            )
+        )
+        print(f"  external test file count: {len(external_files)}")
+        print(f"  external test valid sample count: {len(external_indices)}")
+        return
+
     splits = chronological_split_indices(
         num_timesteps=len(files),
         input_sequence_length=int(config["input_sequence_length"]),
         prediction_horizon=int(config["prediction_horizon"]),
-        train_fraction=float(config["train_fraction"]),
-        val_fraction=float(config["val_fraction"]),
+        train_fraction=train_fraction,
+        val_fraction=val_fraction,
         test_fraction=float(config["test_fraction"]),
+        split_mode=split_mode,
     )
 
+    print(f"split_mode: {split_mode}")
     print("valid forecasting samples by split:")
     print(f"  train: {len(splits['train'])}")
     print(f"  val:   {len(splits['val'])}")
@@ -391,6 +433,7 @@ def main() -> None:
     args = build_arg_parser().parse_args()
     config_path = Path(args.config).expanduser().resolve()
     config = load_config(config_path)
+    config["config_path"] = str(config_path)
 
     if "data_dir" not in config:
         raise KeyError("Config is missing required key 'data_dir'.")

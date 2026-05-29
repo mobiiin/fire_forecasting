@@ -107,25 +107,49 @@ def _discover_files(config: Mapping[str, Any]) -> list[Path]:
 
 
 def _build_test_dataset(config: Mapping[str, Any], normalization_stats) -> FireSequenceDataset:
-	"""Build the chronological test split and expose metadata for visualization."""
+	"""Build the configured test dataset and expose metadata for visualization."""
 
-	files = _discover_files(config)
+	split_mode = str(config.get("split_mode", "train_val_test")).lower()
+	if split_mode == "train_val_external_test":
+		test_data_dir = config.get("test_data_dir")
+		if test_data_dir in (None, "", "null"):
+			raise ValueError(
+				"No external test_data_dir configured. This project now uses data_dir only for train/val. "
+				"Set test_data_dir in the config to run rollout predictions on an external test dataset."
+			)
+		config_path_value = config.get("config_path", config.get("_config_path"))
+		config_path = Path(config_path_value).expanduser().resolve() if config_path_value else None
+		test_dir = _resolve_path(config_path, test_data_dir)
+		external_file_pattern = str(config.get("external_test_file_pattern", config["file_pattern"]))
+		files = _sort_chronologically(list(test_dir.glob(external_file_pattern)))
+		if not files:
+			raise FileNotFoundError(
+				f"No external test files found in '{test_dir}' using pattern '{external_file_pattern}'."
+			)
+	else:
+		files = _discover_files(config)
 	input_sequence_length = int(config["input_sequence_length"])
 	prediction_horizon = int(config["prediction_horizon"])
 	input_channel_count = int(config.get("input_channel_count", _get_section(config, "model").get("input_channels", 0)))
 	if input_channel_count <= 0:
 		raise KeyError("Config must define a positive input_channel_count or model.input_channels.")
-	split_indices = chronological_split_indices(
-		num_timesteps=len(files),
-		input_sequence_length=input_sequence_length,
-		prediction_horizon=prediction_horizon,
-		train_fraction=float(config.get("train_fraction", 0.7)),
-		val_fraction=float(config.get("val_fraction", 0.15)),
-		test_fraction=float(config.get("test_fraction", 0.15)),
-	)
+	if split_mode == "train_val_external_test":
+		max_start_index = len(files) - input_sequence_length - prediction_horizon
+		sample_indices = [] if max_start_index < 0 else list(range(max_start_index + 1))
+	else:
+		split_indices = chronological_split_indices(
+			num_timesteps=len(files),
+			input_sequence_length=input_sequence_length,
+			prediction_horizon=prediction_horizon,
+			train_fraction=float(config.get("train_fraction", 0.7)),
+			val_fraction=float(config.get("val_fraction", 0.15)),
+			test_fraction=float(config.get("test_fraction", 0.15)),
+			split_mode=split_mode,
+		)
+		sample_indices = split_indices["test"]
 	return FireSequenceDataset(
 		file_paths=files,
-		sample_indices=split_indices["test"],
+		sample_indices=sample_indices,
 		input_sequence_length=input_sequence_length,
 		prediction_horizon=prediction_horizon,
 		target_channel=int(config["target_channel"]),
@@ -244,7 +268,7 @@ def rollout_predictions(
 	rollout_steps: int = 30,
 	rollout_mode: str = "constant_exogenous",
 ) -> list[Path]:
-	"""Run autoregressive rollout visualization from a test split start index."""
+	"""Run autoregressive rollout visualization from the configured test dataset."""
 
 	if torch is None:
 		raise ImportError("PyTorch is required to run rollout predictions.")
@@ -266,7 +290,7 @@ def rollout_predictions(
 
 	test_dataset = _build_test_dataset(config, normalization_stats)
 	if len(test_dataset) == 0:
-		raise ValueError("Test split is empty; cannot run rollout visualization.")
+		raise ValueError("Configured test dataset is empty; cannot run rollout visualization.")
 	if start_index < 0 or start_index >= len(test_dataset):
 		raise IndexError(f"start_index must be in [0, {len(test_dataset) - 1}], got {start_index}.")
 	input_channel_count = int(getattr(test_dataset, "input_channel_count", test_dataset.num_channels))
@@ -322,7 +346,7 @@ def rollout_predictions(
 		raise ValueError("No future timesteps are available for the requested rollout.")
 
 	logger.info(
-		"Rolling from test sample %s (raw index %s) for %s steps in %s mode.",
+		"Rolling from configured test sample %s (raw index %s) for %s steps in %s mode.",
 		start_index,
 		start_sample_index,
 		rollout_limit,
@@ -430,7 +454,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
 		default="configs/default.yaml",
 		help="Path to the YAML configuration file.",
 	)
-	parser.add_argument("--start_index", type=int, default=0, help="Start index within the chronological test split.")
+	parser.add_argument("--start_index", type=int, default=0, help="Start index within the configured test dataset.")
 	parser.add_argument("--rollout_steps", type=int, default=30, help="Number of autoregressive rollout steps to run.")
 	parser.add_argument(
 		"--rollout_mode",
