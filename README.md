@@ -201,6 +201,17 @@ predicted future canopy fuel = current canopy fuel - predicted canopy consumed f
 
 These reconstructed maps are clamped to `>= 0`.
 
+## Multi-Step Autoregressive Rollout
+One-step forecasts can look good because adjacent timestamps are often similar. Multi-step rollout is the harder test: start from a true input window, predict one step ahead, write the predicted surface and canopy fuel back into the next raw frame, rebuild engineered features from that updated raw window, and repeat.
+
+The rollout path currently supports only `window_mode: static`, which keeps the model input length equal to `input_sequence_length`. After every step, the oldest frame is dropped and the newly constructed next frame is appended.
+
+Exogenous handling modes:
+- `teacher_forced`: use the true future raw frame for non-fuel variables, but replace the surface and canopy fuel channels with predicted fuel
+- `constant`: copy the previous rollout raw frame for non-fuel variables and replace the surface and canopy fuel channels with predicted fuel
+
+The rollout script now randomly selects split samples by seed and generates one GIF per sample. Each GIF compares ground-truth future progression against the model's autoregressive rollout with consistent color scaling across steps. Metrics are still saved, but the primary output is the visual rollout sequence under `outputs/rollouts/<split>/<dataset_name>/`.
+
 ## Commands
 All commands below assume the Conda environment above is already active.
 
@@ -249,8 +260,10 @@ All commands below assume the Conda environment above is already active.
   `python scripts/evaluate_persistence_baseline.py --config configs/default.yaml --num-visualizations 5`
 - Compare persistence across candidate target channels:
   `python scripts/evaluate_persistence_all_candidate_targets.py --config configs/default.yaml --channels 50 51 52 53 54 55`
-- Run autoregressive rollout visualizations from the configured test dataset:
-  `python scripts/rollout_predictions.py --config configs/default.yaml --start_index 0 --rollout_steps 30 --rollout_mode constant_exogenous`
+- Run multitask autoregressive rollout GIF generation with teacher-forced future exogenous variables:
+  `python scripts/rollout_predictions.py --config configs/default.yaml --split test --num_samples 5 --rollout_steps 20`
+- Run multitask autoregressive rollout GIF generation with constant exogenous variables:
+  `python scripts/rollout_predictions.py --config configs/default.yaml --split test --num_samples 5 --rollout_steps 20 --exogenous_mode constant`
 
 ### Shell Wrappers
 - Full pipeline wrapper:

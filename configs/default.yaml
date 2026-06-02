@@ -162,6 +162,59 @@ external_test_spatial:
   # Options: true, false
   allow_resize: false
 
+rollout:
+  # Enable autoregressive rollout evaluation utilities.
+  # Options: true, false
+  enabled: true
+
+  # Number of autoregressive forecast steps.
+  # Options: any positive integer >= 1.
+  rollout_steps: 20
+
+  # Window handling policy for rollout inference.
+  # Supported options:
+  # - static
+  window_mode: static
+
+  # How non-fuel future inputs are filled during rollout.
+  # Supported options:
+  # - teacher_forced: use the true future raw frame for non-fuel channels, but replace fuel with predicted fuel
+  # - constant: copy the previous rollout raw frame and replace fuel with predicted fuel
+  exogenous_mode: teacher_forced
+
+  # Raw fuel channels updated during rollout.
+  # Options: any valid raw channel indices.
+  surface_fuel_channel: 84
+  canopy_fuel_channel: 85
+
+  # Clamp reconstructed future fuel maps to be nonnegative.
+  # Options: true, false
+  clamp_fuel_nonnegative: true
+
+  # Probability threshold used to binarize the mask-logit head during rollout visualization and metrics.
+  # Options: any float in [0, 1].
+  mask_probability_threshold: 0.5
+
+  # Save one rollout GIF per selected sample.
+  # Options: true, false
+  save_gif: true
+
+  # Save per-step PNG frames alongside the GIF.
+  # Options: true, false
+  save_png_frames: false
+
+  # GIF frames per second.
+  # Options: any positive integer >= 1.
+  fps: 2
+
+  # Random seed used when rollout samples are selected randomly.
+  # Options: any integer.
+  random_seed: 42
+
+  # Root output directory for rollout artifacts.
+  # Options: any relative or absolute path.
+  output_dir: ./outputs/rollouts
+
 # Number of raw/base channels to take before adding engineered channels.
 # Options: any integer in [1, C_raw].
 input_channel_count: 86

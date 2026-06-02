@@ -537,6 +537,153 @@ def build_engineered_features(
 	return np.stack(feature_frames, axis=0).astype(np.float32, copy=False)
 
 
+def build_engineered_features_from_raw_window(
+	raw_window: np.ndarray,
+	config: Mapping[str, Any],
+	initial_fuel: np.ndarray | None = None,
+	previous_frame_before_window: np.ndarray | None = None,
+) -> np.ndarray:
+	"""Build engineered features from an in-memory rollout window.
+
+	This mirrors ``build_engineered_features`` but avoids disk-based lookups so
+	autoregressive rollout can rebuild deltas and consumed-fuel features from the
+	current predicted raw window at each step.
+	"""
+
+	raw_frames = np.asarray(raw_window, dtype=np.float32)
+	if raw_frames.ndim != 4:
+		raise ValueError(
+			"build_engineered_features_from_raw_window expects raw_window shaped (T, H, W, C), "
+			f"got {raw_frames.shape}."
+		)
+
+	engineered = _resolve_engineered_features_config(config)
+	atmospheric_count = count_atmospheric_engineered_channels(config)
+	fuel_flux_count = _count_fuel_flux_engineered_channels(config)
+	if atmospheric_count + fuel_flux_count <= 0:
+		height, width = int(raw_frames.shape[1]), int(raw_frames.shape[2])
+		return np.zeros((int(raw_frames.shape[0]), height, width, 0), dtype=np.float32)
+
+	layout = _resolve_channel_layout(config)
+	if engineered["enabled"] and engineered["add_cumulative_consumed_fuel"] and initial_fuel is None:
+		raise ValueError(
+			"initial_fuel must be provided when add_cumulative_consumed_fuel is enabled for rollout preprocessing."
+		)
+
+	if previous_frame_before_window is not None:
+		previous_frame_before_window = np.asarray(previous_frame_before_window, dtype=np.float32)
+		if previous_frame_before_window.shape != raw_frames[0].shape:
+			raise ValueError(
+				"previous_frame_before_window must match one raw frame shape. "
+				f"Expected {raw_frames[0].shape}, got {previous_frame_before_window.shape}."
+			)
+
+	feature_frames: list[np.ndarray] = []
+	for timestep_index in range(raw_frames.shape[0]):
+		current_frame = raw_frames[timestep_index]
+		if timestep_index == 0:
+			previous_frame = previous_frame_before_window if previous_frame_before_window is not None else current_frame
+		else:
+			previous_frame = raw_frames[timestep_index - 1]
+
+		per_timestep_features: list[np.ndarray] = []
+		atmospheric_features = build_atmospheric_features(current_frame, config)
+		if atmospheric_features.shape[-1] != atmospheric_count:
+			raise ValueError(
+				"Atmospheric engineered feature count mismatch in rollout preprocessing. "
+				f"Expected {atmospheric_count}, got {atmospheric_features.shape[-1]}."
+			)
+		if atmospheric_features.shape[-1] > 0:
+			per_timestep_features.append(atmospheric_features)
+
+		if engineered["enabled"]:
+			current_flux = _slice_channels(current_frame, layout["flux_channels"])
+			previous_flux = _slice_channels(previous_frame, layout["flux_channels"])
+			current_fuel = _slice_channels(current_frame, layout["fuel_channels"])
+			previous_fuel = _slice_channels(previous_frame, layout["fuel_channels"])
+
+			if engineered["add_flux_delta"]:
+				per_timestep_features.append(current_flux - previous_flux)
+			if engineered["add_fuel_delta"]:
+				per_timestep_features.append(current_fuel - previous_fuel)
+			if engineered["add_step_consumed_fuel"]:
+				step_consumed = previous_fuel - current_fuel
+				if engineered["clamp_consumed_fuel_nonnegative"]:
+					step_consumed = np.maximum(step_consumed, 0.0)
+				per_timestep_features.append(step_consumed)
+			if engineered["add_cumulative_consumed_fuel"]:
+				cumulative_consumed = np.asarray(initial_fuel, dtype=np.float32) - current_fuel
+				if engineered["clamp_consumed_fuel_nonnegative"]:
+					cumulative_consumed = np.maximum(cumulative_consumed, 0.0)
+				per_timestep_features.append(cumulative_consumed)
+
+		if per_timestep_features:
+			feature_frames.append(np.concatenate(per_timestep_features, axis=-1).astype(np.float32, copy=False))
+		else:
+			height, width = current_frame.shape[:2]
+			feature_frames.append(np.zeros((height, width, 0), dtype=np.float32))
+
+	return np.stack(feature_frames, axis=0).astype(np.float32, copy=False)
+
+
+def build_model_input_from_raw_window(
+	raw_window: np.ndarray,
+	config: Mapping[str, Any],
+	normalization_stats: Mapping[str, np.ndarray] | None = None,
+	initial_fuel: np.ndarray | None = None,
+	previous_frame_before_window: np.ndarray | None = None,
+) -> np.ndarray:
+	"""Convert a raw rollout window into the model's normalized (1, T, C, H, W) input."""
+
+	raw_frames = np.asarray(raw_window, dtype=np.float32)
+	if raw_frames.ndim != 4:
+		raise ValueError(
+			"build_model_input_from_raw_window expects raw_window shaped (T, H, W, C), "
+			f"got {raw_frames.shape}."
+		)
+
+	input_channel_count = int(config.get("input_channel_count", raw_frames.shape[-1]))
+	base_input_channel_indices = _resolve_input_channel_indices(config, input_channel_count)
+	base_input_frames = [_slice_channels(raw_frame, base_input_channel_indices) for raw_frame in raw_frames]
+	stacked_inputs = np.stack(base_input_frames, axis=0).astype(np.float32, copy=False)
+
+	engineered_inputs = build_engineered_features_from_raw_window(
+		raw_window=raw_frames,
+		config=config,
+		initial_fuel=initial_fuel,
+		previous_frame_before_window=previous_frame_before_window,
+	)
+	if engineered_inputs.shape[:3] != stacked_inputs.shape[:3]:
+		raise ValueError(
+			"Engineered rollout features must align with base inputs in (T, H, W). "
+			f"Got base={stacked_inputs.shape} engineered={engineered_inputs.shape}."
+		)
+	if engineered_inputs.shape[-1] > 0:
+		stacked_inputs = np.concatenate([stacked_inputs, engineered_inputs], axis=-1)
+
+	total_input_channels = stacked_inputs.shape[-1]
+	model_input_channels = int(config.get("model", {}).get("input_channels", total_input_channels))
+	if model_input_channels != total_input_channels:
+		raise ValueError(
+			"Model input channel count does not match rollout-preprocessed channels. "
+			f"model.input_channels={model_input_channels}, actual={total_input_channels}."
+		)
+
+	if normalization_stats is not None:
+		stats_mean = np.asarray(normalization_stats["mean"], dtype=np.float32)
+		stats_std = np.asarray(normalization_stats["std"], dtype=np.float32)
+		if stats_mean.shape[0] != total_input_channels or stats_std.shape[0] != total_input_channels:
+			raise ValueError(
+				"Normalization stats channel count does not match rollout-preprocessed inputs. "
+				f"Need {total_input_channels}, got mean={stats_mean.shape[0]} std={stats_std.shape[0]}."
+			)
+		stacked_inputs = normalize_tensor(stacked_inputs, stats_mean, stats_std).astype(np.float32, copy=False)
+
+	stacked_inputs = np.transpose(stacked_inputs, (0, 3, 1, 2))
+	stacked_inputs = np.ascontiguousarray(stacked_inputs, dtype=np.float32)
+	return np.expand_dims(stacked_inputs, axis=0)
+
+
 def build_multitask_target(
 	current_frame: np.ndarray,
 	future_frame: np.ndarray,

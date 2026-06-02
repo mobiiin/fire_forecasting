@@ -1,6 +1,7 @@
 numpy
 torch
 matplotlib
+imageio
 PyYAML
 tqdm
 scikit-learn
