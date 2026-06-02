@@ -361,24 +361,20 @@ def visualize_predictions(
 	test_dataset = _build_dataset_for_split(config, normalization_stats, split=selected_split)
 	if len(test_dataset) == 0:
 		raise ValueError(f"Requested {selected_split} dataset is empty; cannot visualize predictions.")
-	base_dataset = _unwrap_dataset(test_dataset)
-	test_loader = _build_test_loader(test_dataset)
 	task_type = str(config.get("task_type", _get_section(config, "training").get("task_type", "regression"))).lower()
-	total_test_samples = len(test_loader.dataset)
+	total_test_samples = len(test_dataset)
 	sample_count = min(max(int(num_samples), 0), total_test_samples)
 	if sample_count == 0:
 		raise ValueError("num_samples must be positive when visualizing predictions.")
+	selected_indices = random.Random(int(config.get("seed", _get_section(config, "training").get("seed", 42)))).sample(
+		range(total_test_samples),
+		sample_count,
+	)
+	test_dataset = torch.utils.data.Subset(test_dataset, selected_indices)
+	base_dataset = _unwrap_dataset(test_dataset)
+	test_loader = _build_test_loader(test_dataset)
 	split_mode = str(config.get("split_mode", "train_val_test")).lower()
-	if selected_split == "test" and split_mode == "train_val_external_test":
-		random_seed = int(config.get("seed", _get_section(config, "training").get("seed", 42)))
-		selected_indices = sorted(random.Random(random_seed).sample(range(total_test_samples), sample_count))
-		test_dataset = torch.utils.data.Subset(test_dataset, selected_indices)
-		base_dataset = _unwrap_dataset(test_dataset)
-		test_loader = _build_test_loader(test_dataset)
-		max_samples = len(selected_indices)
-	else:
-		selected_indices = list(range(sample_count))
-		max_samples = sample_count
+	max_samples = len(selected_indices)
 	first_batch = next(iter(test_loader))
 	x_batch, y_batch = first_batch[:2]
 	if x_batch.ndim != 5 or y_batch.ndim != 4:

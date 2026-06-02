@@ -118,7 +118,7 @@ learning_rate: 0.0001
 
 # Total training epochs.
 # Options: any positive integer >= 1.
-epochs: 8
+epochs: 50
 
 # Number of DataLoader workers.
 # Options: any integer >= 0.

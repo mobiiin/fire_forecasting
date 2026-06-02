@@ -1298,27 +1298,12 @@ def create_dataloaders(config):
 	train_fraction = float(config.get("train_fraction", 0.7))
 	val_fraction = float(config.get("val_fraction", 0.15))
 	test_fraction = float(config.get("test_fraction", 0.15))
-	if split_mode == "train_val_external_test":
-		split_indices = {
-			**chronological_train_val_split_indices(
-				num_timesteps=len(files),
-				input_sequence_length=input_sequence_length,
-				prediction_horizon=prediction_horizon,
-				train_fraction=train_fraction,
-				val_fraction=val_fraction,
-			),
-			"test": [],
-		}
-	else:
-		split_indices = chronological_split_indices(
-			num_timesteps=len(files),
-			input_sequence_length=input_sequence_length,
-			prediction_horizon=prediction_horizon,
-			train_fraction=train_fraction,
-			val_fraction=val_fraction,
-			test_fraction=test_fraction,
-			split_mode=split_mode,
-		)
+
+	task_type = str(config.get("task_type", _get_section(config, "training").get("task_type", "regression"))).lower()
+	target_normalization = _resolve_target_normalization_config(config)
+	use_train_patches = bool(config.get("use_patches", False))
+	use_eval_patches = bool(config.get("use_patches_for_eval", False))
+	return_metadata_for_multi = True
 
 	normalization_stats = None
 	normalization_config = _get_section(config, "normalization")
@@ -1327,12 +1312,6 @@ def create_dataloaders(config):
 		resolved_normalization_path = _resolve_path(config_path, normalization_path)
 		if resolved_normalization_path.exists():
 			normalization_stats = resolved_normalization_path
-
-	task_type = str(config.get("task_type", _get_section(config, "training").get("task_type", "regression"))).lower()
-	target_normalization = _resolve_target_normalization_config(config)
-	use_train_patches = bool(config.get("use_patches", False))
-	use_eval_patches = bool(config.get("use_patches_for_eval", False))
-	return_metadata_for_multi = True
 
 	if split_mode == "multi_dataset_chronological":
 		data_dirs = resolve_data_dirs(config)
@@ -1431,6 +1410,27 @@ def create_dataloaders(config):
 	if not data_dir.exists():
 		raise FileNotFoundError(f"Data directory does not exist: {data_dir}")
 	files = discover_dataset_files(data_dir, file_pattern)
+	if split_mode == "train_val_external_test":
+		split_indices = {
+			**chronological_train_val_split_indices(
+				num_timesteps=len(files),
+				input_sequence_length=input_sequence_length,
+				prediction_horizon=prediction_horizon,
+				train_fraction=train_fraction,
+				val_fraction=val_fraction,
+			),
+			"test": [],
+		}
+	else:
+		split_indices = chronological_split_indices(
+			num_timesteps=len(files),
+			input_sequence_length=input_sequence_length,
+			prediction_horizon=prediction_horizon,
+			train_fraction=train_fraction,
+			val_fraction=val_fraction,
+			test_fraction=test_fraction,
+			split_mode=split_mode,
+		)
 	dataset_kwargs = {
 		"file_paths": files,
 		"input_sequence_length": input_sequence_length,
