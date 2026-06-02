@@ -8,4 +8,5 @@ echo "Train ConvLSTM U-Net"
 echo "Config: ${CONFIG}"
 echo "========================================"
 
+python scripts/compute_normalization.py --config configs/default.yaml
 python scripts/train_convlstm_unet.py --config "$CONFIG"

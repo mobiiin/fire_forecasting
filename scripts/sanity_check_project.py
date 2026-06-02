@@ -20,6 +20,7 @@ from src.data.dataset import (
 	_resolve_path,
 	_sort_chronologically,
 	count_atmospheric_engineered_channels,
+	metadata_batch_to_list,
 	_resolve_atmospheric_features_config,
 	_resolve_multitask_config,
 	create_dataloaders,
@@ -72,6 +73,30 @@ def _format_stats(label: str, stats: Mapping[str, float]) -> str:
 	)
 
 
+def _print_metadata_preview(label: str, batch) -> None:
+	"""Print a short metadata preview when a batch includes per-sample metadata."""
+
+	if not isinstance(batch, (tuple, list)) or len(batch) < 3:
+		return
+	metadata_batch = batch[2]
+	if not isinstance(metadata_batch, Mapping):
+		return
+	metadata_items = metadata_batch_to_list(metadata_batch)[:3]
+	if not metadata_items:
+		return
+	print(f"{label} metadata preview")
+	for item in metadata_items:
+		dataset_name = item.get("dataset_name", "n/a")
+		dataset_id = item.get("dataset_id", "n/a")
+		sample_index = item.get("sample_index", "n/a")
+		current_file = item.get("current_file_path", item.get("current_file", "n/a"))
+		target_file = item.get("target_file_path", item.get("future_file", "n/a"))
+		print(
+			f"  dataset_name={dataset_name} dataset_id={dataset_id} "
+			f"sample_index={sample_index} current={current_file} future={target_file}"
+		)
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
 	"""Build CLI parser."""
 
@@ -116,6 +141,16 @@ def main() -> None:
 			"WARNING: atmospheric_features.low_level_indices contain invalid z-level indices: "
 			f"{invalid_low_level_indices}"
 		)
+	if atmospheric["enabled"] and atmospheric["add_wind_direction"] and atmospheric["wind_direction_mode"] != "unit_vector":
+		print(
+			"WARNING: atmospheric_features.wind_direction_mode is not 'unit_vector': "
+			f"{atmospheric['wind_direction_mode']!r}"
+		)
+	if atmospheric["enabled"] and atmospheric["add_wind_direction"] and atmospheric["wind_direction_convention"] != "toward":
+		print(
+			"WARNING: atmospheric_features.wind_direction_convention is not 'toward': "
+			f"{atmospheric['wind_direction_convention']!r}"
+		)
 
 	train_loader, val_loader, test_loader = create_dataloaders(config)
 	if len(train_loader.dataset) == 0:
@@ -136,7 +171,8 @@ def main() -> None:
 	else:
 		print(f"  external test samples: {len(test_loader.dataset)}")
 
-	x_batch, y_batch = next(iter(train_loader))[:2]
+	train_batch = next(iter(train_loader))
+	x_batch, y_batch = train_batch[:2]
 	if x_batch.ndim != 5:
 		raise ValueError(f"Expected X batch shape (B, T, C, H, W), got {tuple(x_batch.shape)}")
 	if y_batch.ndim != 4:
@@ -201,6 +237,28 @@ def main() -> None:
 	print(f"  X batch shape: {tuple(x_batch.shape)}")
 	print(f"  y batch shape: {tuple(y_batch.shape)}")
 	print(f"  model output shape: {tuple(y_pred.shape)}")
+	if str(config.get("split_mode", "")).lower() == "multi_dataset_chronological":
+		train_metadata_items = metadata_batch_to_list(train_batch[2]) if len(train_batch) >= 3 and isinstance(train_batch[2], Mapping) else []
+		for item in train_metadata_items[:3]:
+			data_dir = str(item.get("data_dir", ""))
+			current_file = str(item.get("current_file_path", item.get("current_file", "")))
+			target_file = str(item.get("target_file_path", item.get("future_file", "")))
+			if data_dir and not current_file.startswith(data_dir):
+				raise ValueError(
+					"Multi-dataset metadata sanity check failed: current_file_path is outside the sample's data_dir. "
+					f"data_dir={data_dir} current_file={current_file}"
+				)
+			if data_dir and not target_file.startswith(data_dir):
+				raise ValueError(
+					"Multi-dataset metadata sanity check failed: target_file_path is outside the sample's data_dir. "
+					f"data_dir={data_dir} target_file={target_file}"
+				)
+		if not hasattr(train_loader.dataset, "initial_fuel_maps") or not getattr(train_loader.dataset, "initial_fuel_maps"):
+			raise ValueError("Multi-dataset sanity check failed: dataset.initial_fuel_maps is missing or empty.")
+		_print_metadata_preview("train", train_batch)
+		_print_metadata_preview("val", next(iter(val_loader)))
+		if test_loader is not None and len(test_loader.dataset) > 0:
+			_print_metadata_preview("test", next(iter(test_loader)))
 	if atmospheric_engineered_channel_count > 0:
 		if "horizontal_wind_speed" in engineered_channel_slices:
 			print(_format_stats("  horizontal wind speed channels", _tensor_stats(x_batch[:, :, engineered_channel_slices["horizontal_wind_speed"], :, :])))
@@ -208,6 +266,10 @@ def main() -> None:
 			print(_format_stats("  low-level mean wind speed channel", _tensor_stats(x_batch[:, :, engineered_channel_slices["low_level_mean_wind_speed"], :, :])))
 		if "updraft" in engineered_channel_slices:
 			print(_format_stats("  updraft channels", _tensor_stats(x_batch[:, :, engineered_channel_slices["updraft"], :, :])))
+		if "wind_dir_cos" in engineered_channel_slices:
+			print(_format_stats("  wind_dir_cos channels", _tensor_stats(x_batch[:, :, engineered_channel_slices["wind_dir_cos"], :, :])))
+		if "wind_dir_sin" in engineered_channel_slices:
+			print(_format_stats("  wind_dir_sin channels", _tensor_stats(x_batch[:, :, engineered_channel_slices["wind_dir_sin"], :, :])))
 
 	if task_type == "multitask":
 		surface_stats = _tensor_stats(y_batch[:, 0])

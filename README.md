@@ -42,36 +42,36 @@ channel_layout:
 ```
 
 ## Dataset Splitting Policy
-Main `data_dir` is used only for training and validation.
+## Training On Multiple Simulation Datasets
+Use `data_dirs` to provide multiple dataset folders. Each folder is treated as an independent time series, so input sequences never cross folder boundaries.
 
-Chronological split policy:
-- train: first `85%`
-- validation: last `15%`
-- no random splitting
-- no internal test split from the main dataset
-
-Final testing is done only on a separate external dataset configured by `test_data_dir`.
+In `multi_dataset_chronological` mode:
+- each dataset is split chronologically into train/validation/test independently
+- train splits are concatenated across datasets
+- validation splits are concatenated across datasets
+- test splits are concatenated across datasets
+- no random frame splitting is used
 
 Normalization rules:
-- normalization stats are computed only from the main training split
-- validation data is not used for normalization
-- external test data is not used for normalization
-- external test data uses the training normalization stats
+- normalization stats are computed only from the combined training splits
+- validation and test splits are not used for normalization
+- sequences, previous-frame deltas, and initial-fuel references all stay local to the source dataset
+
+This improves generalization by exposing the model to more fire regimes while still preserving chronological structure inside each simulation.
 
 Example config:
 
 ```yaml
-split_mode: train_val_external_test
-train_fraction: 0.85
+data_dirs:
+  - ../keepz_08
+  - ../keepz_08_tuo
+split_mode: multi_dataset_chronological
+train_fraction: 0.7
 val_fraction: 0.15
-test_fraction: 0.0
-data_dir: ../keepz_08
-test_data_dir: ../keepz_08_external_test
-file_pattern: "*.npy"
-external_test_file_pattern: "*.npy"
+test_fraction: 0.15
 ```
 
-If `test_data_dir: null`, training and validation still work, but `scripts/test_model.py` will fail with a clear message instead of silently evaluating validation data.
+If the goal is strict cross-dataset generalization, add a future split mode that holds out whole datasets. The current `multi_dataset_chronological` mode uses all configured datasets in train/val/test splits chronologically.
 
 ## Inputs And Targets
 Base input channels: `86`
@@ -84,18 +84,19 @@ With the default engineered features enabled, the dataset appends:
 - `8` horizontal wind speed channels
 - `1` low-level mean wind speed channel
 - `8` updraft channels
+- `16` wind direction unit-vector channels
 
 Total input channels:
 
 ```text
-86 + 10 + 17 = 113
+86 + 10 + 33 = 129
 ```
 
 Default model config:
 
 ```yaml
 model:
-  input_channels: 113
+  input_channels: 129
   output_channels: 3
 ```
 
@@ -120,16 +121,37 @@ sqrt(mean(U_low)^2 + mean(V_low)^2)
 max(W, 0)
 ```
 
+4. Wind direction unit-vector features for each retained z-level:
+
+```text
+wind_speed = sqrt(U^2 + V^2 + eps)
+wind_dir_cos = U / wind_speed
+wind_dir_sin = V / wind_speed
+```
+
+These encode the direction the wind is blowing toward.
+
 Why these features help:
 - horizontal wind speed directly represents wind magnitude
 - low-level wind is strongly related to near-surface fire spread
 - updraft captures plume and convection strength
+- wind-direction unit vectors preserve directional information without angle wraparound
+
+Why not raw angles:
+- raw `atan2`-style angle channels wrap at `360/0` degrees, which creates an artificial discontinuity for ML
+- normalized `cos/sin` direction components are smoother and easier for the model to learn from
+- meteorological wind direction is usually the direction wind comes from, but these features use the toward-direction vector because it is more directly aligned with transport and spread
 
 Default channel-count example:
 - raw channels: `86`
 - fuel/flux engineered channels: `10`
-- atmospheric engineered channels: `17`
-- total model input channels: `113`
+- atmospheric engineered channels:
+  `8` horizontal wind speed
+  `1` low-level mean wind speed
+  `8` updraft
+  `16` wind direction unit-vector channels
+  total atmospheric engineered = `33`
+- total model input channels: `129`
 
 ## Leakage Rule
 - input features may use time `t` and earlier only
@@ -193,13 +215,19 @@ All commands below assume the Conda environment above is already active.
   `python scripts/smoke_checks.py --config configs/default.yaml`
 - Train the model:
   `python scripts/train_convlstm_unet.py --config configs/default.yaml`
-- Evaluate the saved checkpoint on the external test dataset:
+- Evaluate the saved checkpoint on the configured test split:
   `python scripts/test_model.py --config configs/default.yaml --checkpoint-kind best`
 - Probe model support for native and alternate spatial sizes without loading dataset files:
   `python scripts/test_spatial_size_compatibility.py --config configs/default.yaml`
+- Diagnose why multitask mask output channel 2 generalizes poorly on external test:
+  `python scripts/diagnose_mask_generalization.py --config configs/default.yaml --max_samples 200`
+- Compare raw active-flux and burned-fuel mask definitions across splits:
+  `python scripts/compare_mask_definitions.py --config configs/default.yaml --max_samples 200`
+- Evaluate masks derived from predicted consumed fuel:
+  `python scripts/evaluate_consumed_fuel_derived_mask.py --config configs/default.yaml --max_samples 200`
 - Visualize validation predictions:
   `python scripts/visualize_predictions.py --config configs/default.yaml --split val --num_samples 10`
-- Visualize external test predictions:
+- Visualize test predictions:
   `python scripts/visualize_predictions.py --config configs/default.yaml --split test --num_samples 10`
 - Visualize model vs persistence comparisons:
   `python scripts/visualize_model_vs_persistence.py --config configs/default.yaml --num_samples 20 --output_dir outputs/model_vs_persistence`

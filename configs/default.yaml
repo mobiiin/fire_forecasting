@@ -2,13 +2,20 @@
 # This file is intentionally verbose so it can also serve as an ablation reference.
 # Parameter values are unchanged; comments list the supported options or valid ranges.
 
-# Main dataset directory used for training/validation.
+# Main dataset directories used for training/validation/test in multi-dataset mode.
+# Options: a non-empty list of relative or absolute directory paths containing one .npy file per timestamp.
+data_dirs:
+  - ../keepz_08
+  - ../keepz_08_tuo
+
+# Legacy single dataset directory fallback.
 # Options: any relative or absolute directory path containing one .npy file per timestamp.
+# If data_dirs exists and is non-empty, code uses data_dirs and ignores this fallback.
 data_dir: ../keepz_08
 
 # External final-test dataset directory.
 # Options: null to disable external testing, or any relative/absolute directory path.
-test_data_dir: ../keepz_08_tuo
+test_data_dir: null
 
 # Glob pattern for the main dataset files.
 # Options: any glob accepted by pathlib.Path.glob, e.g. "*.npy", "frame_*.npy".
@@ -33,9 +40,10 @@ target_channel: 84
 
 # Dataset split policy.
 # Supported options:
+# - multi_dataset_chronological: split each dataset in data_dirs independently by time, then concatenate train/val/test samples
 # - train_val_external_test: main data_dir -> chronological train/val only, test_data_dir used for final testing
 # - train_val_test: legacy chronological train/val/test split within data_dir
-split_mode: train_val_external_test
+split_mode: multi_dataset_chronological
 
 # Learning task.
 # Supported options:
@@ -50,7 +58,7 @@ fire_threshold: 0.5
 
 # Whether to sample spatial patches during training.
 # Options: true, false
-use_patches: false
+use_patches: true
 
 # Whether to use patches during validation/external test/inference utilities.
 # Options: true, false
@@ -58,7 +66,7 @@ use_patches_for_eval: false
 
 # Patch size used when patch mode is enabled.
 # Options: any positive integer <= min(H, W).
-patch_size: 64
+patch_size: 72
 
 # Probability of sampling a patch around active pixels when patch mode is enabled.
 # Options: float in [0, 1].
@@ -71,8 +79,8 @@ active_threshold: 0.5
 # Chronological train fraction for the main dataset.
 # Options:
 # - for split_mode=train_val_external_test: train_fraction + val_fraction must sum to 1.0
-# - for split_mode=train_val_test: train_fraction + val_fraction + test_fraction must sum to 1.0
-train_fraction: 0.85
+# - for split_mode=train_val_test or multi_dataset_chronological: train_fraction + val_fraction + test_fraction must sum to 1.0
+train_fraction: 0.7
 
 # Chronological validation fraction for the main dataset.
 # Options: see train_fraction rules above.
@@ -81,8 +89,23 @@ val_fraction: 0.15
 # Chronological internal test fraction.
 # Options:
 # - 0.0 when using train_val_external_test
-# - positive fraction when using legacy train_val_test
-test_fraction: 0.0
+# - positive fraction when using train_val_test or multi_dataset_chronological
+test_fraction: 0.15
+
+# Whether dataset metadata should include dataset_id and dataset_name when return_metadata=True.
+# Options: true, false
+dataset_id_in_metadata: true
+
+dataset_sampling:
+  # Enable custom train sampling across datasets.
+  # Options: true, false
+  enabled: false
+
+  # Dataset sampling strategy.
+  # Supported options:
+  # - uniform_samples
+  # - balanced_by_dataset
+  mode: uniform_samples
 
 # Batch size for DataLoaders.
 # Options: any positive integer >= 1, limited by memory.
@@ -95,7 +118,7 @@ learning_rate: 0.0001
 
 # Total training epochs.
 # Options: any positive integer >= 1.
-epochs: 20
+epochs: 8
 
 # Number of DataLoader workers.
 # Options: any integer >= 0.
@@ -107,7 +130,7 @@ num_workers: 4
 # - cpu
 # - cuda
 # - gpu   # alias for cuda
-device: auto
+device: cuda
 
 # External test spatial handling policy.
 # Supported options:
@@ -229,6 +252,20 @@ atmospheric_features:
   # Options: true, false
   add_updraft: true
 
+  # Append wind direction using normalized U/V unit-vector components for every retained z-level.
+  # Options: true, false
+  add_wind_direction: true
+
+  # Wind-direction feature encoding mode.
+  # Currently implemented options:
+  # - unit_vector
+  wind_direction_mode: unit_vector
+
+  # Wind-direction convention.
+  # Currently implemented options:
+  # - toward
+  wind_direction_convention: toward
+
   # Z-level indices used for the low-level mean wind feature.
   # Options: any non-empty list of valid zero-based z-level indices in [0, num_vertical_levels - 1].
   low_level_indices: [0, 1, 2]
@@ -264,7 +301,7 @@ multitask:
   # Supported options:
   # - active_flux
   # - burned_fuel
-  mask_target_type: active_flux
+  mask_target_type: burned_fuel
 
   # Threshold for active_flux mask_target_type.
   # Options: any float threshold in the selected flux channel's range.
@@ -308,7 +345,7 @@ multitask:
 
   # Weight applied to active pixels in weighted multitask losses.
   # Options: any positive float > 0.
-  active_fire_weight: 10.0
+  active_fire_weight: 20.0
 
   # Weight applied to background pixels in weighted multitask losses.
   # Options: any positive float > 0.
@@ -333,7 +370,9 @@ model:
 
   # Total input channels after all enabled engineered features are appended.
   # Options: any positive integer matching the actual dataset tensor width after engineering.
-  input_channels: 113
+  # Default full setup here:
+  # 86 raw + 10 fuel/flux engineered + 33 atmospheric engineered = 129
+  input_channels: 129
 
   # ConvLSTM hidden dimension.
   # Options: any positive integer >= 1.
@@ -443,6 +482,10 @@ training:
   # Whether to run external test evaluation automatically after training.
   # Options: true, false
   run_external_test_after_training: false
+
+  # Whether to run the configured test split automatically after training.
+  # Options: true, false
+  run_test_after_training: false
 
   # Learning-rate scheduler.
   # Supported options:

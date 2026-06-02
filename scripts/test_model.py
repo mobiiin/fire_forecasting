@@ -1,4 +1,4 @@
-"""Evaluate a trained ConvLSTM U-Net checkpoint on the external test split with diagnostics."""
+"""Evaluate a trained ConvLSTM U-Net checkpoint on the configured test split with diagnostics."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ from src.training.train import (
     _infer_input_channels_from_loader,
     _resolve_training_paths,
 )
-from src.data.dataset import create_dataloaders
+from src.data.dataset import create_dataloaders, metadata_batch_to_list
 
 
 def tensor_stats(array_like) -> dict[str, float]:
@@ -190,11 +190,83 @@ def evaluate_external_test_loader(model, test_loader, criterion, config, device:
     }
 
 
+def evaluate_multi_dataset_test_loader(model, test_loader, criterion, config, device: torch.device) -> tuple[dict[str, float], dict[str, dict[str, float]]]:
+    """Evaluate a combined internal multi-dataset test loader with aggregate and per-dataset metrics."""
+
+    model.eval()
+    aggregate_loss_total = 0.0
+    aggregate_metric_totals: dict[str, float] = defaultdict(float)
+    aggregate_loss_component_totals: dict[str, float] = defaultdict(float)
+    aggregate_samples = 0
+    per_dataset: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+
+    with torch.no_grad():
+        for batch in test_loader:
+            if not isinstance(batch, (tuple, list)) or len(batch) < 3:
+                raise TypeError(
+                    "Expected multi-dataset test batches to contain input tensors, target tensors, and metadata."
+                )
+            x_batch = batch[0].to(device)
+            y_batch = batch[1].to(device)
+            metadata_items = metadata_batch_to_list(batch[2])
+            y_pred = model(x_batch)
+            if tuple(y_pred.shape) != tuple(y_batch.shape):
+                raise ValueError(
+                    "Internal multi-dataset test prediction shape does not match target shape. "
+                    f"Prediction={tuple(y_pred.shape)} target={tuple(y_batch.shape)}."
+                )
+
+            for sample_index, metadata in enumerate(metadata_items):
+                dataset_name = str(metadata.get("dataset_name", f"dataset_{metadata.get('dataset_id', 'unknown')}"))
+                sample_pred = y_pred[sample_index : sample_index + 1]
+                sample_true = y_batch[sample_index : sample_index + 1]
+                loss_result = criterion(sample_pred, sample_true)
+                loss, loss_components = _coerce_loss_result(loss_result)
+                metric_prediction, metric_target = _denormalize_target_tensors_for_metrics(
+                    test_loader,
+                    sample_pred.detach(),
+                    sample_true.detach(),
+                )
+                sample_metrics = compute_metrics(metric_prediction, metric_target, config)
+
+                aggregate_samples += 1
+                aggregate_loss_total += float(loss.detach().item())
+                per_dataset[dataset_name]["num_samples"] += 1.0
+                per_dataset[dataset_name]["test_loss"] += float(loss.detach().item())
+
+                for component_name, component_value in loss_components.items():
+                    aggregate_loss_component_totals[component_name] += float(component_value)
+                    per_dataset[dataset_name][f"test_{component_name}"] += float(component_value)
+                for metric_name, metric_value in sample_metrics.items():
+                    aggregate_metric_totals[metric_name] += float(metric_value)
+                    per_dataset[dataset_name][f"test_{metric_name}"] += float(metric_value)
+
+    if aggregate_samples == 0:
+        raise ValueError("Combined internal multi-dataset test loader produced no samples.")
+
+    aggregate_results = {"test_loss": aggregate_loss_total / aggregate_samples}
+    for component_name, total_value in aggregate_loss_component_totals.items():
+        aggregate_results[f"test_{component_name}"] = total_value / aggregate_samples
+    for metric_name, total_value in aggregate_metric_totals.items():
+        aggregate_results[f"test_{metric_name}"] = total_value / aggregate_samples
+
+    per_dataset_results: dict[str, dict[str, float]] = {}
+    for dataset_name, totals in per_dataset.items():
+        num_samples = max(int(totals.get("num_samples", 0.0)), 1)
+        dataset_results: dict[str, float] = {"num_samples": float(num_samples)}
+        for key, total_value in totals.items():
+            if key == "num_samples":
+                continue
+            dataset_results[key] = float(total_value) / num_samples
+        per_dataset_results[dataset_name] = dataset_results
+    return aggregate_results, per_dataset_results
+
+
 def build_argument_parser() -> argparse.ArgumentParser:
     """Create the command-line parser for standalone test evaluation."""
 
     parser = argparse.ArgumentParser(
-        description="Evaluate a trained ConvLSTM U-Net checkpoint on the external test split."
+        description="Evaluate a trained ConvLSTM U-Net checkpoint on the configured test split."
     )
     parser.add_argument(
         "--config",
@@ -222,6 +294,7 @@ def main() -> None:
     if torch is None:
         raise ImportError("PyTorch is required to evaluate the ConvLSTM U-Net model.")
     config = _ensure_config_path(load_config(args.config), args.config)
+    split_mode = str(config.get("split_mode", "train_val_test")).lower()
 
     train_loader, _, test_loader = create_dataloaders(config)
     if test_loader is None:
@@ -230,6 +303,8 @@ def main() -> None:
             "Set test_data_dir in the config to evaluate on an external test dataset."
         )
     if len(test_loader.dataset) == 0:
+        if split_mode == "multi_dataset_chronological":
+            raise ValueError("Combined internal test split is empty; cannot evaluate the model.")
         raise ValueError("External test dataset is empty; cannot evaluate the model.")
 
     dataset = test_loader.dataset
@@ -255,34 +330,57 @@ def main() -> None:
     checkpoint = load_checkpoint(resolved_checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
 
-    test_results, spatial_summary = evaluate_external_test_loader(
-        model=model,
-        test_loader=test_loader,
-        criterion=criterion,
-        config=config,
-        device=device,
-    )
-
-    diagnostics_path = Path("artifacts/logs/test_scale_diagnostics.txt").expanduser().resolve()
-    generate_scale_diagnostics(model, test_loader, device, diagnostics_path, config)
-
     print(f"checkpoint: {resolved_checkpoint_path}")
-    print(f"external test dataset path: {config.get('test_data_dir')}")
-    print(f"external test files: {len(getattr(test_loader.dataset, 'file_paths', []))}")
-    print(f"external test samples: {len(test_loader.dataset)}")
-    if spatial_summary.get("first_batch"):
-        print(f"external X before spatial handling: {spatial_summary['first_batch']['native_input_shape']}")
-        print(f"external X fed to model: {spatial_summary['first_batch']['model_input_shape']}")
-        print(f"external prediction after crop: {spatial_summary['first_batch']['prediction_shape']}")
-        print(f"external y shape: {spatial_summary['first_batch']['target_shape']}")
-        print(f"external spatial mode used on first batch: {spatial_summary['first_batch']['mode_used']}")
-    if spatial_summary.get("warning"):
-        print(f"WARNING: {spatial_summary['warning']}")
-    print(f"external spatial mode counts: {spatial_summary['mode_counts']}")
-    print(f"target_channel: {target_channel}")
-    for metric_name, metric_value in test_results.items():
-        print(f"{metric_name}: {metric_value:.6f}")
-    print(f"diagnostics_file: {diagnostics_path}")
+    if split_mode == "multi_dataset_chronological":
+        aggregate_results, per_dataset_results = evaluate_multi_dataset_test_loader(
+            model=model,
+            test_loader=test_loader,
+            criterion=criterion,
+            config=config,
+            device=device,
+        )
+        print(f"combined internal test samples: {len(test_loader.dataset)}")
+        print(f"target_channel: {target_channel}")
+        print("aggregate metrics")
+        for metric_name, metric_value in aggregate_results.items():
+            print(f"{metric_name}: {metric_value:.6f}")
+        print("per-dataset metrics")
+        for dataset_name in sorted(per_dataset_results):
+            print(f"[{dataset_name}]")
+            dataset_metrics = per_dataset_results[dataset_name]
+            print(f"num_samples: {int(dataset_metrics['num_samples'])}")
+            for key, value in dataset_metrics.items():
+                if key == "num_samples":
+                    continue
+                print(f"{key}: {value:.6f}")
+    else:
+        test_results, spatial_summary = evaluate_external_test_loader(
+            model=model,
+            test_loader=test_loader,
+            criterion=criterion,
+            config=config,
+            device=device,
+        )
+
+        diagnostics_path = Path("artifacts/logs/test_scale_diagnostics.txt").expanduser().resolve()
+        generate_scale_diagnostics(model, test_loader, device, diagnostics_path, config)
+
+        print(f"external test dataset path: {config.get('test_data_dir')}")
+        print(f"external test files: {len(getattr(test_loader.dataset, 'file_paths', []))}")
+        print(f"external test samples: {len(test_loader.dataset)}")
+        if spatial_summary.get("first_batch"):
+            print(f"external X before spatial handling: {spatial_summary['first_batch']['native_input_shape']}")
+            print(f"external X fed to model: {spatial_summary['first_batch']['model_input_shape']}")
+            print(f"external prediction after crop: {spatial_summary['first_batch']['prediction_shape']}")
+            print(f"external y shape: {spatial_summary['first_batch']['target_shape']}")
+            print(f"external spatial mode used on first batch: {spatial_summary['first_batch']['mode_used']}")
+        if spatial_summary.get("warning"):
+            print(f"WARNING: {spatial_summary['warning']}")
+        print(f"external spatial mode counts: {spatial_summary['mode_counts']}")
+        print(f"target_channel: {target_channel}")
+        for metric_name, metric_value in test_results.items():
+            print(f"{metric_name}: {metric_value:.6f}")
+        print(f"diagnostics_file: {diagnostics_path}")
 
 
 if __name__ == "__main__":

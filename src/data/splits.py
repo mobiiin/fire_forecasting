@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, List
+from typing import Any, Dict, List, Mapping, Sequence
 
 
 def _validate_nonnegative_fraction(name: str, fraction: float) -> None:
@@ -106,6 +106,68 @@ def chronological_train_val_split_indices(
 		prediction_horizon=prediction_horizon,
 	)
 	return {"train": train, "val": val}
+
+
+def chronological_split_indices_for_dataset(
+	num_timesteps: int,
+	input_sequence_length: int,
+	prediction_horizon: int,
+	train_fraction: float,
+	val_fraction: float,
+	test_fraction: float,
+) -> Dict[str, List[int]]:
+	"""Split one dataset chronologically into train/val/test sample starts."""
+
+	return chronological_split_indices(
+		num_timesteps=num_timesteps,
+		input_sequence_length=input_sequence_length,
+		prediction_horizon=prediction_horizon,
+		train_fraction=train_fraction,
+		val_fraction=val_fraction,
+		test_fraction=test_fraction,
+		split_mode="train_val_test",
+	)
+
+
+def multi_dataset_chronological_splits(
+	dataset_records: Sequence[Mapping[str, Any]],
+	input_sequence_length: int,
+	prediction_horizon: int,
+	train_fraction: float,
+	val_fraction: float,
+	test_fraction: float,
+) -> dict[str, list[dict[str, int]]]:
+	"""Split each dataset independently, then concatenate split-local sample references."""
+
+	_validate_fractions(train_fraction, val_fraction, test_fraction)
+	combined: dict[str, list[dict[str, int]]] = {"train": [], "val": [], "test": []}
+	rows: list[tuple[str, int, int, int, int]] = []
+
+	for dataset_record in dataset_records:
+		file_count = int(dataset_record["num_files"])
+		dataset_id = int(dataset_record["dataset_id"])
+		dataset_name = str(dataset_record["dataset_name"])
+		splits = chronological_split_indices_for_dataset(
+			num_timesteps=file_count,
+			input_sequence_length=input_sequence_length,
+			prediction_horizon=prediction_horizon,
+			train_fraction=train_fraction,
+			val_fraction=val_fraction,
+			test_fraction=test_fraction,
+		)
+		rows.append((dataset_name, file_count, len(splits["train"]), len(splits["val"]), len(splits["test"])))
+		for split_name in ("train", "val", "test"):
+			for sample_index in splits[split_name]:
+				combined[split_name].append({"dataset_id": dataset_id, "sample_index": int(sample_index)})
+
+	print("dataset_name       files    train_samples    val_samples    test_samples")
+	for dataset_name, file_count, train_count, val_count, test_count in rows:
+		print(f"{dataset_name:<18} {file_count:<8} {train_count:<16} {val_count:<13} {test_count:<12}")
+	print(
+		f"{'TOTAL':<18} {'':<8} {len(combined['train']):<16} "
+		f"{len(combined['val']):<13} {len(combined['test']):<12}"
+	)
+	return combined
 
 
 def chronological_split_indices(

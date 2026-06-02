@@ -8,13 +8,19 @@ from pathlib import Path
 import numpy as np
 
 from src.config import load_config
+from src.data.discovery import discover_dataset_files, discover_multiple_datasets
 from src.data.dataset import (
 	FireSequenceDataset,
+	MultiFireSequenceDataset,
 	_count_fuel_flux_engineered_channels,
 	count_atmospheric_engineered_channels,
-	_sort_chronologically,
 )
-from src.data.splits import chronological_split_indices, chronological_train_val_split_indices
+from src.data.splits import (
+	chronological_split_indices,
+	chronological_train_val_split_indices,
+	chronological_split_indices_for_dataset,
+	multi_dataset_chronological_splits,
+)
 
 
 def _resolve_path(base_path: Path, configured_path: str | Path) -> Path:
@@ -80,60 +86,113 @@ def main() -> None:
 	if "path" not in normalization_config:
 		raise KeyError("Config is missing normalization.path.")
 
-	data_dir = _resolve_path(config_path, config["data_dir"])
-	file_pattern = str(config["file_pattern"])
-	if not data_dir.exists():
-		raise FileNotFoundError(f"Data directory does not exist: {data_dir}")
-	files = _sort_chronologically(list(data_dir.glob(file_pattern)))
-	if not files:
-		raise FileNotFoundError(f"No files found in '{data_dir}' using pattern '{file_pattern}'.")
-
 	split_mode = str(config.get("split_mode", "train_val_test")).lower()
 	train_fraction = float(config["train_fraction"])
 	val_fraction = float(config["val_fraction"])
 	test_fraction = float(config.get("test_fraction", 0.0))
-	if split_mode == "train_val_external_test":
-		splits = {
-			**chronological_train_val_split_indices(
-				num_timesteps=len(files),
-				input_sequence_length=int(config["input_sequence_length"]),
-				prediction_horizon=int(config["prediction_horizon"]),
-				train_fraction=train_fraction,
-				val_fraction=val_fraction,
-			),
-			"test": [],
-		}
-	else:
-		splits = chronological_split_indices(
-			num_timesteps=len(files),
+	file_pattern = str(config["file_pattern"])
+	if split_mode == "multi_dataset_chronological":
+		dataset_records = discover_multiple_datasets(config)
+		sample_refs = multi_dataset_chronological_splits(
+			dataset_records=dataset_records,
 			input_sequence_length=int(config["input_sequence_length"]),
 			prediction_horizon=int(config["prediction_horizon"]),
 			train_fraction=train_fraction,
 			val_fraction=val_fraction,
 			test_fraction=test_fraction,
-			split_mode=split_mode,
 		)
+		train_dataset = MultiFireSequenceDataset(
+			dataset_records=dataset_records,
+			sample_refs=sample_refs["train"],
+			input_sequence_length=int(config["input_sequence_length"]),
+			prediction_horizon=int(config["prediction_horizon"]),
+			target_channel=int(config.get("target_channel", 0)),
+			input_channel_count=int(config.get("input_channel_count", config.get("model", {}).get("input_channels", 0))),
+			input_channel_indices=config.get("input_channel_indices"),
+			task_type=str(config.get("task_type", config.get("training", {}).get("task_type", "regression"))),
+			fire_threshold=float(config.get("fire_threshold", config.get("training", {}).get("fire_threshold", 0.5))),
+			use_patches=False,
+			patch_size=int(config.get("patch_size", 64)),
+			active_patch_probability=float(config.get("active_patch_probability", 0.7)),
+			active_threshold=float(config.get("active_threshold", config.get("fire_threshold", 0.5))),
+			normalization_stats=None,
+			normalize_target=False,
+			config=config,
+		)
+		per_dataset_train_counts: dict[str, int] = {}
+		per_dataset_val_counts: dict[str, int] = {}
+		per_dataset_test_counts: dict[str, int] = {}
+		for dataset_record in dataset_records:
+			dataset_name = str(dataset_record["dataset_name"])
+			dataset_splits = chronological_split_indices_for_dataset(
+				num_timesteps=int(dataset_record["num_files"]),
+				input_sequence_length=int(config["input_sequence_length"]),
+				prediction_horizon=int(config["prediction_horizon"]),
+				train_fraction=train_fraction,
+				val_fraction=val_fraction,
+				test_fraction=test_fraction,
+			)
+			per_dataset_train_counts[dataset_name] = len(dataset_splits["train"])
+			per_dataset_val_counts[dataset_name] = len(dataset_splits["val"])
+			per_dataset_test_counts[dataset_name] = len(dataset_splits["test"])
+		splits = {
+			"train": sample_refs["train"],
+			"val": sample_refs["val"],
+			"test": sample_refs["test"],
+		}
+	else:
+		data_dir = _resolve_path(config_path, config["data_dir"])
+		if not data_dir.exists():
+			raise FileNotFoundError(f"Data directory does not exist: {data_dir}")
+		files = discover_dataset_files(data_dir, file_pattern)
+		if split_mode == "train_val_external_test":
+			splits = {
+				**chronological_train_val_split_indices(
+					num_timesteps=len(files),
+					input_sequence_length=int(config["input_sequence_length"]),
+					prediction_horizon=int(config["prediction_horizon"]),
+					train_fraction=train_fraction,
+					val_fraction=val_fraction,
+				),
+				"test": [],
+			}
+		else:
+			splits = chronological_split_indices(
+				num_timesteps=len(files),
+				input_sequence_length=int(config["input_sequence_length"]),
+				prediction_horizon=int(config["prediction_horizon"]),
+				train_fraction=train_fraction,
+				val_fraction=val_fraction,
+				test_fraction=test_fraction,
+				split_mode=split_mode,
+			)
+		if not splits["train"]:
+			raise ValueError("No training samples were found for normalization.")
+
+		train_dataset = FireSequenceDataset(
+			file_paths=files,
+			sample_indices=splits["train"],
+			input_sequence_length=int(config["input_sequence_length"]),
+			prediction_horizon=int(config["prediction_horizon"]),
+			target_channel=int(config.get("target_channel", 0)),
+			input_channel_count=int(config.get("input_channel_count", config.get("model", {}).get("input_channels", 0))),
+			input_channel_indices=config.get("input_channel_indices"),
+			task_type=str(config.get("task_type", config.get("training", {}).get("task_type", "regression"))),
+			fire_threshold=float(config.get("fire_threshold", config.get("training", {}).get("fire_threshold", 0.5))),
+			use_patches=False,
+			patch_size=int(config.get("patch_size", 64)),
+			active_patch_probability=float(config.get("active_patch_probability", 0.7)),
+			active_threshold=float(config.get("active_threshold", config.get("fire_threshold", 0.5))),
+			normalization_stats=None,
+			normalize_target=False,
+			config=config,
+		)
+		per_dataset_train_counts = {}
+		per_dataset_val_counts = {}
+		per_dataset_test_counts = {}
+
 	if not splits["train"]:
 		raise ValueError("No training samples were found for normalization.")
-
-	train_dataset = FireSequenceDataset(
-		file_paths=files,
-		sample_indices=splits["train"],
-		input_sequence_length=int(config["input_sequence_length"]),
-		prediction_horizon=int(config["prediction_horizon"]),
-		target_channel=int(config.get("target_channel", 0)),
-		input_channel_count=int(config.get("input_channel_count", config.get("model", {}).get("input_channels", 0))),
-		input_channel_indices=config.get("input_channel_indices"),
-		task_type=str(config.get("task_type", config.get("training", {}).get("task_type", "regression"))),
-		fire_threshold=float(config.get("fire_threshold", config.get("training", {}).get("fire_threshold", 0.5))),
-		use_patches=False,
-		patch_size=int(config.get("patch_size", 64)),
-		active_patch_probability=float(config.get("active_patch_probability", 0.7)),
-		active_threshold=float(config.get("active_threshold", config.get("fire_threshold", 0.5))),
-		normalization_stats=None,
-		normalize_target=False,
-		config=config,
-	)
 	first_x_tensor, _ = train_dataset[0][:2]
 	actual_input_channel_count = int(first_x_tensor.shape[1])
 	configured_model_input_channels = int(config.get("model", {}).get("input_channels", actual_input_channel_count))
@@ -233,9 +292,20 @@ def main() -> None:
 	atmospheric_engineered_channel_count = count_atmospheric_engineered_channels(config)
 	print(f"C: {channel_mean.shape[0]}")
 	print(f"split mode: {split_mode}")
-	print(f"train samples used for normalization: {len(splits['train'])}")
-	print(f"validation samples not used: {len(splits['val'])}")
-	print("external test dataset ignored for normalization")
+	if split_mode == "multi_dataset_chronological":
+		print(f"number of datasets: {len(dataset_records)}")
+		for dataset_name, train_count in per_dataset_train_counts.items():
+			print(
+				f"dataset {dataset_name}: train={train_count} "
+				f"val={per_dataset_val_counts.get(dataset_name, 0)} "
+				f"test={per_dataset_test_counts.get(dataset_name, 0)}"
+			)
+		print(f"total train samples used for normalization: {len(splits['train'])}")
+		print(f"total val/test samples ignored: {len(splits['val']) + len(splits['test'])}")
+	else:
+		print(f"train samples used for normalization: {len(splits['train'])}")
+		print(f"validation samples not used: {len(splits['val'])}")
+		print("external test dataset ignored for normalization")
 	print(f"raw/base input channels: {train_dataset.base_input_channel_count}")
 	print(f"fuel/flux engineered channels: {fuel_flux_engineered_channel_count}")
 	print(f"atmospheric engineered channels: {atmospheric_engineered_channel_count}")

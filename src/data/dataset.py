@@ -9,10 +9,11 @@ import numpy as np
 
 try:
 	import torch  # type: ignore[import-not-found]
-	from torch.utils.data import DataLoader, Dataset  # type: ignore[import-not-found]
+	from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler  # type: ignore[import-not-found]
 except ImportError:  # pragma: no cover - environment-specific fallback
 	torch = None
 	DataLoader = None
+	WeightedRandomSampler = None
 
 	class Dataset:  # type: ignore[too-many-ancestors]
 		"""Fallback base class used only when PyTorch is unavailable."""
@@ -20,7 +21,12 @@ except ImportError:  # pragma: no cover - environment-specific fallback
 		pass
 
 from src.data.preprocessing import load_normalization_stats, normalize_channel_map, normalize_tensor
-from src.data.splits import chronological_split_indices, chronological_train_val_split_indices
+from src.data.discovery import discover_dataset_files, discover_multiple_datasets, resolve_data_dirs, sort_chronologically
+from src.data.splits import (
+	chronological_split_indices,
+	chronological_train_val_split_indices,
+	multi_dataset_chronological_splits,
+)
 
 
 def _extract_numeric_suffix(name: str) -> int | None:
@@ -40,10 +46,7 @@ def _extract_numeric_suffix(name: str) -> int | None:
 def _sort_chronologically(file_paths: Sequence[Path]) -> list[Path]:
 	"""Sort by trailing numeric suffix when available, otherwise lexicographically."""
 
-	numeric_suffixes = [_extract_numeric_suffix(path.stem) for path in file_paths]
-	if all(value is not None for value in numeric_suffixes):
-		return [path for _, path in sorted(zip(numeric_suffixes, file_paths), key=lambda item: item[0])]
-	return sorted(file_paths, key=lambda path: path.name)
+	return sort_chronologically(file_paths)
 
 
 def _resolve_path(base_path: Path | None, configured_path: str | Path) -> Path:
@@ -61,6 +64,52 @@ def _as_path_list(file_paths: Iterable[str | Path]) -> list[Path]:
 	"""Convert an arbitrary iterable of paths into a concrete list of Path objects."""
 
 	return [Path(path) for path in file_paths]
+
+
+def _extract_first_metadata_item(value):
+	"""Normalize one collated metadata field to its first scalar/string item."""
+
+	if torch is not None and torch.is_tensor(value):
+		return value.reshape(-1)[0].item() if value.numel() else None
+	if isinstance(value, (list, tuple)):
+		return value[0] if value else None
+	return value
+
+
+def metadata_batch_to_list(metadata_batch: Mapping[str, Any]) -> list[dict[str, Any]]:
+	"""Convert a collated metadata batch into a list of per-sample dictionaries."""
+
+	if not isinstance(metadata_batch, Mapping):
+		raise TypeError(f"Expected metadata_batch to be a mapping, got {type(metadata_batch)!r}.")
+	if not metadata_batch:
+		return []
+
+	batch_size = None
+	for value in metadata_batch.values():
+		if torch is not None and torch.is_tensor(value):
+			batch_size = int(value.shape[0]) if value.ndim > 0 else 1
+			break
+		if isinstance(value, (list, tuple)):
+			batch_size = len(value)
+			break
+	if batch_size is None:
+		return [{key: _extract_first_metadata_item(value) for key, value in metadata_batch.items()}]
+
+	items: list[dict[str, Any]] = []
+	for sample_index in range(batch_size):
+		item: dict[str, Any] = {}
+		for key, value in metadata_batch.items():
+			if torch is not None and torch.is_tensor(value):
+				if value.ndim == 0:
+					item[key] = value.item()
+				else:
+					item[key] = value[sample_index].item()
+			elif isinstance(value, (list, tuple)):
+				item[key] = value[sample_index]
+			else:
+				item[key] = value
+		items.append(item)
+	return items
 
 
 def _get_section(config: Mapping[str, Any] | None, *names: str) -> dict[str, Any]:
@@ -151,6 +200,9 @@ def _resolve_atmospheric_features_config(config: Mapping[str, Any]) -> dict[str,
 		"add_horizontal_wind_speed": bool(section.get("add_horizontal_wind_speed", False)),
 		"add_low_level_mean_wind_speed": bool(section.get("add_low_level_mean_wind_speed", False)),
 		"add_updraft": bool(section.get("add_updraft", False)),
+		"add_wind_direction": bool(section.get("add_wind_direction", False)),
+		"wind_direction_mode": str(section.get("wind_direction_mode", "unit_vector")).lower(),
+		"wind_direction_convention": str(section.get("wind_direction_convention", "toward")).lower(),
 		"low_level_indices": [int(index) for index in section.get("low_level_indices", [0, 1, 2])],
 		"epsilon": float(section.get("epsilon", 1e-6)),
 	}
@@ -218,6 +270,17 @@ def count_atmospheric_engineered_channels(config: Mapping[str, Any]) -> int:
 		return 0
 
 	num_vertical_levels = int(atmospheric["num_vertical_levels"])
+	if atmospheric["add_wind_direction"]:
+		if atmospheric["wind_direction_mode"] != "unit_vector":
+			raise ValueError(
+				"Unsupported atmospheric_features.wind_direction_mode. "
+				f"Expected 'unit_vector', got {atmospheric['wind_direction_mode']!r}."
+			)
+		if atmospheric["wind_direction_convention"] != "toward":
+			raise ValueError(
+				"Unsupported atmospheric_features.wind_direction_convention. "
+				f"Expected 'toward', got {atmospheric['wind_direction_convention']!r}."
+			)
 	total = 0
 	if atmospheric["add_horizontal_wind_speed"]:
 		total += num_vertical_levels
@@ -225,6 +288,8 @@ def count_atmospheric_engineered_channels(config: Mapping[str, Any]) -> int:
 		total += 1
 	if atmospheric["add_updraft"]:
 		total += num_vertical_levels
+	if atmospheric["add_wind_direction"]:
+		total += 2 * num_vertical_levels
 	return total
 
 
@@ -276,11 +341,23 @@ def build_atmospheric_features(frame: np.ndarray, config: Mapping[str, Any]) -> 
 		)
 	if atmospheric["add_low_level_mean_wind_speed"] and not low_level_indices:
 		raise ValueError("atmospheric_features.low_level_indices cannot be empty when add_low_level_mean_wind_speed is enabled.")
+	if atmospheric["add_wind_direction"]:
+		if atmospheric["wind_direction_mode"] != "unit_vector":
+			raise ValueError(
+				"Unsupported atmospheric_features.wind_direction_mode. "
+				f"Expected 'unit_vector', got {atmospheric['wind_direction_mode']!r}."
+			)
+		if atmospheric["wind_direction_convention"] != "toward":
+			raise ValueError(
+				"Unsupported atmospheric_features.wind_direction_convention. "
+				f"Expected 'toward', got {atmospheric['wind_direction_convention']!r}."
+			)
 
 	epsilon = max(float(atmospheric["epsilon"]), 0.0)
-	per_frame_features: list[np.ndarray] = []
 	u_levels: list[np.ndarray] = []
 	v_levels: list[np.ndarray] = []
+	horizontal_wind_speed_levels: list[np.ndarray] = []
+	updraft_levels: list[np.ndarray] = []
 
 	for z_level in range(num_vertical_levels):
 		base_index = z_level * variables_per_level
@@ -291,10 +368,14 @@ def build_atmospheric_features(frame: np.ndarray, config: Mapping[str, Any]) -> 
 		v_levels.append(v_values)
 		if atmospheric["add_horizontal_wind_speed"]:
 			wind_speed = np.sqrt(u_values * u_values + v_values * v_values + epsilon).astype(np.float32, copy=False)
-			per_frame_features.append(wind_speed[:, :, None].astype(np.float32, copy=False))
+			horizontal_wind_speed_levels.append(wind_speed[:, :, None].astype(np.float32, copy=False))
 		if atmospheric["add_updraft"]:
 			updraft = np.maximum(w_values, 0.0)
-			per_frame_features.append(None)  # placeholder to preserve deterministic order after low-level mean
+			updraft_levels.append(updraft[:, :, None].astype(np.float32, copy=False))
+
+	feature_groups: list[np.ndarray] = []
+	if atmospheric["add_horizontal_wind_speed"] and horizontal_wind_speed_levels:
+		feature_groups.extend(horizontal_wind_speed_levels)
 
 	if atmospheric["add_low_level_mean_wind_speed"]:
 		selected_u = np.stack([u_levels[index] for index in low_level_indices], axis=0)
@@ -302,20 +383,27 @@ def build_atmospheric_features(frame: np.ndarray, config: Mapping[str, Any]) -> 
 		mean_low_u = np.mean(selected_u, axis=0)
 		mean_low_v = np.mean(selected_v, axis=0)
 		low_level_mean_wind_speed = np.sqrt(mean_low_u * mean_low_u + mean_low_v * mean_low_v + epsilon).astype(np.float32, copy=False)
-		per_frame_features.append(low_level_mean_wind_speed[:, :, None].astype(np.float32, copy=False))
+		feature_groups.append(low_level_mean_wind_speed[:, :, None].astype(np.float32, copy=False))
 
-	if atmospheric["add_updraft"]:
-		updraft_features: list[np.ndarray] = []
+	if atmospheric["add_updraft"] and updraft_levels:
+		feature_groups.extend(updraft_levels)
+
+	if atmospheric["add_wind_direction"]:
+		wind_direction_features: list[np.ndarray] = []
 		for z_level in range(num_vertical_levels):
-			base_index = z_level * variables_per_level
-			w_values = np.asarray(raw_frame[:, :, base_index + 2], dtype=np.float32)
-			updraft_features.append(np.maximum(w_values, 0.0)[:, :, None].astype(np.float32, copy=False))
-		per_frame_features = [feature for feature in per_frame_features if feature is not None] + updraft_features
+			u_values = u_levels[z_level]
+			v_values = v_levels[z_level]
+			wind_speed = np.sqrt(u_values * u_values + v_values * v_values + epsilon).astype(np.float32, copy=False)
+			wind_dir_cos = (u_values / wind_speed).astype(np.float32, copy=False)
+			wind_dir_sin = (v_values / wind_speed).astype(np.float32, copy=False)
+			wind_direction_features.append(wind_dir_cos[:, :, None].astype(np.float32, copy=False))
+			wind_direction_features.append(wind_dir_sin[:, :, None].astype(np.float32, copy=False))
+		feature_groups.extend(wind_direction_features)
 
-	if not per_frame_features:
+	if not feature_groups:
 		height, width = int(raw_frame.shape[0]), int(raw_frame.shape[1])
 		return np.zeros((height, width, 0), dtype=np.float32)
-	return np.concatenate(per_frame_features, axis=-1).astype(np.float32, copy=False)
+	return np.concatenate(feature_groups, axis=-1).astype(np.float32, copy=False)
 
 
 def resolve_engineered_feature_slices(config: Mapping[str, Any], base_input_channel_count: int) -> dict[str, slice]:
@@ -338,6 +426,12 @@ def resolve_engineered_feature_slices(config: Mapping[str, Any], base_input_chan
 		num_levels = int(atmospheric["num_vertical_levels"])
 		slices["updraft"] = slice(offset, offset + num_levels)
 		offset += num_levels
+	if atmospheric["enabled"] and atmospheric["add_wind_direction"]:
+		num_levels = int(atmospheric["num_vertical_levels"])
+		slices["wind_direction"] = slice(offset, offset + 2 * num_levels)
+		slices["wind_dir_cos"] = slice(offset, offset + 2 * num_levels, 2)
+		slices["wind_dir_sin"] = slice(offset + 1, offset + 2 * num_levels, 2)
+		offset += 2 * num_levels
 	if engineered["enabled"] and engineered["add_flux_delta"]:
 		slices["flux_delta"] = slice(offset, offset + len(layout["flux_channels"]))
 		offset += len(layout["flux_channels"])
@@ -896,26 +990,303 @@ class FireSequenceDataset(Dataset):
 		return x_tensor, y_tensor
 
 
+class MultiFireSequenceDataset(FireSequenceDataset):
+	"""Sequence dataset that combines multiple independent wildfire time series."""
+
+	def __init__(
+		self,
+		dataset_records: Sequence[Mapping[str, Any]],
+		sample_refs: Sequence[Mapping[str, int]],
+		input_sequence_length: int,
+		prediction_horizon: int,
+		target_channel: int,
+		input_channel_count: int | None = None,
+		input_channel_indices: Sequence[int] | None = None,
+		task_type: str = "regression",
+		fire_threshold: float = 0.5,
+		use_patches: bool = False,
+		patch_size: int = 64,
+		active_patch_probability: float = 0.7,
+		active_threshold: float = 0.0,
+		normalization_stats: Mapping[str, np.ndarray] | str | Path | None = None,
+		normalize_target: bool = False,
+		transform=None,
+		target_transform=None,
+		return_metadata: bool = False,
+		config: Mapping[str, Any] | None = None,
+	) -> None:
+		self.dataset_records = [
+			{
+				**dict(record),
+				"dataset_id": int(record["dataset_id"]),
+				"dataset_name": str(record["dataset_name"]),
+				"data_dir": Path(record["data_dir"]),
+				"file_paths": _sort_chronologically(_as_path_list(record["file_paths"])),
+				"num_files": int(record["num_files"]),
+				"raw_shape": tuple(int(dimension) for dimension in record["raw_shape"]),
+			}
+			for record in dataset_records
+		]
+		if not self.dataset_records:
+			raise ValueError("MultiFireSequenceDataset requires at least one dataset record.")
+
+		self.input_sequence_length = int(input_sequence_length)
+		self.prediction_horizon = int(prediction_horizon)
+		self.target_channel = int(target_channel)
+		self.input_channel_count = None if input_channel_count is None else int(input_channel_count)
+		self.input_channel_indices = _coerce_index_list(input_channel_indices)
+		self.task_type = str(task_type).lower()
+		self.fire_threshold = float(fire_threshold)
+		self.use_patches = bool(use_patches)
+		self.patch_size = int(patch_size)
+		self.active_patch_probability = float(active_patch_probability)
+		self.active_threshold = float(active_threshold)
+		self.transform = transform
+		self.target_transform = target_transform
+		self.return_metadata = bool(return_metadata)
+		self.config = dict(config) if isinstance(config, Mapping) else {
+			"task_type": self.task_type,
+			"target_channel": self.target_channel,
+			"input_channel_count": self.input_channel_count,
+			"input_channel_indices": self.input_channel_indices,
+			"fire_threshold": self.fire_threshold,
+			"active_threshold": self.active_threshold,
+		}
+
+		target_normalization_config = _resolve_target_normalization_config(self.config)
+		self.normalize_target = bool(normalize_target or target_normalization_config["enabled"])
+
+		if self.input_sequence_length <= 0:
+			raise ValueError(f"input_sequence_length must be positive, got {self.input_sequence_length}.")
+		if self.prediction_horizon < 0:
+			raise ValueError(f"prediction_horizon must be non-negative, got {self.prediction_horizon}.")
+		if not 0.0 <= self.active_patch_probability <= 1.0:
+			raise ValueError("active_patch_probability must be in [0, 1], got {self.active_patch_probability}.")
+		if self.patch_size <= 0:
+			raise ValueError(f"patch_size must be positive, got {self.patch_size}.")
+		if self.task_type not in {"regression", "segmentation", "multitask"}:
+			raise ValueError(
+				f"task_type must be 'regression', 'segmentation', or 'multitask', got {self.task_type!r}."
+			)
+
+		first_record = self.dataset_records[0]
+		self.expected_height, self.expected_width, self.num_channels = first_record["raw_shape"]
+		for record in self.dataset_records:
+			record_height, record_width, record_channels = record["raw_shape"]
+			if record_channels != self.num_channels:
+				raise ValueError(
+					"All dataset records must share the same raw channel count. "
+					f"Expected {self.num_channels}, got {record_channels} in {record['dataset_name']}."
+				)
+			if self.use_patches and (self.patch_size > record_height or self.patch_size > record_width):
+				raise ValueError(
+					"patch_size must be <= both spatial dimensions for every dataset. "
+					f"Got patch_size={self.patch_size}, dataset={record['dataset_name']}, "
+					f"raw_shape={record['raw_shape']}."
+				)
+			if not record["file_paths"]:
+				raise ValueError(f"Dataset record {record['dataset_name']} has no file paths.")
+
+		if self.input_channel_count is None:
+			self.input_channel_count = self.num_channels
+		if self.input_channel_count <= 0 or self.input_channel_count > self.num_channels:
+			raise ValueError(f"input_channel_count must be in [1, {self.num_channels}], got {self.input_channel_count}.")
+		if self.target_channel < 0 or self.target_channel >= self.num_channels:
+			raise ValueError(f"target_channel must be in [0, {self.num_channels - 1}], got {self.target_channel}.")
+
+		self.base_input_channel_indices = _resolve_input_channel_indices(self.config, self.input_channel_count)
+		if any(index < 0 or index >= self.num_channels for index in self.base_input_channel_indices):
+			raise ValueError(
+				f"input_channel_indices must stay within [0, {self.num_channels - 1}], got {self.base_input_channel_indices}."
+			)
+		self.base_input_channel_count = len(self.base_input_channel_indices)
+		self.fuel_flux_engineered_channel_count = _count_fuel_flux_engineered_channels(self.config)
+		self.atmospheric_engineered_channel_count = count_atmospheric_engineered_channels(self.config)
+		self.engineered_channel_count = self.fuel_flux_engineered_channel_count + self.atmospheric_engineered_channel_count
+		self.total_input_channels = self.base_input_channel_count + self.engineered_channel_count
+		self.input_channels_after_engineering = self.total_input_channels
+		self.engineered_feature_slices = resolve_engineered_feature_slices(self.config, self.base_input_channel_count)
+
+		self.sample_refs = [
+			{"dataset_id": int(ref["dataset_id"]), "sample_index": int(ref["sample_index"])}
+			for ref in sample_refs
+		]
+		for ref in self.sample_refs:
+			dataset_id = int(ref["dataset_id"])
+			if dataset_id < 0 or dataset_id >= len(self.dataset_records):
+				raise ValueError(f"sample_refs contain invalid dataset_id={dataset_id}.")
+			record = self.dataset_records[dataset_id]
+			max_valid_start = len(record["file_paths"]) - self.input_sequence_length - self.prediction_horizon
+			if ref["sample_index"] < 0 or ref["sample_index"] > max_valid_start:
+				raise ValueError(
+					"sample_refs contain invalid sample start positions. "
+					f"Dataset={record['dataset_name']} valid range=[0, {max_valid_start}], "
+					f"got {ref['sample_index']}."
+				)
+
+		self.normalization_stats = FireSequenceDataset._coerce_normalization_stats(self, normalization_stats)
+		self.target_mean, self.target_std = FireSequenceDataset._resolve_target_normalization_stats(self)
+		self.initial_fuel_maps = {
+			int(record["dataset_id"]): _load_initial_fuel_map(record["file_paths"], self.config)
+			for record in self.dataset_records
+			if self.task_type == "multitask" or _resolve_engineered_features_config(self.config)["enabled"]
+		}
+
+	def __len__(self) -> int:
+		return len(self.sample_refs)
+
+	def _validate_tensor_shape_for_record(self, tensor: np.ndarray, file_path: Path, dataset_record: Mapping[str, Any]) -> None:
+		"""Ensure one loaded tensor matches the expected shape for its own dataset."""
+
+		expected_shape = tuple(int(dimension) for dimension in dataset_record["raw_shape"])
+		if tensor.ndim != 3:
+			raise ValueError(f"Expected a 3D tensor in {file_path}, got shape {tensor.shape}.")
+		if tuple(int(dimension) for dimension in tensor.shape) != expected_shape:
+			raise ValueError(
+				f"Inconsistent tensor shape in {file_path}. "
+				f"Expected {expected_shape}, got {tuple(int(dimension) for dimension in tensor.shape)}."
+			)
+
+	def __getitem__(self, index: int):
+		if torch is None:
+			raise ImportError("PyTorch is required to index MultiFireSequenceDataset.")
+
+		ref = self.sample_refs[index]
+		dataset_record = self.dataset_records[int(ref["dataset_id"])]
+		file_paths = dataset_record["file_paths"]
+		sample_start = int(ref["sample_index"])
+		current_index = sample_start + self.input_sequence_length - 1
+		future_index = current_index + self.prediction_horizon
+		input_file_paths = file_paths[sample_start : sample_start + self.input_sequence_length]
+		current_file_path = file_paths[current_index]
+		target_file_path = file_paths[future_index]
+
+		raw_input_frames: list[np.ndarray] = []
+		base_input_frames: list[np.ndarray] = []
+		for file_path in input_file_paths:
+			tensor = FireSequenceDataset._load_tensor(self, file_path)
+			self._validate_tensor_shape_for_record(tensor, file_path, dataset_record)
+			raw_frame = np.asarray(tensor, dtype=np.float32)
+			raw_input_frames.append(raw_frame)
+			base_input_frames.append(_slice_channels(raw_frame, self.base_input_channel_indices))
+
+		current_tensor = raw_input_frames[-1]
+		future_tensor = FireSequenceDataset._load_tensor(self, target_file_path)
+		self._validate_tensor_shape_for_record(future_tensor, target_file_path, dataset_record)
+		future_tensor = np.asarray(future_tensor, dtype=np.float32)
+
+		if self.task_type == "multitask":
+			initial_fuel_map = self.initial_fuel_maps.get(int(dataset_record["dataset_id"]))
+			if initial_fuel_map is None:
+				raise ValueError("initial_fuel_map must be available for multitask targets.")
+			target_array = build_multitask_target(
+				current_frame=current_tensor,
+				future_frame=future_tensor,
+				initial_fuel=initial_fuel_map,
+				config=self.config,
+			)
+			target_map_for_sampling = np.asarray(target_array[2], dtype=np.float32)
+		else:
+			raw_target_array = np.asarray(future_tensor[:, :, self.target_channel], dtype=np.float32)
+			target_array = raw_target_array.copy()
+			if self.task_type == "segmentation":
+				target_array = (target_array > self.fire_threshold).astype(np.float32, copy=False)
+			target_map_for_sampling = raw_target_array
+
+		stacked_inputs = np.stack(base_input_frames, axis=0).astype(np.float32, copy=False)
+		engineered_inputs = build_engineered_features(
+			input_frames=np.stack(raw_input_frames, axis=0).astype(np.float32, copy=False),
+			file_paths=file_paths,
+			start_index=sample_start,
+			config=self.config,
+		)
+		if engineered_inputs.shape[:3] != stacked_inputs.shape[:3]:
+			raise ValueError(
+				"Engineered feature tensor must align with base inputs in (T, H, W). "
+				f"Got base={stacked_inputs.shape} engineered={engineered_inputs.shape}."
+			)
+		if engineered_inputs.shape[-1] != self.engineered_channel_count:
+			raise ValueError(
+				f"Expected {self.engineered_channel_count} engineered channels, got {engineered_inputs.shape[-1]}."
+			)
+		if engineered_inputs.shape[-1] > 0:
+			stacked_inputs = np.concatenate([stacked_inputs, engineered_inputs], axis=-1)
+
+		patch_top = None
+		patch_left = None
+		if self.use_patches:
+			patch_top, patch_left = FireSequenceDataset._sample_patch_origin(self, target_map_for_sampling)
+			patch_bottom = patch_top + self.patch_size
+			patch_right = patch_left + self.patch_size
+			stacked_inputs = stacked_inputs[:, patch_top:patch_bottom, patch_left:patch_right, :]
+			if self.task_type == "multitask":
+				target_array = target_array[:, patch_top:patch_bottom, patch_left:patch_right]
+			else:
+				target_array = target_array[patch_top:patch_bottom, patch_left:patch_right]
+
+		stacked_inputs = FireSequenceDataset._normalize_inputs(self, stacked_inputs)
+		target_array = FireSequenceDataset._normalize_target(self, target_array)
+
+		stacked_inputs = np.transpose(stacked_inputs, (0, 3, 1, 2))
+		stacked_inputs = np.ascontiguousarray(stacked_inputs, dtype=np.float32)
+		if self.task_type == "multitask":
+			target_array = np.ascontiguousarray(target_array, dtype=np.float32)
+			if not np.all(np.isin(np.unique(target_array[2]), np.asarray([0.0, 1.0], dtype=np.float32))):
+				raise ValueError("Multitask mask channel must contain only 0.0 and 1.0 after processing.")
+		else:
+			target_array = np.expand_dims(np.ascontiguousarray(target_array, dtype=np.float32), axis=0)
+
+		x_tensor = torch.from_numpy(stacked_inputs).to(torch.float32)
+		y_tensor = torch.from_numpy(target_array).to(torch.float32)
+		if self.transform is not None:
+			x_tensor = self.transform(x_tensor)
+		if self.target_transform is not None:
+			y_tensor = self.target_transform(y_tensor)
+
+		if self.return_metadata:
+			metadata = {
+				"dataset_id": int(dataset_record["dataset_id"]),
+				"dataset_name": str(dataset_record["dataset_name"]),
+				"data_dir": str(dataset_record["data_dir"]),
+				"sample_index": sample_start,
+				"current_idx": current_index,
+				"future_idx": future_index,
+				"current_index": current_index,
+				"future_index": future_index,
+				"current_file": str(current_file_path),
+				"future_file": str(target_file_path),
+				"current_file_path": str(current_file_path),
+				"target_file_path": str(target_file_path),
+				"input_channel_count_base": int(self.base_input_channel_count),
+				"fuel_flux_engineered_channel_count": int(self.fuel_flux_engineered_channel_count),
+				"atmospheric_engineered_channel_count": int(self.atmospheric_engineered_channel_count),
+				"engineered_channel_count": int(self.engineered_channel_count),
+				"total_input_channels": int(self.total_input_channels),
+			}
+			if self.use_patches:
+				metadata["patch_top"] = int(patch_top)
+				metadata["patch_left"] = int(patch_left)
+				metadata["patch_size"] = int(self.patch_size)
+			return x_tensor, y_tensor, metadata
+
+		return x_tensor, y_tensor
+
+
 def create_dataloaders(config):
 	"""Build train/validation/test DataLoaders from a configuration dictionary."""
 
 	if torch is None or DataLoader is None:
 		raise ImportError("PyTorch is required to build DataLoaders for wildfire forecasting.")
 
-	for required_key in ("data_dir", "file_pattern", "input_sequence_length", "prediction_horizon"):
+	for required_key in ("file_pattern", "input_sequence_length", "prediction_horizon"):
 		if required_key not in config:
 			raise KeyError(f"Config is missing required key '{required_key}'.")
+	if "data_dir" not in config and "data_dirs" not in config:
+		raise KeyError("Config must define either data_dir or data_dirs.")
 
 	config_path_value = config.get("config_path", config.get("_config_path"))
 	config_path = Path(config_path_value).expanduser().resolve() if config_path_value else None
-	data_dir = _resolve_path(config_path, config["data_dir"])
 	file_pattern = str(config["file_pattern"])
-	if not data_dir.exists():
-		raise FileNotFoundError(f"Data directory does not exist: {data_dir}")
-
-	files = _sort_chronologically(list(data_dir.glob(file_pattern)))
-	if not files:
-		raise FileNotFoundError(f"No files found in '{data_dir}' using pattern '{file_pattern}'.")
 
 	input_sequence_length = int(config["input_sequence_length"])
 	prediction_horizon = int(config["prediction_horizon"])
@@ -959,6 +1330,107 @@ def create_dataloaders(config):
 
 	task_type = str(config.get("task_type", _get_section(config, "training").get("task_type", "regression"))).lower()
 	target_normalization = _resolve_target_normalization_config(config)
+	use_train_patches = bool(config.get("use_patches", False))
+	use_eval_patches = bool(config.get("use_patches_for_eval", False))
+	return_metadata_for_multi = True
+
+	if split_mode == "multi_dataset_chronological":
+		data_dirs = resolve_data_dirs(config)
+		if "data_dirs" in config and config.get("data_dirs"):
+			print(f"Using data_dirs mode with {len(data_dirs)} datasets.")
+		else:
+			print("Using legacy data_dir fallback as a single-item data_dirs list.")
+		dataset_records = discover_multiple_datasets(config)
+		sample_refs = multi_dataset_chronological_splits(
+			dataset_records=dataset_records,
+			input_sequence_length=input_sequence_length,
+			prediction_horizon=prediction_horizon,
+			train_fraction=train_fraction,
+			val_fraction=val_fraction,
+			test_fraction=test_fraction,
+		)
+		normalization_stats = None
+		normalization_config = _get_section(config, "normalization")
+		normalization_path = normalization_config.get("path")
+		if normalization_path:
+			resolved_normalization_path = _resolve_path(config_path, normalization_path)
+			if resolved_normalization_path.exists():
+				normalization_stats = resolved_normalization_path
+
+		common_multi_kwargs = {
+			"dataset_records": dataset_records,
+			"input_sequence_length": input_sequence_length,
+			"prediction_horizon": prediction_horizon,
+			"target_channel": target_channel,
+			"input_channel_count": input_channel_count,
+			"input_channel_indices": config.get("input_channel_indices"),
+			"task_type": task_type,
+			"fire_threshold": float(config.get("fire_threshold", _get_section(config, "training").get("fire_threshold", 0.5))),
+			"patch_size": int(config.get("patch_size", 64)),
+			"active_patch_probability": float(config.get("active_patch_probability", 0.7)),
+			"active_threshold": float(config.get("active_threshold", config.get("fire_threshold", 0.5))),
+			"normalization_stats": normalization_stats,
+			"normalize_target": bool(target_normalization["enabled"]),
+			"return_metadata": return_metadata_for_multi,
+			"config": config,
+		}
+		train_dataset = MultiFireSequenceDataset(sample_refs=sample_refs["train"], use_patches=use_train_patches, **common_multi_kwargs)
+		val_dataset = MultiFireSequenceDataset(sample_refs=sample_refs["val"], use_patches=use_eval_patches, **common_multi_kwargs)
+		test_dataset = MultiFireSequenceDataset(sample_refs=sample_refs["test"], use_patches=use_eval_patches, **common_multi_kwargs)
+
+		batch_size = int(config.get("batch_size", 4))
+		num_workers = int(config.get("num_workers", 0))
+		sampler = None
+		dataset_sampling = _get_section(config, "dataset_sampling")
+		if bool(dataset_sampling.get("enabled", False)):
+			sampling_mode = str(dataset_sampling.get("mode", "uniform_samples")).lower()
+			if sampling_mode == "balanced_by_dataset":
+				if WeightedRandomSampler is None:
+					print("WARNING: WeightedRandomSampler is unavailable; falling back to normal shuffled training.")
+				else:
+					counts_by_dataset: dict[int, int] = {}
+					for ref in train_dataset.sample_refs:
+						dataset_id = int(ref["dataset_id"])
+						counts_by_dataset[dataset_id] = counts_by_dataset.get(dataset_id, 0) + 1
+					weights = [1.0 / counts_by_dataset[int(ref["dataset_id"])] for ref in train_dataset.sample_refs]
+					sampler = WeightedRandomSampler(weights=weights, num_samples=len(weights), replacement=True)
+			elif sampling_mode != "uniform_samples":
+				print(
+					"WARNING: Unsupported dataset_sampling.mode for multi_dataset_chronological; "
+					f"falling back to normal shuffle: {sampling_mode!r}"
+				)
+
+		train_loader = DataLoader(
+			train_dataset,
+			batch_size=batch_size,
+			shuffle=sampler is None,
+			sampler=sampler,
+			num_workers=num_workers,
+			pin_memory=torch.cuda.is_available(),
+			drop_last=False,
+		)
+		val_loader = DataLoader(
+			val_dataset,
+			batch_size=batch_size,
+			shuffle=False,
+			num_workers=num_workers,
+			pin_memory=torch.cuda.is_available(),
+			drop_last=False,
+		)
+		test_loader = DataLoader(
+			test_dataset,
+			batch_size=batch_size,
+			shuffle=False,
+			num_workers=num_workers,
+			pin_memory=torch.cuda.is_available(),
+			drop_last=False,
+		)
+		return train_loader, val_loader, test_loader
+
+	data_dir = _resolve_path(config_path, config["data_dir"])
+	if not data_dir.exists():
+		raise FileNotFoundError(f"Data directory does not exist: {data_dir}")
+	files = discover_dataset_files(data_dir, file_pattern)
 	dataset_kwargs = {
 		"file_paths": files,
 		"input_sequence_length": input_sequence_length,
@@ -975,8 +1447,6 @@ def create_dataloaders(config):
 		"normalize_target": bool(target_normalization["enabled"]),
 		"config": config,
 	}
-	use_train_patches = bool(config.get("use_patches", False))
-	use_eval_patches = bool(config.get("use_patches_for_eval", False))
 
 	train_dataset = FireSequenceDataset(sample_indices=split_indices["train"], use_patches=use_train_patches, **dataset_kwargs)
 	val_dataset = FireSequenceDataset(sample_indices=split_indices["val"], use_patches=use_eval_patches, **dataset_kwargs)

@@ -92,9 +92,13 @@ def main() -> None:
 	channel_ranges: list[tuple[str, tuple[int, int]]] = []
 	for feature_name, feature_slice in engineered_slices.items():
 		if feature_slice.stop > feature_slice.start:
-			channel_ranges.append((feature_name, (feature_slice.start, feature_slice.stop - 1)))
+			step = int(feature_slice.step or 1)
+			last_index = feature_slice.start + step * max(((feature_slice.stop - feature_slice.start - 1) // step), 0)
+			channel_ranges.append((feature_name, (feature_slice.start, last_index)))
 	for name, (start, end) in channel_ranges:
-		print(f"{name}: channels [{start}, {end}]")
+		feature_slice = engineered_slices[name]
+		step_suffix = f", step={feature_slice.step}" if feature_slice.step not in (None, 1) else ""
+		print(f"{name}: channels [{start}, {end}]{step_suffix}")
 
 	current_frame = np.load(Path(metadata["current_file_path"]).expanduser().resolve(), mmap_mode="r", allow_pickle=False)
 	current_frame = np.asarray(current_frame, dtype=np.float32)
@@ -121,6 +125,18 @@ def main() -> None:
 		if "updraft" in engineered_slices:
 			updraft_slice = engineered_slices["updraft"]
 			print(f"updraft: channels [{updraft_slice.start}, {updraft_slice.stop - 1}]")
+		if "wind_dir_cos" in engineered_slices:
+			wind_dir_cos_slice = engineered_slices["wind_dir_cos"]
+			print(
+				f"wind_dir_cos: channels [{wind_dir_cos_slice.start}, {wind_dir_cos_slice.stop - 1}], "
+				f"step={wind_dir_cos_slice.step}"
+			)
+		if "wind_dir_sin" in engineered_slices:
+			wind_dir_sin_slice = engineered_slices["wind_dir_sin"]
+			print(
+				f"wind_dir_sin: channels [{wind_dir_sin_slice.start}, {wind_dir_sin_slice.stop - 1}], "
+				f"step={wind_dir_sin_slice.step}"
+			)
 
 	panel_specs = [
 		("Selected flux channel", current_frame[:, :, layout["flux_channels"][0]]),

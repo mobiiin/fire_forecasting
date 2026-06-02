@@ -18,7 +18,7 @@ except ImportError:  # pragma: no cover - environment-specific fallback
 
 from scripts.evaluate_persistence_baseline import build_persistence_sample, discover_files, regression_metrics
 from src.config import load_config
-from src.data.dataset import FireSequenceDataset, _resolve_multitask_config, _sort_chronologically
+from src.data.dataset import FireSequenceDataset, _resolve_multitask_config, _sort_chronologically, create_dataloaders
 from src.data.preprocessing import inverse_normalize_channel_map as inverse_normalize_scalar_channel_map
 from src.data.preprocessing import load_normalization_stats
 from src.data.spatial_transforms import infer_with_external_test_spatial_handling
@@ -83,6 +83,17 @@ def _build_dataset_for_split(config: Mapping[str, Any], normalization_stats, spl
 	"""Build a dataset for validation or external test visualization."""
 
 	split = str(split).lower()
+	split_mode = str(config.get("split_mode", "train_val_test")).lower()
+	if split_mode == "multi_dataset_chronological":
+		train_loader, val_loader, test_loader = create_dataloaders(config)
+		loader_by_split = {"train": train_loader, "val": val_loader, "test": test_loader}
+		if split not in loader_by_split:
+			raise ValueError(f"split must be 'train', 'val', or 'test', got {split!r}.")
+		selected_loader = loader_by_split[split]
+		if selected_loader is None:
+			raise ValueError(f"Requested split {split!r} is not available for split_mode={split_mode!r}.")
+		return selected_loader.dataset
+
 	input_sequence_length = int(config["input_sequence_length"])
 	prediction_horizon = int(config["prediction_horizon"])
 	common_kwargs = {
@@ -99,9 +110,8 @@ def _build_dataset_for_split(config: Mapping[str, Any], normalization_stats, spl
 		"config": config,
 	}
 
-	if split == "val":
+	if split in {"train", "val"}:
 		files = _discover_files(config)
-		split_mode = str(config.get("split_mode", "train_val_test")).lower()
 		if split_mode == "train_val_external_test":
 			splits = chronological_train_val_split_indices(
 				num_timesteps=len(files),
@@ -120,7 +130,7 @@ def _build_dataset_for_split(config: Mapping[str, Any], normalization_stats, spl
 				test_fraction=float(config.get("test_fraction", 0.15)),
 				split_mode=split_mode,
 			)
-		return FireSequenceDataset(file_paths=files, sample_indices=splits["val"], **common_kwargs)
+		return FireSequenceDataset(file_paths=files, sample_indices=splits[split], **common_kwargs)
 
 	if split == "test":
 		test_data_dir = config.get("test_data_dir")
@@ -140,7 +150,7 @@ def _build_dataset_for_split(config: Mapping[str, Any], normalization_stats, spl
 			)
 		return FireSequenceDataset(file_paths=files, sample_indices=None, **common_kwargs)
 
-	raise ValueError(f"split must be 'val' or 'test', got {split!r}.")
+	raise ValueError(f"split must be 'train', 'val', or 'test', got {split!r}.")
 
 
 def _build_test_dataset(config: Mapping[str, Any], normalization_stats) -> FireSequenceDataset:
@@ -155,6 +165,12 @@ def _build_test_loader(dataset):
 	if torch is None or DataLoader is None:
 		raise ImportError("PyTorch is required to build the visualization DataLoader.")
 	return DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0, pin_memory=torch.cuda.is_available(), drop_last=False)
+
+
+def _unwrap_dataset(dataset):
+	"""Return the underlying dataset when a subset wrapper is used."""
+
+	return dataset.dataset if hasattr(dataset, "dataset") else dataset
 
 
 def _select_device(config: Mapping[str, Any]):
@@ -210,16 +226,18 @@ def _build_model(config: Mapping[str, Any], input_channels: int):
 def _sample_output_name(metadata: Mapping[str, Any]) -> str:
 	"""Build an informative filename from the sample metadata."""
 
+	dataset_name = metadata.get("dataset_name")
 	sample_index = metadata.get("sample_index")
 	file_path = metadata.get("target_file_path")
 	file_stem = Path(str(file_path)).stem if file_path else "sample"
+	prefix = f"{dataset_name}_" if dataset_name else ""
 	if sample_index is None:
-		return f"{file_stem}.png"
+		return f"{prefix}{file_stem}.png"
 	try:
 		sample_index_int = int(sample_index)
 	except (TypeError, ValueError):
-		return f"{file_stem}.png"
-	return f"sample_{sample_index_int:05d}_{file_stem}.png"
+		return f"{prefix}{file_stem}.png"
+	return f"{prefix}sample_{sample_index_int:05d}_{file_stem}.png"
 
 
 def _load_raw_frame(file_path: str | Path) -> np.ndarray:
@@ -343,16 +361,19 @@ def visualize_predictions(
 	test_dataset = _build_dataset_for_split(config, normalization_stats, split=selected_split)
 	if len(test_dataset) == 0:
 		raise ValueError(f"Requested {selected_split} dataset is empty; cannot visualize predictions.")
+	base_dataset = _unwrap_dataset(test_dataset)
 	test_loader = _build_test_loader(test_dataset)
 	task_type = str(config.get("task_type", _get_section(config, "training").get("task_type", "regression"))).lower()
 	total_test_samples = len(test_loader.dataset)
 	sample_count = min(max(int(num_samples), 0), total_test_samples)
 	if sample_count == 0:
 		raise ValueError("num_samples must be positive when visualizing predictions.")
-	if selected_split == "test":
+	split_mode = str(config.get("split_mode", "train_val_test")).lower()
+	if selected_split == "test" and split_mode == "train_val_external_test":
 		random_seed = int(config.get("seed", _get_section(config, "training").get("seed", 42)))
 		selected_indices = sorted(random.Random(random_seed).sample(range(total_test_samples), sample_count))
 		test_dataset = torch.utils.data.Subset(test_dataset, selected_indices)
+		base_dataset = _unwrap_dataset(test_dataset)
 		test_loader = _build_test_loader(test_dataset)
 		max_samples = len(selected_indices)
 	else:
@@ -394,14 +415,19 @@ def visualize_predictions(
 					spatial_note = " | model inference used padding; predictions cropped back to native grid"
 			else:
 				predicted = model(x_sample_device)
+			dataset_name = str(metadata_dict.get("dataset_name", "")).strip()
+			split_output_dir = output_dir / selected_split
+			if dataset_name:
+				split_output_dir = split_output_dir / dataset_name
+			split_output_dir.mkdir(parents=True, exist_ok=True)
 			output_name = _sample_output_name(metadata_dict)
-			output_path = output_dir / output_name
+			output_path = split_output_dir / output_name
 			if output_path.exists():
-				output_path = output_dir / f"{output_path.stem}_{sample_index:05d}{output_path.suffix}"
+				output_path = split_output_dir / f"{output_path.stem}_{sample_index:05d}{output_path.suffix}"
 
 			if task_type == "multitask":
-				plot_inputs = _build_multitask_visualization_maps(predicted, y_sample, metadata_dict, config, test_dataset)
-				if selected_split == "test":
+				plot_inputs = _build_multitask_visualization_maps(predicted, y_sample, metadata_dict, config, base_dataset)
+				if selected_split == "test" and split_mode == "train_val_external_test":
 					native_height = int(y_sample.shape[-2])
 					native_width = int(y_sample.shape[-1])
 					title = (
@@ -410,6 +436,8 @@ def visualize_predictions(
 					)
 				else:
 					title = f"{selected_split.capitalize()} multitask forecast | sample {sample_index + 1}/{max_samples}"
+					if dataset_name:
+						title += f" | {dataset_name}"
 				saved_path = plot_multitask_prediction_grid(
 					current_surface_fuel=plot_inputs["current_surface_fuel"],
 					true_future_surface_fuel=plot_inputs["true_future_surface_fuel"],
@@ -428,14 +456,14 @@ def visualize_predictions(
 			else:
 				current_map = x_sample[0, -1, -1].detach().cpu().numpy()
 				ground_truth_map = y_sample[0, 0].detach().cpu().numpy()
-				predicted_map = _prediction_to_single_map(predicted, test_dataset, task_type)
-				if task_type == "regression" and bool(getattr(test_dataset, "normalize_target", False)) and test_dataset.target_mean is not None and test_dataset.target_std is not None:
+				predicted_map = _prediction_to_single_map(predicted, base_dataset, task_type)
+				if task_type == "regression" and bool(getattr(base_dataset, "normalize_target", False)) and base_dataset.target_mean is not None and base_dataset.target_std is not None:
 					ground_truth_map = inverse_normalize_scalar_channel_map(
 						ground_truth_map,
-						test_dataset.target_mean,
-						test_dataset.target_std,
+						base_dataset.target_mean,
+						base_dataset.target_std,
 					)
-				if selected_split == "test":
+				if selected_split == "test" and split_mode == "train_val_external_test":
 					native_height = int(y_sample.shape[-2])
 					native_width = int(y_sample.shape[-1])
 					title = (
@@ -444,6 +472,8 @@ def visualize_predictions(
 					)
 				else:
 					title = f"{selected_split.capitalize()} forecast | sample {sample_index + 1}/{max_samples}"
+					if dataset_name:
+						title += f" | {dataset_name}"
 				saved_path = plot_prediction_grid(
 					current_map=current_map,
 					ground_truth_map=ground_truth_map,
@@ -589,12 +619,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
 	parser = argparse.ArgumentParser(description="Visualize ConvLSTM U-Net wildfire predictions.")
 	parser.add_argument("--config", default="configs/default.yaml", help="Path to the YAML configuration file.")
-	parser.add_argument("--split", choices=("val", "test"), default="val", help="Which split to visualize.")
+	parser.add_argument("--split", choices=("train", "val", "test"), default="val", help="Which split to visualize.")
 	parser.add_argument(
 		"--num_samples",
 		type=int,
 		default=10,
-		help="Number of validation samples to visualize, or number of random external test samples when --split test is selected.",
+		help="Number of samples to visualize from the requested split.",
 	)
 	return parser
 

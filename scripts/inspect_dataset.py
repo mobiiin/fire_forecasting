@@ -12,7 +12,12 @@ from typing import List, Sequence, Tuple
 import numpy as np
 
 from src.config import load_config
-from src.data.splits import chronological_split_indices, chronological_train_val_split_indices
+from src.data.discovery import discover_multiple_datasets, resolve_data_dirs
+from src.data.splits import (
+    chronological_split_indices,
+    chronological_train_val_split_indices,
+    multi_dataset_chronological_splits,
+)
 
 
 def resolve_path(base_path: Path, configured_path: str) -> Path:
@@ -405,6 +410,33 @@ def report_split_sample_counts(files: Sequence[Path], config: dict) -> None:
     print(f"  test:  {len(splits['test'])}")
 
 
+def report_multi_dataset_split_sample_counts(config: dict) -> None:
+    """Print per-dataset and total sample counts for multi-dataset mode."""
+
+    dataset_records = discover_multiple_datasets(config)
+    print("dataset directories:")
+    for dataset_record in dataset_records:
+        print(f"  {dataset_record['dataset_name']}: {dataset_record['data_dir']}")
+        print(
+            f"    files={dataset_record['num_files']} raw_shape={dataset_record['raw_shape']}"
+        )
+
+    splits = multi_dataset_chronological_splits(
+        dataset_records=dataset_records,
+        input_sequence_length=int(config["input_sequence_length"]),
+        prediction_horizon=int(config["prediction_horizon"]),
+        train_fraction=float(config["train_fraction"]),
+        val_fraction=float(config["val_fraction"]),
+        test_fraction=float(config["test_fraction"]),
+    )
+
+    print("combined totals:")
+    print(f"  train samples: {len(splits['train'])}")
+    print(f"  val samples: {len(splits['val'])}")
+    print(f"  test samples: {len(splits['test'])}")
+    print(f"  total valid samples: {len(splits['train']) + len(splits['val']) + len(splits['test'])}")
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     """Create the command-line interface for dataset inspection."""
 
@@ -435,11 +467,17 @@ def main() -> None:
     config = load_config(config_path)
     config["config_path"] = str(config_path)
 
-    if "data_dir" not in config:
-        raise KeyError("Config is missing required key 'data_dir'.")
     if "file_pattern" not in config:
         raise KeyError("Config is missing required key 'file_pattern'.")
 
+    split_mode = str(config.get("split_mode", "train_val_test")).lower()
+    if split_mode == "multi_dataset_chronological":
+        resolve_data_dirs(config)
+        report_multi_dataset_split_sample_counts(config)
+        return
+
+    if "data_dir" not in config:
+        raise KeyError("Config is missing required key 'data_dir'.")
     configured_data_dir = str(config["data_dir"])
     data_dir = resolve_path(config_path, args.data_dir or configured_data_dir)
     file_pattern = str(config["file_pattern"])

@@ -48,8 +48,8 @@ def _stats(array: np.ndarray) -> dict[str, float]:
 			"max": float("nan"),
 			"mean": float("nan"),
 			"std": float("nan"),
+			"p1": float("nan"),
 			"p50": float("nan"),
-			"p90": float("nan"),
 			"p99": float("nan"),
 		}
 	return {
@@ -57,8 +57,8 @@ def _stats(array: np.ndarray) -> dict[str, float]:
 		"max": float(finite.max()),
 		"mean": float(finite.mean()),
 		"std": float(finite.std()),
+		"p1": float(np.percentile(finite, 1)),
 		"p50": float(np.percentile(finite, 50)),
-		"p90": float(np.percentile(finite, 90)),
 		"p99": float(np.percentile(finite, 99)),
 	}
 
@@ -67,7 +67,7 @@ def _print_stats(name: str, array: np.ndarray) -> None:
 	stats = _stats(array)
 	print(
 		f"{name}: min={stats['min']:.6g} max={stats['max']:.6g} mean={stats['mean']:.6g} "
-		f"std={stats['std']:.6g} p50={stats['p50']:.6g} p90={stats['p90']:.6g} p99={stats['p99']:.6g}"
+		f"std={stats['std']:.6g} p1={stats['p1']:.6g} p50={stats['p50']:.6g} p99={stats['p99']:.6g}"
 	)
 
 
@@ -121,32 +121,48 @@ def main() -> None:
 	horizontal_count = num_levels if atmospheric["add_horizontal_wind_speed"] else 0
 	low_level_count = 1 if atmospheric["add_low_level_mean_wind_speed"] else 0
 	updraft_count = num_levels if atmospheric["add_updraft"] else 0
+	wind_direction_count = 2 * num_levels if atmospheric["add_wind_direction"] else 0
 	offset = 0
 	horizontal_slice = slice(offset, offset + horizontal_count)
 	offset += horizontal_count
 	low_level_slice = slice(offset, offset + low_level_count)
 	offset += low_level_count
 	updraft_slice = slice(offset, offset + updraft_count)
+	offset += updraft_count
+	wind_direction_slice = slice(offset, offset + wind_direction_count)
 
 	def _channel(base_level: int, variable_offset: int) -> np.ndarray:
 		return np.asarray(current_frame[:, :, base_level * variables_per_level + variable_offset], dtype=np.float32)
 
+	def _wind_dir_cos_index(z_level: int) -> int:
+		return int(wind_direction_slice.start + 2 * z_level)
+
+	def _wind_dir_sin_index(z_level: int) -> int:
+		return int(wind_direction_slice.start + 2 * z_level + 1)
+
 	panels: list[tuple[str, np.ndarray]] = [
 		("U z0", _channel(0, 0)),
 		("V z0", _channel(0, 1)),
-		("W z0", _channel(0, 2)),
+		("Horizontal wind speed z0", atmospheric_features[:, :, horizontal_slice.start + 0] if horizontal_count > 0 else np.zeros(current_frame.shape[:2], dtype=np.float32)),
+		("wind_dir_cos_z0", atmospheric_features[:, :, _wind_dir_cos_index(0)] if wind_direction_count >= 2 else np.zeros(current_frame.shape[:2], dtype=np.float32)),
+		("wind_dir_sin_z0", atmospheric_features[:, :, _wind_dir_sin_index(0)] if wind_direction_count >= 2 else np.zeros(current_frame.shape[:2], dtype=np.float32)),
+		("U z1", _channel(1, 0) if num_levels > 1 else np.zeros(current_frame.shape[:2], dtype=np.float32)),
+		("V z1", _channel(1, 1) if num_levels > 1 else np.zeros(current_frame.shape[:2], dtype=np.float32)),
+		("Horizontal wind speed z1", atmospheric_features[:, :, horizontal_slice.start + 1] if horizontal_count > 1 else np.zeros(current_frame.shape[:2], dtype=np.float32)),
+		("wind_dir_cos_z1", atmospheric_features[:, :, _wind_dir_cos_index(1)] if wind_direction_count >= 4 else np.zeros(current_frame.shape[:2], dtype=np.float32)),
+		("wind_dir_sin_z1", atmospheric_features[:, :, _wind_dir_sin_index(1)] if wind_direction_count >= 4 else np.zeros(current_frame.shape[:2], dtype=np.float32)),
 	]
-	for z_level in range(min(3, num_levels)):
-		if horizontal_count > z_level:
-			panels.append((f"Horizontal wind speed z{z_level}", atmospheric_features[:, :, horizontal_slice.start + z_level]))
 	if low_level_count == 1:
 		panels.append((
 			f"Low-level mean wind speed z{low_level_indices}",
 			atmospheric_features[:, :, low_level_slice.start],
 		))
-	for z_level in range(min(3, num_levels)):
-		if updraft_count > z_level:
-			panels.append((f"Updraft z{z_level}", atmospheric_features[:, :, updraft_slice.start + z_level]))
+	else:
+		panels.append(("Low-level mean wind speed", np.zeros(current_frame.shape[:2], dtype=np.float32)))
+	if updraft_count > 0:
+		panels.append(("Updraft z0", atmospheric_features[:, :, updraft_slice.start + 0]))
+	else:
+		panels.append(("Updraft z0", np.zeros(current_frame.shape[:2], dtype=np.float32)))
 
 	print(f"sample_index: {int(args.sample_index)}")
 	print(f"current_file: {metadata['current_file_path']}")
@@ -156,8 +172,8 @@ def main() -> None:
 
 	output_dir = _resolve_path(config_path, "outputs/atmospheric_feature_inspection")
 	output_dir.mkdir(parents=True, exist_ok=True)
-	fig, axes = plt.subplots(2, 5, figsize=(24, 10), dpi=150, constrained_layout=True)
-	for axis, (title, panel) in zip(axes.flatten(), panels):
+	fig, axes = plt.subplots(3, 4, figsize=(24, 16), dpi=150, constrained_layout=True)
+	for axis, (title, panel) in zip(axes.flatten(), panels, strict=True):
 		image = axis.imshow(np.asarray(panel, dtype=np.float32), origin="lower", cmap="viridis")
 		axis.set_title(title)
 		axis.set_xticks([])

@@ -823,29 +823,51 @@ def train_model(config_path: str | Path) -> dict[str, Any]:
 
 	test_results: dict[str, float] = {}
 	test_plot_results: dict[str, float] = {}
+	run_test_after_training = bool(training_config.get("run_test_after_training", config.get("run_test_after_training", False)))
 	run_external_test_after_training = bool(training_config.get("run_external_test_after_training", config.get("run_external_test_after_training", False)))
+	run_final_test_after_training = bool(run_test_after_training or run_external_test_after_training)
+	split_mode = str(config.get("split_mode", "train_val_test")).lower()
 	logger.info("Training complete. Best checkpoint selected using validation split.")
-	logger.info("Run scripts/test_model.py with test_data_dir configured for external testing.")
-	if run_external_test_after_training and test_loader is not None and len(test_loader.dataset) > 0:
-		logger.info("Loading best checkpoint for optional external test evaluation.")
+	if split_mode == "train_val_external_test":
+		logger.info("Run scripts/test_model.py with test_data_dir configured for external testing.")
+	else:
+		logger.info("Run scripts/test_model.py to evaluate the combined internal test split.")
+	if run_final_test_after_training and test_loader is not None and len(test_loader.dataset) > 0:
+		logger.info("Loading best checkpoint for optional post-training test evaluation.")
 		if best_checkpoint_path.exists():
 			checkpoint = load_checkpoint(best_checkpoint_path, map_location=device)
 			model.load_state_dict(checkpoint["model_state_dict"])
-		test_plot_results, spatial_mode_counts = _run_external_test_epoch_with_spatial_handling(
-			model=model,
-			loader=test_loader,
-			criterion=criterion,
-			config=config,
-			device=device,
-		)
+		if split_mode == "train_val_external_test":
+			test_plot_results, spatial_mode_counts = _run_external_test_epoch_with_spatial_handling(
+				model=model,
+				loader=test_loader,
+				criterion=criterion,
+				config=config,
+				device=device,
+			)
+		else:
+			val_like_test_results = _run_epoch(
+				model=model,
+				loader=test_loader,
+				criterion=criterion,
+				config=config,
+				device=device,
+				input_sequence_length=input_sequence_length,
+				input_channels=input_channels,
+				output_channels=output_channels,
+				train=False,
+			)
+			test_plot_results = _rename_result_prefix(val_like_test_results, "val_", "test_")
+			spatial_mode_counts = {}
 		test_results = dict(test_plot_results)
-		logger.info("External test loss: %.6f", test_plot_results["test_loss"])
-		logger.info("External test spatial mode counts: %s", spatial_mode_counts)
+		logger.info("Test loss: %.6f", test_plot_results["test_loss"])
+		if spatial_mode_counts:
+			logger.info("External test spatial mode counts: %s", spatial_mode_counts)
 		for metric_name, metric_value in test_plot_results.items():
 			if metric_name != "test_loss":
-				logger.info("External test %s: %.6f", metric_name.removeprefix("test_"), metric_value)
-	elif run_external_test_after_training:
-		logger.info("External test evaluation requested, but no external test dataset is configured.")
+				logger.info("Test %s: %.6f", metric_name.removeprefix("test_"), metric_value)
+	elif run_final_test_after_training:
+		logger.info("Post-training test evaluation requested, but no test dataset is configured.")
 
 	training_curve_paths: list[str] = []
 	for checkpoint_path in (latest_checkpoint_path, best_checkpoint_path):
