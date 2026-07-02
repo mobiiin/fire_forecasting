@@ -337,6 +337,12 @@ multitask:
   # y[:, 0] = surface consumed fuel
   # y[:, 1] = canopy consumed fuel
   # y[:, 2] = binary mask target
+  # y[:, 3] = log1p energy release total MW
+  output_channels:
+    surface_consumed: 0
+    canopy_consumed: 1
+    mask_logits: 2
+    energy_total_log1p: 3
 
   # Raw surface fuel channel used to build multitask regression targets.
   # Options: any valid raw channel index.
@@ -394,7 +400,11 @@ multitask:
 
   # Weight for segmentation loss in total multitask loss.
   # Options: any nonnegative float.
-  segmentation_loss_weight: 1.0
+  segmentation_loss_weight: 5.0
+
+  # Weight for the energy release regression head.
+  # Options: any nonnegative float.
+  energy_loss_weight: 1.0
 
   # Weight applied to active pixels in weighted multitask losses.
   # Options: any positive float > 0.
@@ -404,10 +414,47 @@ multitask:
   # Options: any positive float > 0.
   background_weight: 1.0
 
+  # Loss for the energy release map head.
+  # Supported options:
+  # - huber
+  # - mse
+  energy_loss: huber
+
+  # Target space used by the energy loss.
+  # Currently implemented options:
+  # - log
+  energy_loss_space: log
+
+  # Active/background weights for the energy loss.
+  energy_active_weight: 10.0
+  energy_background_weight: 1.0
+
+  # Active-energy threshold in physical MW.
+  energy_active_threshold_MW: 0.001
+
+energy_release:
+  enabled: true
+  surface_sensible_flux_channel: 80
+  surface_latent_flux_channel: 81
+  canopy_sensible_flux_channel: 82
+  canopy_latent_flux_channel: 83
+  flux_units: W_per_m2
+  dx_m: null
+  dy_m: null
+  metadata_path: ./fire_metadata.json
+  clamp_negative_flux_to_zero: true
+  save_components: true
+  add_as_input_history: false
+  target_transform: log1p
+  inverse_transform: expm1
+  predict_total: true
+  predict_sensible: false
+  predict_latent: false
+
 target_normalization:
   # Whether to normalize target channels.
   # Options: true, false
-  # Note: for multitask, only channels 0 and 1 are normalized; the binary mask is never normalized.
+  # Note: for multitask, only channels 0 and 1 are normalized; the mask and energy targets are not normalized here.
   enabled: false
 
   # Target normalization method.
@@ -447,8 +494,8 @@ model:
   # Options: any positive integer >= 1.
   # Common values:
   # - 1 for regression/segmentation
-  # - 3 for the current multitask setup
-  output_channels: 3
+  # - 4 for the default multitask setup with energy release
+  output_channels: 4
 
   # Optional output activation at the model head.
   # Supported options in code:

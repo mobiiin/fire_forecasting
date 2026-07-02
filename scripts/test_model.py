@@ -19,7 +19,7 @@ from scripts.evaluate_persistence_baseline import warning_messages_for_target_ch
 from src.config import load_config
 from src.data.spatial_transforms import infer_with_external_test_spatial_handling
 from src.models.convlstm_unet import build_model_from_config
-from src.training.checkpoints import load_checkpoint
+from src.training.checkpoints import load_checkpoint, validate_checkpoint_model_compatibility
 from src.training.losses import get_loss_function
 from src.training.metrics import compute_metrics
 from src.training.train import (
@@ -328,6 +328,7 @@ def main() -> None:
         raise FileNotFoundError(f"Checkpoint not found: {resolved_checkpoint_path}")
 
     checkpoint = load_checkpoint(resolved_checkpoint_path, map_location=device)
+    validate_checkpoint_model_compatibility(model, checkpoint, resolved_checkpoint_path)
     model.load_state_dict(checkpoint["model_state_dict"])
 
     print(f"checkpoint: {resolved_checkpoint_path}")

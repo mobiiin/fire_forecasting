@@ -20,8 +20,16 @@ except ImportError:  # pragma: no cover - environment-specific fallback
 
 		pass
 
-from src.data.preprocessing import load_normalization_stats, normalize_channel_map, normalize_tensor
 from src.data.discovery import discover_dataset_files, discover_multiple_datasets, resolve_data_dirs, sort_chronologically
+from src.data.energy_release import (
+	compute_energy_release_maps,
+	resolve_dataset_energy_geometry,
+	resolve_energy_output_channel_names,
+	resolve_energy_release_config,
+	resolve_energy_target_count,
+	transform_energy_target,
+)
+from src.data.preprocessing import load_normalization_stats, normalize_channel_map, normalize_tensor
 from src.data.splits import (
 	chronological_split_indices,
 	chronological_train_val_split_indices,
@@ -228,6 +236,12 @@ def _resolve_multitask_config(config: Mapping[str, Any]) -> dict[str, Any]:
 	}
 
 
+def _multitask_output_channel_count(config: Mapping[str, Any]) -> int:
+	"""Return the total multitask target channel count for the current config."""
+
+	return 3 + resolve_energy_target_count(config)
+
+
 def _resolve_target_normalization_config(config: Mapping[str, Any]) -> dict[str, Any]:
 	"""Resolve target normalization configuration."""
 
@@ -296,7 +310,9 @@ def count_atmospheric_engineered_channels(config: Mapping[str, Any]) -> int:
 def _count_engineered_channels(config: Mapping[str, Any]) -> int:
 	"""Count the total number of engineered input channels that will be appended."""
 
-	return _count_fuel_flux_engineered_channels(config) + count_atmospheric_engineered_channels(config)
+	energy_release = resolve_energy_release_config(config)
+	energy_history_channels = 1 if energy_release["enabled"] and energy_release["add_as_input_history"] else 0
+	return _count_fuel_flux_engineered_channels(config) + count_atmospheric_engineered_channels(config) + energy_history_channels
 
 
 def _slice_channels(frame: np.ndarray, channel_indices: Sequence[int]) -> np.ndarray:
@@ -412,6 +428,7 @@ def resolve_engineered_feature_slices(config: Mapping[str, Any], base_input_chan
 	offset = int(base_input_channel_count)
 	atmospheric = _resolve_atmospheric_features_config(config)
 	engineered = _resolve_engineered_features_config(config)
+	energy_release = resolve_energy_release_config(config)
 	layout = _resolve_channel_layout(config)
 	slices: dict[str, slice] = {}
 
@@ -444,6 +461,9 @@ def resolve_engineered_feature_slices(config: Mapping[str, Any], base_input_chan
 	if engineered["enabled"] and engineered["add_cumulative_consumed_fuel"]:
 		slices["cumulative_consumed_fuel"] = slice(offset, offset + len(layout["fuel_channels"]))
 		offset += len(layout["fuel_channels"])
+	if energy_release["enabled"] and energy_release["add_as_input_history"]:
+		slices["energy_release_history"] = slice(offset, offset + 1)
+		offset += 1
 	return slices
 
 
@@ -466,13 +486,16 @@ def build_engineered_features(
 	file_paths: Sequence[str | Path],
 	start_index: int,
 	config: Mapping[str, Any],
+	energy_geometry: Mapping[str, Any] | None = None,
 ) -> np.ndarray:
 	"""Build leakage-safe engineered features from current and previous frames only."""
 
 	engineered = _resolve_engineered_features_config(config)
+	energy_release = resolve_energy_release_config(config)
 	atmospheric_count = count_atmospheric_engineered_channels(config)
 	fuel_flux_count = _count_fuel_flux_engineered_channels(config)
-	if atmospheric_count + fuel_flux_count <= 0:
+	energy_history_count = 1 if energy_release["enabled"] and energy_release["add_as_input_history"] else 0
+	if atmospheric_count + fuel_flux_count + energy_history_count <= 0:
 		height, width = int(input_frames.shape[1]), int(input_frames.shape[2])
 		return np.zeros((int(input_frames.shape[0]), height, width, 0), dtype=np.float32)
 
@@ -527,6 +550,17 @@ def build_engineered_features(
 				if engineered["clamp_consumed_fuel_nonnegative"]:
 					cumulative_consumed = np.maximum(cumulative_consumed, 0.0)
 				per_timestep_features.append(cumulative_consumed)
+		if energy_history_count:
+			if energy_geometry is None:
+				raise ValueError("energy_geometry is required when energy_release.add_as_input_history=true.")
+			energy_maps = compute_energy_release_maps(
+				current_frame,
+				config=config,
+				dx_m=float(energy_geometry["dx_m"]),
+				dy_m=float(energy_geometry["dy_m"]),
+			)
+			energy_history = transform_energy_target(energy_maps["energy_release_total_MW"], config)
+			per_timestep_features.append(energy_history[:, :, None].astype(np.float32, copy=False))
 
 		if per_timestep_features:
 			feature_frames.append(np.concatenate(per_timestep_features, axis=-1).astype(np.float32, copy=False))
@@ -542,6 +576,7 @@ def build_engineered_features_from_raw_window(
 	config: Mapping[str, Any],
 	initial_fuel: np.ndarray | None = None,
 	previous_frame_before_window: np.ndarray | None = None,
+	energy_geometry: Mapping[str, Any] | None = None,
 ) -> np.ndarray:
 	"""Build engineered features from an in-memory rollout window.
 
@@ -558,9 +593,11 @@ def build_engineered_features_from_raw_window(
 		)
 
 	engineered = _resolve_engineered_features_config(config)
+	energy_release = resolve_energy_release_config(config)
 	atmospheric_count = count_atmospheric_engineered_channels(config)
 	fuel_flux_count = _count_fuel_flux_engineered_channels(config)
-	if atmospheric_count + fuel_flux_count <= 0:
+	energy_history_count = 1 if energy_release["enabled"] and energy_release["add_as_input_history"] else 0
+	if atmospheric_count + fuel_flux_count + energy_history_count <= 0:
 		height, width = int(raw_frames.shape[1]), int(raw_frames.shape[2])
 		return np.zeros((int(raw_frames.shape[0]), height, width, 0), dtype=np.float32)
 
@@ -616,6 +653,17 @@ def build_engineered_features_from_raw_window(
 				if engineered["clamp_consumed_fuel_nonnegative"]:
 					cumulative_consumed = np.maximum(cumulative_consumed, 0.0)
 				per_timestep_features.append(cumulative_consumed)
+		if energy_history_count:
+			if energy_geometry is None:
+				raise ValueError("energy_geometry is required when energy_release.add_as_input_history=true.")
+			energy_maps = compute_energy_release_maps(
+				current_frame,
+				config=config,
+				dx_m=float(energy_geometry["dx_m"]),
+				dy_m=float(energy_geometry["dy_m"]),
+			)
+			energy_history = transform_energy_target(energy_maps["energy_release_total_MW"], config)
+			per_timestep_features.append(energy_history[:, :, None].astype(np.float32, copy=False))
 
 		if per_timestep_features:
 			feature_frames.append(np.concatenate(per_timestep_features, axis=-1).astype(np.float32, copy=False))
@@ -632,6 +680,7 @@ def build_model_input_from_raw_window(
 	normalization_stats: Mapping[str, np.ndarray] | None = None,
 	initial_fuel: np.ndarray | None = None,
 	previous_frame_before_window: np.ndarray | None = None,
+	energy_geometry: Mapping[str, Any] | None = None,
 ) -> np.ndarray:
 	"""Convert a raw rollout window into the model's normalized (1, T, C, H, W) input."""
 
@@ -652,6 +701,7 @@ def build_model_input_from_raw_window(
 		config=config,
 		initial_fuel=initial_fuel,
 		previous_frame_before_window=previous_frame_before_window,
+		energy_geometry=energy_geometry,
 	)
 	if engineered_inputs.shape[:3] != stacked_inputs.shape[:3]:
 		raise ValueError(
@@ -689,8 +739,9 @@ def build_multitask_target(
 	future_frame: np.ndarray,
 	initial_fuel: np.ndarray,
 	config: Mapping[str, Any],
+	energy_geometry: Mapping[str, Any] | None = None,
 ) -> np.ndarray:
-	"""Build the 3-channel multitask target."""
+	"""Build the multitask target, optionally including energy release channels."""
 
 	multitask = _resolve_multitask_config(config)
 	surface_fuel_channel = int(multitask["surface_fuel_channel"])
@@ -734,14 +785,26 @@ def build_multitask_target(
 	if not np.isfinite(surface_consumed_target).all() or not np.isfinite(canopy_consumed_target).all():
 		raise ValueError("Multitask regression targets contain non-finite values.")
 
-	target = np.stack(
-		[
-			surface_consumed_target.astype(np.float32, copy=False),
-			canopy_consumed_target.astype(np.float32, copy=False),
-			mask_array,
-		],
-		axis=0,
-	)
+	target_channels = [
+		surface_consumed_target.astype(np.float32, copy=False),
+		canopy_consumed_target.astype(np.float32, copy=False),
+		mask_array,
+	]
+	energy_release = resolve_energy_release_config(config)
+	energy_output_names = resolve_energy_output_channel_names(config)
+	if energy_release["enabled"] and energy_output_names:
+		if energy_geometry is None:
+			raise ValueError("energy_geometry must be provided when energy_release.enabled=true.")
+		energy_maps = compute_energy_release_maps(
+			future_frame,
+			config=config,
+			dx_m=float(energy_geometry["dx_m"]),
+			dy_m=float(energy_geometry["dy_m"]),
+		)
+		for energy_output_name in energy_output_names:
+			target_channels.append(transform_energy_target(energy_maps[energy_output_name], config))
+
+	target = np.stack(target_channels, axis=0)
 	return np.ascontiguousarray(target, dtype=np.float32)
 
 
@@ -845,7 +908,14 @@ class FireSequenceDataset(Dataset):
 		self.base_input_channel_count = len(self.base_input_channel_indices)
 		self.fuel_flux_engineered_channel_count = _count_fuel_flux_engineered_channels(self.config)
 		self.atmospheric_engineered_channel_count = count_atmospheric_engineered_channels(self.config)
-		self.engineered_channel_count = self.fuel_flux_engineered_channel_count + self.atmospheric_engineered_channel_count
+		self.energy_release_config = resolve_energy_release_config(self.config)
+		self.energy_target_channel_count = resolve_energy_target_count(self.config)
+		self.energy_history_channel_count = 1 if self.energy_release_config["enabled"] and self.energy_release_config["add_as_input_history"] else 0
+		self.engineered_channel_count = (
+			self.fuel_flux_engineered_channel_count
+			+ self.atmospheric_engineered_channel_count
+			+ self.energy_history_channel_count
+		)
 		self.total_input_channels = self.base_input_channel_count + self.engineered_channel_count
 		self.input_channels_after_engineering = self.total_input_channels
 		self.engineered_feature_slices = resolve_engineered_feature_slices(self.config, self.base_input_channel_count)
@@ -872,6 +942,17 @@ class FireSequenceDataset(Dataset):
 		self.normalization_stats = self._coerce_normalization_stats(normalization_stats)
 		self.target_mean, self.target_std = self._resolve_target_normalization_stats()
 		self.initial_fuel_map = _load_initial_fuel_map(self.file_paths, self.config) if self.task_type == "multitask" or _resolve_engineered_features_config(self.config)["enabled"] else None
+		self.energy_geometry = None
+		if self.energy_release_config["enabled"] and (self.task_type == "multitask" or self.energy_history_channel_count > 0):
+			dataset_dir = self.file_paths[0].parent
+			self.energy_geometry = resolve_dataset_energy_geometry(data_dir=dataset_dir, config=self.config, dataset_name=dataset_dir.name)
+			print(
+				"Energy release geometry | "
+				f"dataset={dataset_dir.name} dx_m={self.energy_geometry['dx_m']:.6f} "
+				f"dy_m={self.energy_geometry['dy_m']:.6f} "
+				f"A_cell_m2={self.energy_geometry['cell_area_m2']:.6f} "
+				f"source={self.energy_geometry['source']}"
+			)
 
 	def _coerce_normalization_stats(
 		self,
@@ -1049,6 +1130,7 @@ class FireSequenceDataset(Dataset):
 				future_frame=future_tensor,
 				initial_fuel=self.initial_fuel_map,
 				config=self.config,
+				energy_geometry=self.energy_geometry,
 			)
 			target_map_for_sampling = np.asarray(target_array[2], dtype=np.float32)
 		else:
@@ -1064,6 +1146,7 @@ class FireSequenceDataset(Dataset):
 			file_paths=self.file_paths,
 			start_index=sample_start,
 			config=self.config,
+			energy_geometry=self.energy_geometry,
 		)
 		if engineered_inputs.shape[:3] != stacked_inputs.shape[:3]:
 			raise ValueError(
@@ -1105,8 +1188,10 @@ class FireSequenceDataset(Dataset):
 			raise ValueError(
 				f"Expected stacked input channel dimension {self.total_input_channels}, got {stacked_inputs.shape[1]}."
 			)
-		if self.task_type == "multitask" and target_array.shape[0] != 3:
-			raise ValueError(f"Expected multitask target shape (3, H, W), got {target_array.shape}.")
+		if self.task_type == "multitask" and target_array.shape[0] != _multitask_output_channel_count(self.config):
+			raise ValueError(
+				f"Expected multitask target shape ({_multitask_output_channel_count(self.config)}, H, W), got {target_array.shape}."
+			)
 
 		x_tensor = torch.from_numpy(stacked_inputs).to(torch.float32)
 		y_tensor = torch.from_numpy(target_array).to(torch.float32)
@@ -1132,6 +1217,22 @@ class FireSequenceDataset(Dataset):
 				metadata["patch_top"] = int(patch_top)
 				metadata["patch_left"] = int(patch_left)
 				metadata["patch_size"] = int(self.patch_size)
+			if self.energy_geometry is not None and self.task_type == "multitask" and target_array.shape[0] > 3:
+				energy_target_raw = compute_energy_release_maps(
+					future_tensor,
+					config=self.config,
+					dx_m=float(self.energy_geometry["dx_m"]),
+					dy_m=float(self.energy_geometry["dy_m"]),
+				)["energy_release_total_MW"]
+				if self.use_patches:
+					energy_target_raw = energy_target_raw[patch_top:patch_top + self.patch_size, patch_left:patch_left + self.patch_size]
+				metadata["energy_dx_m"] = float(self.energy_geometry["dx_m"])
+				metadata["energy_dy_m"] = float(self.energy_geometry["dy_m"])
+				metadata["energy_cell_area_m2"] = float(self.energy_geometry["cell_area_m2"])
+				metadata["energy_target_transform"] = str(self.energy_release_config["target_transform"])
+				metadata["energy_total_MW_min"] = float(np.min(energy_target_raw))
+				metadata["energy_total_MW_max"] = float(np.max(energy_target_raw))
+				metadata["energy_total_MW_mean"] = float(np.mean(energy_target_raw))
 			return x_tensor, y_tensor, metadata
 
 		return x_tensor, y_tensor
@@ -1249,7 +1350,14 @@ class MultiFireSequenceDataset(FireSequenceDataset):
 		self.base_input_channel_count = len(self.base_input_channel_indices)
 		self.fuel_flux_engineered_channel_count = _count_fuel_flux_engineered_channels(self.config)
 		self.atmospheric_engineered_channel_count = count_atmospheric_engineered_channels(self.config)
-		self.engineered_channel_count = self.fuel_flux_engineered_channel_count + self.atmospheric_engineered_channel_count
+		self.energy_release_config = resolve_energy_release_config(self.config)
+		self.energy_target_channel_count = resolve_energy_target_count(self.config)
+		self.energy_history_channel_count = 1 if self.energy_release_config["enabled"] and self.energy_release_config["add_as_input_history"] else 0
+		self.engineered_channel_count = (
+			self.fuel_flux_engineered_channel_count
+			+ self.atmospheric_engineered_channel_count
+			+ self.energy_history_channel_count
+		)
 		self.total_input_channels = self.base_input_channel_count + self.engineered_channel_count
 		self.input_channels_after_engineering = self.total_input_channels
 		self.engineered_feature_slices = resolve_engineered_feature_slices(self.config, self.base_input_channel_count)
@@ -1278,6 +1386,23 @@ class MultiFireSequenceDataset(FireSequenceDataset):
 			for record in self.dataset_records
 			if self.task_type == "multitask" or _resolve_engineered_features_config(self.config)["enabled"]
 		}
+		self.energy_geometries: dict[int, dict[str, Any]] = {}
+		if self.energy_release_config["enabled"] and (self.task_type == "multitask" or self.energy_history_channel_count > 0):
+			for record in self.dataset_records:
+				dataset_id = int(record["dataset_id"])
+				geometry = resolve_dataset_energy_geometry(
+					data_dir=record["data_dir"],
+					config=self.config,
+					dataset_name=str(record["dataset_name"]),
+				)
+				self.energy_geometries[dataset_id] = geometry
+				print(
+					"Energy release geometry | "
+					f"dataset={record['dataset_name']} dx_m={geometry['dx_m']:.6f} "
+					f"dy_m={geometry['dy_m']:.6f} "
+					f"A_cell_m2={geometry['cell_area_m2']:.6f} "
+					f"source={geometry['source']}"
+				)
 
 	def __len__(self) -> int:
 		return len(self.sample_refs)
@@ -1326,14 +1451,17 @@ class MultiFireSequenceDataset(FireSequenceDataset):
 			initial_fuel_map = self.initial_fuel_maps.get(int(dataset_record["dataset_id"]))
 			if initial_fuel_map is None:
 				raise ValueError("initial_fuel_map must be available for multitask targets.")
+			energy_geometry = self.energy_geometries.get(int(dataset_record["dataset_id"]))
 			target_array = build_multitask_target(
 				current_frame=current_tensor,
 				future_frame=future_tensor,
 				initial_fuel=initial_fuel_map,
 				config=self.config,
+				energy_geometry=energy_geometry,
 			)
 			target_map_for_sampling = np.asarray(target_array[2], dtype=np.float32)
 		else:
+			energy_geometry = self.energy_geometries.get(int(dataset_record["dataset_id"]))
 			raw_target_array = np.asarray(future_tensor[:, :, self.target_channel], dtype=np.float32)
 			target_array = raw_target_array.copy()
 			if self.task_type == "segmentation":
@@ -1346,6 +1474,7 @@ class MultiFireSequenceDataset(FireSequenceDataset):
 			file_paths=file_paths,
 			start_index=sample_start,
 			config=self.config,
+			energy_geometry=energy_geometry,
 		)
 		if engineered_inputs.shape[:3] != stacked_inputs.shape[:3]:
 			raise ValueError(
@@ -1380,6 +1509,10 @@ class MultiFireSequenceDataset(FireSequenceDataset):
 			target_array = np.ascontiguousarray(target_array, dtype=np.float32)
 			if not np.all(np.isin(np.unique(target_array[2]), np.asarray([0.0, 1.0], dtype=np.float32))):
 				raise ValueError("Multitask mask channel must contain only 0.0 and 1.0 after processing.")
+			if target_array.shape[0] != _multitask_output_channel_count(self.config):
+				raise ValueError(
+					f"Expected multitask target shape ({_multitask_output_channel_count(self.config)}, H, W), got {target_array.shape}."
+				)
 		else:
 			target_array = np.expand_dims(np.ascontiguousarray(target_array, dtype=np.float32), axis=0)
 
@@ -1414,6 +1547,22 @@ class MultiFireSequenceDataset(FireSequenceDataset):
 				metadata["patch_top"] = int(patch_top)
 				metadata["patch_left"] = int(patch_left)
 				metadata["patch_size"] = int(self.patch_size)
+			if energy_geometry is not None and self.task_type == "multitask" and target_array.shape[0] > 3:
+				energy_target_raw = compute_energy_release_maps(
+					future_tensor,
+					config=self.config,
+					dx_m=float(energy_geometry["dx_m"]),
+					dy_m=float(energy_geometry["dy_m"]),
+				)["energy_release_total_MW"]
+				if self.use_patches:
+					energy_target_raw = energy_target_raw[patch_top:patch_top + self.patch_size, patch_left:patch_left + self.patch_size]
+				metadata["energy_dx_m"] = float(energy_geometry["dx_m"])
+				metadata["energy_dy_m"] = float(energy_geometry["dy_m"])
+				metadata["energy_cell_area_m2"] = float(energy_geometry["cell_area_m2"])
+				metadata["energy_target_transform"] = str(self.energy_release_config["target_transform"])
+				metadata["energy_total_MW_min"] = float(np.min(energy_target_raw))
+				metadata["energy_total_MW_max"] = float(np.max(energy_target_raw))
+				metadata["energy_total_MW_mean"] = float(np.mean(energy_target_raw))
 			return x_tensor, y_tensor, metadata
 
 		return x_tensor, y_tensor

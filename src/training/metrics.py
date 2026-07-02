@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import math
+
 try:
 	import torch  # type: ignore[import-not-found]
 except ImportError:  # pragma: no cover - environment-specific fallback
 	torch = None
+
+from src.data.energy_release import resolve_energy_output_channel_names, resolve_energy_release_config
 
 
 def _get_section(config, *names):
@@ -97,8 +101,13 @@ def compute_metrics(y_pred: torch.Tensor, y_true: torch.Tensor, config) -> dict[
 			return _segmentation_stats(predicted_mask, target_mask, eps)
 
 		if task_type == "multitask":
-			if y_pred.ndim != 4 or y_pred.shape[1] != 3:
-				raise ValueError(f"Multitask metrics expect tensors shaped (B, 3, H, W), got {tuple(y_pred.shape)}.")
+			energy_release = resolve_energy_release_config(config)
+			energy_output_names = resolve_energy_output_channel_names(config)
+			expected_channels = 3 + len(energy_output_names)
+			if y_pred.ndim != 4 or y_pred.shape[1] != expected_channels:
+				raise ValueError(
+					f"Multitask metrics expect tensors shaped (B, {expected_channels}, H, W), got {tuple(y_pred.shape)}."
+				)
 
 			pred_surface = y_pred[:, 0:1]
 			true_surface = y_true[:, 0:1]
@@ -121,7 +130,7 @@ def compute_metrics(y_pred: torch.Tensor, y_true: torch.Tensor, config) -> dict[
 				active_canopy_mae = torch.zeros((), device=y_pred.device, dtype=y_pred.dtype)
 
 			segmentation_metrics = _segmentation_stats(mask_pred, true_mask, eps)
-			return {
+			results = {
 				"surface_consumed_mae": float(surface_abs_error.mean().item()),
 				"surface_consumed_rmse": float(torch.sqrt(torch.mean((pred_surface - true_surface) ** 2) + eps).item()),
 				"active_surface_consumed_mae": float(active_surface_mae.item()),
@@ -134,5 +143,49 @@ def compute_metrics(y_pred: torch.Tensor, y_true: torch.Tensor, config) -> dict[
 				"mask_recall": float(segmentation_metrics["recall"]),
 				"active_mask_fraction": float(true_mask.mean().item()),
 			}
+			if energy_output_names:
+				pred_energy_log = y_pred[:, 3:4]
+				true_energy_log = y_true[:, 3:4]
+				energy_log_error = pred_energy_log - true_energy_log
+				results["energy_log_mae"] = float(torch.mean(torch.abs(energy_log_error)).item())
+				results["energy_log_rmse"] = float(torch.sqrt(torch.mean(energy_log_error ** 2) + eps).item())
+
+				if str(energy_release.get("target_transform", "log1p")) == "log1p":
+					pred_energy_MW = torch.expm1(pred_energy_log)
+					true_energy_MW = torch.expm1(true_energy_log)
+				else:
+					pred_energy_MW = pred_energy_log
+					true_energy_MW = true_energy_log
+				pred_energy_MW = torch.clamp(pred_energy_MW, min=0.0)
+				true_energy_MW = torch.clamp(true_energy_MW, min=0.0)
+
+				energy_abs_error = torch.abs(pred_energy_MW - true_energy_MW)
+				results["energy_MW_mae"] = float(torch.mean(energy_abs_error).item())
+				results["energy_MW_rmse"] = float(torch.sqrt(torch.mean((pred_energy_MW - true_energy_MW) ** 2) + eps).item())
+
+				energy_active_threshold_MW = float(_get_section(config, "multitask").get("energy_active_threshold_MW", 0.001))
+				true_energy_active = (true_energy_MW > energy_active_threshold_MW).to(dtype=torch.float32)
+				pred_energy_active = (pred_energy_MW > energy_active_threshold_MW).to(dtype=torch.float32)
+				if true_energy_active.any():
+					results["energy_MW_active_mae"] = float(energy_abs_error[true_energy_active > 0.5].mean().item())
+					results["energy_MW_active_rmse"] = float(
+						torch.sqrt(torch.mean((pred_energy_MW[true_energy_active > 0.5] - true_energy_MW[true_energy_active > 0.5]) ** 2) + eps).item()
+					)
+				else:
+					results["energy_MW_active_mae"] = 0.0
+					results["energy_MW_active_rmse"] = 0.0
+
+				energy_active_metrics = _segmentation_stats(pred_energy_active, true_energy_active, eps)
+				results["energy_active_iou"] = float(energy_active_metrics["iou"])
+				results["energy_active_dice"] = float(energy_active_metrics["dice"])
+				results["energy_active_precision"] = float(energy_active_metrics["precision"])
+				results["energy_active_recall"] = float(energy_active_metrics["recall"])
+				true_sum = torch.sum(true_energy_MW)
+				pred_sum = torch.sum(pred_energy_MW)
+				results["energy_total_true_MW_sum"] = float(true_sum.item())
+				results["energy_total_pred_MW_sum"] = float(pred_sum.item())
+				results["energy_total_sum_relative_error"] = float((torch.abs(pred_sum - true_sum) / (torch.abs(true_sum) + eps)).item())
+				results["energy_active_fraction"] = float(true_energy_active.mean().item())
+			return results
 
 		raise ValueError(f"Unsupported task_type: {task_type}")

@@ -1,0 +1,66 @@
+The .hdr lists the 3D variables contained in the  large KINGNSM04ASC.xxxx files.
+The first line in the .terrain file gives their dimensions:
+    144  144   14   497.008   370.370
+would indicate 144 in the x (West-East) direction, 144 in the y (south to north) direction, and 14 vertical levels in this domain.  (The latter floating points indicate the approximate grid length of transformed model coordinates in meters. Long explanation but the first, in x-direction, appears stretched but is not in real world coordinates, and the y-direction is the approximate south-north length of each grid. These are not good for precise calculations as model gridpoints are on latitude-longitude coordinates - given in the *.geometric file.)
+
+In Mayamin’s snapshot, .hdr begins with 10 (there are ten 3D fields in the file), the first being U (the west-east velocity component). I don’t remember the dimensions in the data I gave you/her, but if it were like the example above, the first 144 x 144 x 14 values are the U field at this time.  The next 144 x 144 x 14 are the V (south-north) wind component.
+Followed by W (vertical velocity), potential temperature (what we use instead of thermodynamic temperature in model calculations), pressure perturbation, buoyancy, eddy diffusion coefficient (you don’t need this), and vapor mixing ratio, cloud mixing ratio, and (you may want) smoke mixing ratio (grams of the smoke tracer per kg of air).
+
+xxxx in the file title indicates the number of the output file after model start. In all these recent simulations, they are output each minute, so it is the # of minutes after model start.
+
+The other files that may be confusing are the .flux files - the 4 2D arrays are the surface sensible heat flux, the surface latent heat flux, the canopy sensible heat flux and the canopy latent heat flux (W/m^2). The total heat flux is obtained by adding them together. The first line in each flux flie (ex. FRFCA1M04ASC.flux.0289) is
+  144  144    4   497.008   370.370
+where the first two integers are x- and y-direction dimensions, and the third integer indicates there are 4 variables - the 4 flux fields.
+
+*.fuel files contain the mass of fuel remaining (kg/m^2) on the the (refined) fire grid (5x5 cells within each atmospheric grid all the above mentioned variables are on).
+The first row in each:
+   720   720    2    99.402    74.074
+720 x 720 entries for each of the surface fuel load and then the canopy fuel load.
+JC
+
+
+
+
+
+
+
+
+
+I would not use a single [442.033, 370.370] cell size. The fire grid is stored on lat/lon coordinates, not a Cartesian grid with constant meter spacing. The values in the first row of the terrain file are only approximate reference dimensions, not the correct area for every grid cell.
+
+Use the .geom file instead: it has NX NY NZ, followed by the longitudes, latitudes, and cos(latitudes). Compute cell area row-by-row using the longitude spacing, latitude spacing, and cos(latitude). For this domain the center-cell size is closer to about 370 m × 370 m, and the east-west dimension varies slightly with latitude.
+
+
+
+For each latitude row j, keep dy constant and scale dx by cos(latitude_j).
+
+Use:
+
+dy=RΔϕdy=RΔϕdxj=Rcos⁡(ϕj)Δλdxj​=Rcos(ϕj​)Δλareaj=dxj dyareaj​=dxj​dy
+
+where:
+
+R = 6371000 m
+phi_j is the latitude of row j in radians
+Δphi is latitude spacing in radians
+Δlambda is longitude spacing in radians
+
+In code:
+
+import numpy as np
+
+R = 6371000.0
+
+lons = np.array(lons_from_geom)   # length NX
+lats = np.array(lats_from_geom)   # length NY
+
+dlon = np.deg2rad(abs(lons[1] - lons[0]))
+dlat = np.deg2rad(abs(lats[1] - lats[0]))
+
+dy = R * dlat
+dx_by_row = R * np.cos(np.deg2rad(lats)) * dlon
+area_by_row = dx_by_row * dy
+
+# full 2D area array, NY x NX
+area = np.repeat(area_by_row[:, None], len(lons), axis=1)
+So every cell in the same latitude row gets the same area; area changes only north–south.

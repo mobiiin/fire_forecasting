@@ -7,6 +7,7 @@ The current default setup is still the multitask forecast introduced earlier:
 - output channel `0`: surface consumed fuel
 - output channel `1`: canopy consumed fuel
 - output channel `2`: active fire / perimeter mask logits
+- output channel `3`: `log1p` energy release total MW
 
 ## Conda Environment Setup
 Create and activate the environment before running any scripts:
@@ -97,8 +98,30 @@ Default model config:
 ```yaml
 model:
   input_channels: 129
-  output_channels: 3
+  output_channels: 4
 ```
+
+## Energy Release Map Target
+CAWFE provides sensible and latent heat fluxes in `W/m^2`. This project derives an additional downstream target called the energy release map by multiplying the summed fluxes by grid-cell area from `dx * dy`.
+
+Formula:
+
+```text
+P_energy_MW(x,y,t) =
+dx * dy *
+(Q_sens_surface + Q_sens_canopy + Q_lat_surface + Q_lat_canopy)
+/ 1e6
+```
+
+This is intentionally called the energy release map, not FRP, because the CAWFE inputs here are sensible and latent heat fluxes rather than radiative power. The model predicts `log1p(P_energy_MW)` as an additional continuous output target because the distribution is sparse and heavy-tailed. Evaluation reports both log-space error and physical MW error.
+
+`dx` and `dy` are resolved from [fire_metadata.json](/media/mhabibp/Elements/Mobin_CPS_files/nosolar_actualNIROPS_asc_1of2_081214/fire_forecasting/fire_metadata.json:1), which can be regenerated with:
+
+```bash
+python scripts/build_fire_metadata.py
+```
+
+If energy release is enabled, old 3-channel checkpoints are incompatible with the 4-channel model head and must not be reused without retraining.
 
 ## Atmospheric Engineered Features
 From the raw atmospheric `U`, `V`, and `W` channels, the dataset can append three atmospheric feature groups for every input timestep.
@@ -192,7 +215,7 @@ mask = max(initial fuel - future surface/canopy fuel) > consumed_fuel_threshold
 ## Reconstructing Future Fuel Beds
 The regression heads predict consumed fuel, not future fuel directly.
 
-Reconstruction:
+Reconstruction: 
 
 ```text
 predicted future surface fuel = current surface fuel - predicted surface consumed fuel
@@ -241,28 +264,38 @@ All commands below assume the Conda environment above is already active.
 - Visualize test predictions:
   `python scripts/visualize_predictions.py --config configs/default.yaml --split test --num_samples 10`
 - Visualize model vs persistence comparisons:
+
   `python scripts/visualize_model_vs_persistence.py --config configs/default.yaml --num_samples 20 --output_dir outputs/model_vs_persistence`
 - Reconstruct future surface/canopy fuel beds from multitask predictions:
+
   `python scripts/reconstruct_fuel_bed_from_predictions.py --config configs/default.yaml --num_samples 10`
 - Inspect engineered features for one sample:
+
   `python scripts/inspect_engineered_features.py --config configs/default.yaml --sample_index 0`
 - Inspect atmospheric engineered features for one sample:
+
   `python scripts/inspect_atmospheric_features.py --config configs/default.yaml --sample_index 0`
 - Cache engineered per-timestep tensors to disk:
+
   `python scripts/cache_engineered_dataset.py --config configs/default.yaml --output_dir ../keepz_05_engineered`
 
 ### Inspection And Analysis Scripts
 - Inspect selected raw channel maps at selected timesteps:
   `python scripts/inspect_target_channels.py --config configs/default.yaml --channels 80 81 84 85 --timesteps 0 50 100`
 - Launch the interactive raw input viewer:
-  `python scripts/visualize_input_dataset.py --config configs/default.yaml --file-index 0 --channel-start -6 --window-size 6`
+
+  `python scripts/visualize_input_dataset.py --data-dir`
 - Evaluate the persistence baseline on the configured test dataset:
+
   `python scripts/evaluate_persistence_baseline.py --config configs/default.yaml --num-visualizations 5`
 - Compare persistence across candidate target channels:
+
   `python scripts/evaluate_persistence_all_candidate_targets.py --config configs/default.yaml --channels 50 51 52 53 54 55`
 - Run multitask autoregressive rollout GIF generation with teacher-forced future exogenous variables:
+
   `python scripts/rollout_predictions.py --config configs/default.yaml --split test --num_samples 5 --rollout_steps 20`
 - Run multitask autoregressive rollout GIF generation with constant exogenous variables:
+
   `python scripts/rollout_predictions.py --config configs/default.yaml --split test --num_samples 5 --rollout_steps 20 --exogenous_mode constant`
 
 ### Shell Wrappers

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from types import SimpleNamespace
 
 try:
@@ -12,6 +13,8 @@ except ImportError:  # pragma: no cover - environment-specific fallback
 	torch = None
 	nn = SimpleNamespace(Module=object)
 	F = None
+
+from src.data.energy_release import resolve_energy_output_channel_names, resolve_energy_release_config
 
 
 def _get_section(config, *names):
@@ -179,6 +182,22 @@ class MultiTaskLoss(nn.Module):
 		self.consumed_fuel_threshold = float(self.multitask_config.get("consumed_fuel_threshold", 0.01))
 		self.huber_delta = float(self.multitask_config.get("huber_delta", self.training_config.get("huber_delta", 1.0)))
 		self.dice_eps = float(self.multitask_config.get("dice_eps", self.training_config.get("eps", 1e-6)))
+		self.energy_release_config = resolve_energy_release_config(config)
+		self.energy_output_names = resolve_energy_output_channel_names(config)
+		self.expected_channels = 3 + len(self.energy_output_names)
+		self.energy_loss_weight = float(self.multitask_config.get("energy_loss_weight", 1.0))
+		self.energy_loss_name = str(self.multitask_config.get("energy_loss", "huber")).lower()
+		self.energy_loss_space = str(self.multitask_config.get("energy_loss_space", "log")).lower()
+		self.energy_active_weight = float(self.multitask_config.get("energy_active_weight", 10.0))
+		self.energy_background_weight = float(self.multitask_config.get("energy_background_weight", 1.0))
+		self.energy_active_threshold_MW = float(self.multitask_config.get("energy_active_threshold_MW", 0.001))
+
+	def _energy_threshold_in_target_space(self) -> float:
+		"""Convert the physical active threshold into target space."""
+
+		if str(self.energy_release_config.get("target_transform", "log1p")) == "log1p":
+			return float(math.log1p(max(self.energy_active_threshold_MW, 0.0)))
+		return float(self.energy_active_threshold_MW)
 
 	def _regression_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor, true_mask: torch.Tensor) -> torch.Tensor:
 		"""Compute one multitask regression-channel loss."""
@@ -227,11 +246,43 @@ class MultiTaskLoss(nn.Module):
 			f"Expected one of 'bce_dice', 'bce_with_logits', 'dice', 'focal', got {self.segmentation_loss_name!r}."
 		)
 
+	def _energy_loss(self, pred_energy: torch.Tensor, true_energy: torch.Tensor) -> torch.Tensor:
+		"""Compute the energy release regression loss."""
+
+		if pred_energy.shape != true_energy.shape:
+			raise ValueError(
+				f"Energy loss expects matching shapes, got {tuple(pred_energy.shape)} and {tuple(true_energy.shape)}."
+			)
+		if self.energy_loss_space != "log":
+			raise ValueError(
+				"Unsupported multitask.energy_loss_space. "
+				f"Expected 'log', got {self.energy_loss_space!r}."
+			)
+
+		threshold = self._energy_threshold_in_target_space()
+		active_mask = true_energy > threshold
+		weights = _build_weight_map(active_mask, self.energy_active_weight, self.energy_background_weight).to(
+			device=pred_energy.device,
+			dtype=pred_energy.dtype,
+		)
+		if self.energy_loss_name == "mse":
+			loss_map = (pred_energy - true_energy) ** 2
+		elif self.energy_loss_name == "huber":
+			loss_map = F.smooth_l1_loss(pred_energy, true_energy, reduction="none", beta=self.huber_delta)
+		else:
+			raise ValueError(
+				"Unsupported multitask.energy_loss. "
+				f"Expected 'huber' or 'mse', got {self.energy_loss_name!r}."
+			)
+		return _weighted_mean(loss_map, weights)
+
 	def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> dict[str, torch.Tensor]:
 		if y_pred.shape != y_true.shape:
 			raise ValueError(f"MultiTaskLoss expects matching shapes, got {tuple(y_pred.shape)} and {tuple(y_true.shape)}.")
-		if y_pred.ndim != 4 or y_pred.shape[1] != 3:
-			raise ValueError(f"MultiTaskLoss expects tensors shaped (B, 3, H, W), got {tuple(y_pred.shape)}.")
+		if y_pred.ndim != 4 or y_pred.shape[1] != self.expected_channels:
+			raise ValueError(
+				f"MultiTaskLoss expects tensors shaped (B, {self.expected_channels}, H, W), got {tuple(y_pred.shape)}."
+			)
 
 		pred_surface_consumed = y_pred[:, 0:1]
 		true_surface_consumed = y_true[:, 0:1]
@@ -243,16 +294,25 @@ class MultiTaskLoss(nn.Module):
 		surface_loss = self._regression_loss(pred_surface_consumed, true_surface_consumed, true_mask)
 		canopy_loss = self._regression_loss(pred_canopy_consumed, true_canopy_consumed, true_mask)
 		mask_loss = self._mask_loss(pred_mask_logits, true_mask)
+		energy_loss = torch.zeros((), dtype=y_pred.dtype, device=y_pred.device)
+		if self.energy_output_names:
+			energy_losses = []
+			for channel_offset, _ in enumerate(self.energy_output_names):
+				channel_index = 3 + channel_offset
+				energy_losses.append(self._energy_loss(y_pred[:, channel_index : channel_index + 1], y_true[:, channel_index : channel_index + 1]))
+			energy_loss = torch.stack(energy_losses).mean()
 		total_loss = (
 			self.surface_loss_weight * surface_loss
 			+ self.canopy_loss_weight * canopy_loss
 			+ self.segmentation_loss_weight * mask_loss
+			+ self.energy_loss_weight * energy_loss
 		)
 		return {
 			"total_loss": total_loss,
-			"surface_loss": surface_loss,
-			"canopy_loss": canopy_loss,
-			"mask_loss": mask_loss,
+			"loss_surface": surface_loss,
+			"loss_canopy": canopy_loss,
+			"loss_segmentation": mask_loss,
+			"loss_energy": energy_loss,
 		}
 
 

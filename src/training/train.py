@@ -37,7 +37,12 @@ from src.config import load_config
 from src.data.dataset import create_dataloaders
 from src.data.spatial_transforms import infer_with_external_test_spatial_handling
 from src.models.convlstm_unet import build_model_from_config
-from src.training.checkpoints import latest_and_best_checkpoint_paths, load_checkpoint, save_checkpoint
+from src.training.checkpoints import (
+	latest_and_best_checkpoint_paths,
+	load_checkpoint,
+	save_checkpoint,
+	validate_checkpoint_model_compatibility,
+)
 from src.training.losses import get_loss_function
 from src.training.metrics import compute_metrics
 from src.utils.logging import setup_logging
@@ -686,6 +691,7 @@ def train_model(config_path: str | Path) -> dict[str, Any]:
 	if resume_enabled and latest_checkpoint_path.exists():
 		logger.info("Resuming from checkpoint: %s", latest_checkpoint_path)
 		checkpoint = load_checkpoint(latest_checkpoint_path, map_location="cpu")
+		validate_checkpoint_model_compatibility(model, checkpoint, latest_checkpoint_path)
 		model.load_state_dict(checkpoint["model_state_dict"])
 		if checkpoint.get("optimizer_state_dict") is not None:
 			optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -836,6 +842,7 @@ def train_model(config_path: str | Path) -> dict[str, Any]:
 		logger.info("Loading best checkpoint for optional post-training test evaluation.")
 		if best_checkpoint_path.exists():
 			checkpoint = load_checkpoint(best_checkpoint_path, map_location=device)
+			validate_checkpoint_model_compatibility(model, checkpoint, best_checkpoint_path)
 			model.load_state_dict(checkpoint["model_state_dict"])
 		if split_mode == "train_val_external_test":
 			test_plot_results, spatial_mode_counts = _run_external_test_epoch_with_spatial_handling(
@@ -939,6 +946,7 @@ def evaluate_model_on_test_set(
 
 	logger.info("Loading checkpoint for test evaluation: %s", resolved_checkpoint_path)
 	checkpoint = load_checkpoint(resolved_checkpoint_path, map_location=device)
+	validate_checkpoint_model_compatibility(model, checkpoint, resolved_checkpoint_path)
 	model.load_state_dict(checkpoint["model_state_dict"])
 
 	test_results, spatial_mode_counts = _run_external_test_epoch_with_spatial_handling(

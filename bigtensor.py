@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 
 import numpy as np
 
@@ -8,6 +9,12 @@ DEFAULT_ASC_SHAPE = (144, 144, 46, 10)
 DEFAULT_FLUX_SHAPE = (144, 144, 4)
 DEFAULT_FUEL_SHAPE = (720, 720, 2)
 DEFAULT_POOL_WINDOW = (5, 5)
+ASC_Z_LEVELS = 46
+ASC_FIELD_COUNT = 10
+
+DATASET_FILE_PATTERN = re.compile(
+    r"^(?P<stem>.+?)(?:\.(?P<kind>flux|fuel))?\.(?P<timestamp>\d{4})$"
+)
 
 
 def _load_flat_text_data(input_filepath, data_type=np.float32, skip_header_rows=0):
@@ -56,6 +63,207 @@ def _print_tensor_summary(array, tensor_name):
 def _resolve_data_path(data_root, filename):
     """Join a data-root directory and a filename."""
     return os.path.join(data_root, filename)
+
+
+def _scan_dataset_files(data_root):
+    """Index ASC, flux, and fuel files grouped by dataset stem and timestamp."""
+    dataset_files = {}
+
+    for entry_name in sorted(os.listdir(data_root)):
+        entry_path = _resolve_data_path(data_root, entry_name)
+        if not os.path.isfile(entry_path):
+            continue
+
+        match = DATASET_FILE_PATTERN.match(entry_name)
+        if match is None:
+            continue
+
+        stem = match.group("stem")
+        file_kind = match.group("kind") or "asc"
+        timestamp = int(match.group("timestamp"))
+
+        dataset_files.setdefault(stem, {"asc": {}, "flux": {}, "fuel": {}})
+        dataset_files[stem][file_kind][timestamp] = entry_path
+
+    return dataset_files
+
+
+def _resolve_dataset_stem(dataset_files, requested_file_stem=None):
+    """Resolve a single dataset stem from scanned files."""
+    available_stems = sorted(dataset_files)
+    if requested_file_stem is not None:
+        if requested_file_stem not in dataset_files:
+            raise FileNotFoundError(
+                f"Requested file stem '{requested_file_stem}' was not found in the data directory. "
+                f"Available stems: {available_stems}"
+            )
+        return requested_file_stem
+
+    if not available_stems:
+        raise FileNotFoundError("No dataset files matching '*.####', '*.flux.####', or '*.fuel.####' were found.")
+
+    if len(available_stems) > 1:
+        raise ValueError(
+            f"Found multiple dataset stems in the data directory: {available_stems}. "
+            "Pass --file-stem to select one explicitly."
+        )
+
+    return available_stems[0]
+
+
+def _resolve_available_timestamps(dataset_group):
+    """Return timestamps that have ASC, flux, and fuel files together."""
+    shared_timestamps = sorted(
+        set(dataset_group["asc"]) & set(dataset_group["flux"]) & set(dataset_group["fuel"])
+    )
+    if shared_timestamps:
+        return shared_timestamps
+
+    raise ValueError(
+        "No timestamps were found with all three required files present "
+        f"(asc={len(dataset_group['asc'])}, flux={len(dataset_group['flux'])}, fuel={len(dataset_group['fuel'])})."
+    )
+
+
+def _read_header_shape(input_filepath, expected_channel_count, file_kind):
+    """Read the first three numeric values from a flux or fuel header row."""
+    with open(input_filepath, "r", encoding="ascii", errors="ignore") as file_obj:
+        first_line = file_obj.readline().strip()
+
+    if not first_line:
+        raise ValueError(f"The {file_kind} file '{input_filepath}' is empty.")
+
+    header_tokens = first_line.split()
+    if len(header_tokens) < 3:
+        raise ValueError(
+            f"The first line of {file_kind} file '{input_filepath}' does not contain at least 3 values: {first_line!r}"
+        )
+
+    try:
+        shape = tuple(int(float(token)) for token in header_tokens[:3])
+    except ValueError as exc:
+        raise ValueError(
+            f"Could not parse the first three header values from {file_kind} file '{input_filepath}': {first_line!r}"
+        ) from exc
+
+    if shape[2] != expected_channel_count:
+        raise ValueError(
+            f"Expected {file_kind} header '{input_filepath}' to report {expected_channel_count} channels, got {shape[2]}."
+        )
+
+    return shape
+
+
+def _auto_detect_dataset_config(
+    data_root,
+    requested_file_stem=None,
+    start_ts=None,
+    end_ts=None,
+    asc_shape=None,
+    flux_shape=None,
+    fuel_shape=None,
+):
+    """Infer dataset stem, available timestamps, and tensor shapes from the data directory."""
+    dataset_files = _scan_dataset_files(data_root)
+    resolved_file_stem = _resolve_dataset_stem(dataset_files, requested_file_stem=requested_file_stem)
+    dataset_group = dataset_files[resolved_file_stem]
+
+    available_timestamps = _resolve_available_timestamps(dataset_group)
+    detected_start_ts = available_timestamps[0]
+    detected_end_ts = available_timestamps[-1]
+
+    effective_start_ts = detected_start_ts if start_ts is None else start_ts
+    effective_end_ts = detected_end_ts if end_ts is None else end_ts
+    if effective_start_ts > effective_end_ts:
+        raise ValueError(
+            f"start_ts must be <= end_ts, got start_ts={effective_start_ts} and end_ts={effective_end_ts}."
+        )
+
+    selected_timestamps = [
+        timestamp
+        for timestamp in available_timestamps
+        if effective_start_ts <= timestamp <= effective_end_ts
+    ]
+    if not selected_timestamps:
+        raise ValueError(
+            f"No complete timestamps were found between {effective_start_ts:04d} and {effective_end_ts:04d}."
+        )
+
+    sample_timestamp = selected_timestamps[0]
+    inferred_flux_shape = (
+        flux_shape
+        if flux_shape is not None
+        else _read_header_shape(
+            dataset_group["flux"][sample_timestamp],
+            expected_channel_count=4,
+            file_kind="flux",
+        )
+    )
+    inferred_fuel_shape = (
+        fuel_shape
+        if fuel_shape is not None
+        else _read_header_shape(
+            dataset_group["fuel"][sample_timestamp],
+            expected_channel_count=2,
+            file_kind="fuel",
+        )
+    )
+    inferred_asc_shape = (
+        asc_shape
+        if asc_shape is not None
+        else (inferred_flux_shape[0], inferred_flux_shape[1], ASC_Z_LEVELS, ASC_FIELD_COUNT)
+    )
+
+    return {
+        "dataset_group": dataset_group,
+        "file_stem": resolved_file_stem,
+        "available_timestamps": available_timestamps,
+        "selected_timestamps": selected_timestamps,
+        "detected_start_ts": detected_start_ts,
+        "detected_end_ts": detected_end_ts,
+        "effective_start_ts": effective_start_ts,
+        "effective_end_ts": effective_end_ts,
+        "asc_shape": tuple(inferred_asc_shape),
+        "flux_shape": tuple(inferred_flux_shape),
+        "fuel_shape": tuple(inferred_fuel_shape),
+    }
+
+
+def _validate_positive_dims(name, dims):
+    """Require all supplied dimensions to be positive integers."""
+    if any(dim < 1 for dim in dims):
+        raise ValueError(f"{name} must contain only positive integers, got {tuple(dims)}.")
+
+
+def _validate_merge_shapes(asc_shape, flux_shape, fuel_shape, pool_window):
+    """Check that the supplied shapes can be merged after fuel pooling."""
+    _validate_positive_dims("asc_shape", asc_shape)
+    _validate_positive_dims("flux_shape", flux_shape)
+    _validate_positive_dims("fuel_shape", fuel_shape)
+    _validate_positive_dims("pool_window", pool_window)
+
+    asc_xy = tuple(asc_shape[:2])
+    flux_xy = tuple(flux_shape[:2])
+    fuel_xy = tuple(fuel_shape[:2])
+    ph, pw = pool_window
+
+    if flux_xy != asc_xy:
+        raise ValueError(
+            f"ASC and flux spatial shapes must match before merge, got {asc_xy} and {flux_xy}."
+        )
+
+    if fuel_xy[0] % ph != 0 or fuel_xy[1] % pw != 0:
+        raise ValueError(
+            f"Fuel shape {fuel_xy} is not divisible by pool window {pool_window}."
+        )
+
+    pooled_fuel_xy = (fuel_xy[0] // ph, fuel_xy[1] // pw)
+    if pooled_fuel_xy != asc_xy:
+        raise ValueError(
+            "Fuel shape and pool window do not downsample to the ASC/flux grid: "
+            f"fuel={fuel_xy}, pool_window={pool_window}, pooled_fuel={pooled_fuel_xy}, "
+            f"target={asc_xy}."
+        )
 
 
 def _pool_2d_channel(channel_2d, pool_window, pooling_mode):
@@ -287,9 +495,10 @@ def merge_timestamp(
     The ASC contribution preserves all 10 variables for each retained z-level,
     so the output shape is:
 
-        (144, 144, keep_z_levels * 10 + 4 + 2)
+        (asc_x, asc_y, keep_z_levels * asc_fields + 4 + 2)
     """
     try:
+        _validate_merge_shapes(asc_shape, flux_shape, fuel_shape, pool_window)
         asc_tensor = load_asc_tensor(
             input_filepath=base_file,
             keep_z_levels=keep_z_levels,
@@ -341,31 +550,71 @@ def merge_timestamp(
 
 def process_all_files(
     keep_z_levels_list=(8,),
-    start_ts=286,
-    end_ts=1999,
+    start_ts=None,
+    end_ts=None,
     output_root="tensors",
     fuel_pooling_mode="sum",
     data_root="./data",
+    file_stem=None,
+    asc_shape=None,
+    flux_shape=None,
+    fuel_shape=None,
+    pool_window=DEFAULT_POOL_WINDOW,
 ):
     """Generate several dataset versions, one per requested z-depth."""
     if isinstance(keep_z_levels_list, int):
         keep_z_levels_list = (keep_z_levels_list,)
 
+    detected_dataset = _auto_detect_dataset_config(
+        data_root=data_root,
+        requested_file_stem=file_stem,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        asc_shape=asc_shape,
+        flux_shape=flux_shape,
+        fuel_shape=fuel_shape,
+    )
+
+    dataset_group = detected_dataset["dataset_group"]
+    resolved_file_stem = detected_dataset["file_stem"]
+    selected_timestamps = detected_dataset["selected_timestamps"]
+    resolved_asc_shape = detected_dataset["asc_shape"]
+    resolved_flux_shape = detected_dataset["flux_shape"]
+    resolved_fuel_shape = detected_dataset["fuel_shape"]
+
+    _validate_merge_shapes(resolved_asc_shape, resolved_flux_shape, resolved_fuel_shape, pool_window)
+
     if not os.path.exists(output_root):
         os.makedirs(output_root)
         print(f"✅ Created output directory: '{output_root}'")
+
+    print(f"INFO detected dataset stem: '{resolved_file_stem}'")
+    print(
+        "INFO detected dataset range: "
+        f"start_ts={detected_dataset['detected_start_ts']:04d}, "
+        f"end_ts={detected_dataset['detected_end_ts']:04d}"
+    )
+    print(
+        "INFO dataset config: "
+        f"data_root='{data_root}', "
+        f"file_stem={resolved_file_stem!r}, "
+        f"start_ts={detected_dataset['effective_start_ts']:04d}, "
+        f"end_ts={detected_dataset['effective_end_ts']:04d}, "
+        f"asc_shape={resolved_asc_shape}, flux_shape={resolved_flux_shape}, "
+        f"fuel_shape={resolved_fuel_shape}, pool_window={pool_window}"
+    )
 
     for keep_z_levels in keep_z_levels_list:
         version_dir = os.path.join(output_root, f"keepz_{keep_z_levels:02d}")
         os.makedirs(version_dir, exist_ok=True)
         print(f"\n🧭 Writing dataset version for keep_z_levels={keep_z_levels} to '{version_dir}'")
 
-        for ts in range(start_ts, end_ts + 1):
+        for ts in selected_timestamps:
             print(f"\n{'='*20} PROCESSING TIMESTAMP {ts:04d} {'='*20}")
 
-            base_file = _resolve_data_path(data_root, f"KINGNSM04ASC.{ts:04d}")
-            flux_file = _resolve_data_path(data_root, f"KINGNSM04ASC.flux.{ts:04d}")
-            fuel_file = _resolve_data_path(data_root, f"KINGNSM04ASC.fuel.{ts:04d}")
+            base_file = dataset_group["asc"][ts]
+            flux_file = dataset_group["flux"][ts]
+            fuel_file = dataset_group["fuel"][ts]
             output_file = os.path.join(version_dir, f"tensor{ts:04d}.npy")
 
             merged_tensor = merge_timestamp(
@@ -373,6 +622,10 @@ def process_all_files(
                 flux_file=flux_file,
                 fuel_file=fuel_file,
                 keep_z_levels=keep_z_levels,
+                asc_shape=resolved_asc_shape,
+                flux_shape=resolved_flux_shape,
+                fuel_shape=resolved_fuel_shape,
+                pool_window=pool_window,
                 fuel_pooling_mode=fuel_pooling_mode,
             )
             if merged_tensor is None:
@@ -389,7 +642,7 @@ def process_all_files(
             print(f"🎉 Saved tensor for timestamp {ts:04d} with keep_z_levels={keep_z_levels}.")
 
 
-def process_single_version(keep_z_levels=8, start_ts=286, end_ts=1999):
+def process_single_version(keep_z_levels=8, start_ts=None, end_ts=None):
     """Backward-compatible wrapper for a single dataset version."""
     process_all_files(
         keep_z_levels_list=(keep_z_levels,),
@@ -410,19 +663,19 @@ def build_argument_parser():
         nargs="+",
         type=int,
         default=[8],
-        help="One or more z-depths to keep from the 46-level ASC file, e.g. --keep-z-levels 5 10 15.",
+        help="One or more z-depths to keep from the ASC file, e.g. --keep-z-levels 5 10 15.",
     )
     parser.add_argument(
         "--start-ts",
         type=int,
-        default=285,
-        help="First timestamp to process.",
+        default=None,
+        help="First timestamp to process. If omitted, the script auto-detects the first timestamp in the dataset.",
     )
     parser.add_argument(
         "--end-ts",
         type=int,
-        default=3754,
-        help="Last timestamp to process.",
+        default=None,
+        help="Last timestamp to process. If omitted, the script auto-detects the last timestamp in the dataset.",
     )
     parser.add_argument(
         "--output-root",
@@ -432,13 +685,56 @@ def build_argument_parser():
     parser.add_argument(
         "--data-root",
         default="../data",
-        help="Directory containing the KINGNSM04ASC, flux, and fuel input files.",
+        help="Directory containing the ASC, .flux, and .fuel input files.",
+    )
+    parser.add_argument(
+        "--file-stem",
+        default=None,
+        help=(
+            "Optional file stem before the timestamp, for example KINGNSM04ASC or CALWD1M04ASC. "
+            "If omitted, the script auto-detects the single dataset stem in the data directory."
+        ),
     )
     parser.add_argument(
         "--fuel-pooling-mode",
         choices=("average", "max", "sum"),
         default="sum",
-        help="Pooling method for the 720x720 fuel grid before downsampling.",
+        help="Pooling method for the fuel grid before downsampling.",
+    )
+    parser.add_argument(
+        "--asc-shape",
+        nargs=4,
+        type=int,
+        metavar=("X", "Y", "Z", "FIELDS"),
+        default=None,
+        help=(
+            "Optional manual ASC shape override. If omitted, the script uses "
+            "(flux_x, flux_y, 46, 10)."
+        ),
+    )
+    parser.add_argument(
+        "--flux-shape",
+        nargs=3,
+        type=int,
+        metavar=("X", "Y", "CHANNELS"),
+        default=None,
+        help="Optional manual flux shape override. If omitted, the script reads it from the first flux header line.",
+    )
+    parser.add_argument(
+        "--fuel-shape",
+        nargs=3,
+        type=int,
+        metavar=("X", "Y", "CHANNELS"),
+        default=None,
+        help="Optional manual fuel shape override. If omitted, the script reads it from the first fuel header line.",
+    )
+    parser.add_argument(
+        "--pool-window",
+        nargs=2,
+        type=int,
+        metavar=("HEIGHT", "WIDTH"),
+        default=list(DEFAULT_POOL_WINDOW),
+        help="Pooling window for the fuel grid, e.g. --pool-window 5 5.",
     )
     return parser
 
@@ -454,6 +750,11 @@ def main():
         output_root=args.output_root,
         fuel_pooling_mode=args.fuel_pooling_mode,
         data_root=args.data_root,
+        file_stem=args.file_stem,
+        asc_shape=None if args.asc_shape is None else tuple(args.asc_shape),
+        flux_shape=None if args.flux_shape is None else tuple(args.flux_shape),
+        fuel_shape=None if args.fuel_shape is None else tuple(args.fuel_shape),
+        pool_window=tuple(args.pool_window),
     )
 
 # --- Run the main processing function ---
