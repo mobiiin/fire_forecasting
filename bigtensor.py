@@ -1,6 +1,7 @@
 import argparse
 import os
 import re
+import shutil
 
 import numpy as np
 
@@ -63,6 +64,32 @@ def _print_tensor_summary(array, tensor_name):
 def _resolve_data_path(data_root, filename):
     """Join a data-root directory and a filename."""
     return os.path.join(data_root, filename)
+
+
+def _copy_sidecar_files(source_root, file_stem, output_dir, extensions=("geom", "grid", "terrain", "hdr")):
+    """Copy dataset sidecar files into an output directory."""
+    copied_files = []
+    missing_files = []
+
+    for extension in extensions:
+        source_path = _resolve_data_path(source_root, f"{file_stem}.{extension}")
+        if not os.path.isfile(source_path):
+            missing_files.append(source_path)
+            continue
+
+        destination_path = _resolve_data_path(output_dir, os.path.basename(source_path))
+        shutil.copy2(source_path, destination_path)
+        copied_files.append(destination_path)
+
+    if copied_files:
+        copied_names = ", ".join(os.path.basename(path) for path in copied_files)
+        print(f"📎 Copied sidecar files into '{output_dir}': {copied_names}")
+
+    if missing_files:
+        missing_names = ", ".join(os.path.basename(path) for path in missing_files)
+        print(f"⚠️  Missing sidecar files for '{file_stem}': {missing_names}")
+
+    return copied_files
 
 
 def _scan_dataset_files(data_root):
@@ -284,6 +311,13 @@ def _pool_2d_channel(channel_2d, pool_window, pooling_mode):
         return reshaped_for_pooling.sum(axis=(1, 3))
     raise ValueError("pooling_mode must be one of: average, max, sum.")
 
+
+def _reshape_spatial_channel(flat_channel, shape):
+    """Reshape one spatial channel, switching rectangular grids to column-major order."""
+    h, w = shape
+    reshape_order = "F" if h != w else "C"
+    return flat_channel.reshape((h, w), order=reshape_order)
+
 def average_pool_fuel(
     input_filepath,
     initial_shape=(720, 720, 2),
@@ -330,8 +364,8 @@ def average_pool_fuel(
         surface_flat = flat_data[:channel_size]
         canopy_flat = flat_data[channel_size:required_elements]
 
-        surface_tensor = surface_flat.reshape((h, w), order="C")
-        canopy_tensor = canopy_flat.reshape((h, w), order="C")
+        surface_tensor = _reshape_spatial_channel(surface_flat, (h, w))
+        canopy_tensor = _reshape_spatial_channel(canopy_flat, (h, w))
         print(f"✅ Fuel channels reshaped to: surface={surface_tensor.shape}, canopy={canopy_tensor.shape}")
         _raise_if_non_finite(surface_tensor, "Surface fuel tensor after reshape", input_filepath)
         _raise_if_non_finite(canopy_tensor, "Canopy fuel tensor after reshape", input_filepath)
@@ -453,7 +487,7 @@ def load_flux_tensor(
         for channel_index in range(c):
             start = channel_index * channel_size
             end = start + channel_size
-            channel_tensor = flat_data[start:end].reshape((h, w), order="C")
+            channel_tensor = _reshape_spatial_channel(flat_data[start:end], (h, w))
             _raise_if_non_finite(
                 channel_tensor,
                 f"Flux channel {channel_index + 1} tensor after reshape",
@@ -608,6 +642,7 @@ def process_all_files(
         version_dir = os.path.join(output_root, f"keepz_{keep_z_levels:02d}")
         os.makedirs(version_dir, exist_ok=True)
         print(f"\n🧭 Writing dataset version for keep_z_levels={keep_z_levels} to '{version_dir}'")
+        _copy_sidecar_files(data_root, resolved_file_stem, version_dir)
 
         for ts in selected_timestamps:
             print(f"\n{'='*20} PROCESSING TIMESTAMP {ts:04d} {'='*20}")

@@ -6,7 +6,8 @@ tensors/
 ./data
 ./keepz_05
 ./keepz_*
-
+cawfe
+satelite
 
 # Generated training artifacts
 artifacts/

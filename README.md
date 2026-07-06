@@ -115,13 +115,13 @@ dx * dy *
 
 This is intentionally called the energy release map, not FRP, because the CAWFE inputs here are sensible and latent heat fluxes rather than radiative power. The model predicts `log1p(P_energy_MW)` as an additional continuous output target because the distribution is sparse and heavy-tailed. Evaluation reports both log-space error and physical MW error.
 
-`dx` and `dy` are resolved from [fire_metadata.json](/media/mhabibp/Elements/Mobin_CPS_files/nosolar_actualNIROPS_asc_1of2_081214/fire_forecasting/fire_metadata.json:1), which can be regenerated with:
+Per-cell area now comes from each fire dataset's `.geom` file rather than a single scalar `dx * dy`. The recommended discovery/index workflow is:
 
 ```bash
-python scripts/build_fire_metadata.py
+python scripts/discover_fire_datasets.py --main_data_dir /media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/
 ```
 
-If energy release is enabled, old 3-channel checkpoints are incompatible with the 4-channel model head and must not be reused without retraining.
+The resulting `fire_dataset_index.json` is written to the project root by default and is used to pair processed `.npy` folders with the matching geometry source. If energy release is enabled, old 3-channel checkpoints are incompatible with the 4-channel model head and must not be reused without retraining.
 
 ## Atmospheric Engineered Features
 From the raw atmospheric `U`, `V`, and `W` channels, the dataset can append three atmospheric feature groups for every input timestep.

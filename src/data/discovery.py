@@ -8,6 +8,15 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from src.data.fire_index import (
+	DEFAULT_MAIN_DATA_DIR,
+	discover_fire_datasets,
+	load_fire_dataset_index,
+	update_fire_dataset_index,
+	save_fire_dataset_index,
+)
+from src.data.geometry import load_fire_geometry
+
 
 def _extract_numeric_suffix(name: str) -> int | None:
 	"""Extract a trailing numeric suffix from a filename stem when present."""
@@ -45,21 +54,184 @@ def discover_dataset_files(data_dir: Path, file_pattern: str) -> list[Path]:
 	return files
 
 
-def resolve_data_dirs(config: Mapping[str, Any]) -> list[Path]:
-	"""Resolve configured dataset directories, preferring ``data_dirs`` over ``data_dir``."""
+def _resolve_discovery_config(config: Mapping[str, Any]) -> dict[str, Any]:
+	"""Resolve top-level dataset discovery settings."""
+
+	data_discovery = config.get("data_discovery", {}) if isinstance(config.get("data_discovery"), Mapping) else {}
+	return {
+		"mode": str(data_discovery.get("mode", "explicit_data_dirs")).lower(),
+		"fire_dir_glob": str(data_discovery.get("fire_dir_glob", "*")),
+		"require_npy_files": bool(data_discovery.get("require_npy_files", True)),
+		"file_pattern": str(data_discovery.get("file_pattern", config.get("file_pattern", "*.npy"))),
+		"require_geom": bool(data_discovery.get("require_geom", True)),
+		"require_terrain": bool(data_discovery.get("require_terrain", False)),
+		"recursive": bool(data_discovery.get("recursive", False)),
+		"update_fire_index_before_training": bool(data_discovery.get("update_fire_index_before_training", False)),
+	}
+
+
+def _resolve_main_data_dir(config: Mapping[str, Any]) -> Path:
+	"""Resolve the configured main dataset directory."""
+
+	config_path_value = config.get("config_path", config.get("_config_path"))
+	config_path = Path(config_path_value).expanduser().resolve() if config_path_value else None
+	return _resolve_path(config_path, config.get("main_data_dir", DEFAULT_MAIN_DATA_DIR))
+
+
+def _default_fire_index_json_path() -> Path:
+	"""Return the project-root default fire-index path."""
+
+	return Path(__file__).resolve().parents[2] / "fire_dataset_index.json"
+
+
+def _resolve_fire_index_json_path(config: Mapping[str, Any]) -> Path:
+	"""Resolve the fire dataset index JSON path."""
+
+	config_path_value = config.get("config_path", config.get("_config_path"))
+	config_path = Path(config_path_value).expanduser().resolve() if config_path_value else None
+	default_path = _default_fire_index_json_path()
+	return _resolve_path(config_path, config.get("fire_dataset_index_json", default_path))
+
+
+def _load_or_refresh_fire_index(config: Mapping[str, Any]) -> dict[str, Any]:
+	"""Load the configured fire index, optionally refreshing it first."""
+
+	discovery = _resolve_discovery_config(config)
+	main_data_dir = _resolve_main_data_dir(config)
+	index_path = _resolve_fire_index_json_path(config)
+	if discovery["update_fire_index_before_training"]:
+		discovered = discover_fire_datasets(
+			main_data_dir=main_data_dir,
+			fire_dir_glob=discovery["fire_dir_glob"],
+			file_pattern=discovery["file_pattern"],
+			recursive=discovery["recursive"],
+			require_npy_files=discovery["require_npy_files"],
+			require_geom=discovery["require_geom"],
+			require_terrain=discovery["require_terrain"],
+		)
+		if index_path.exists():
+			discovered = update_fire_dataset_index(load_fire_dataset_index(index_path), discovered)
+		save_fire_dataset_index(discovered, index_path)
+		return discovered
+	if not index_path.exists():
+		raise FileNotFoundError(
+			"fire_dataset_index.json not found. Run:\n"
+			f"python scripts/discover_fire_datasets.py --main_data_dir {main_data_dir}"
+		)
+	return load_fire_dataset_index(index_path)
+
+
+def _records_from_fire_index(config: Mapping[str, Any]) -> list[dict[str, Any]]:
+	"""Build dataset records from a saved fire index."""
+
+	index = _load_or_refresh_fire_index(config)
+	fires = index.get("fires", {})
+	if not isinstance(fires, Mapping):
+		raise ValueError("fire_dataset_index.json is malformed: expected a top-level 'fires' mapping.")
+	records: list[dict[str, Any]] = []
+	for fire_name, record in sorted(fires.items()):
+		if not isinstance(record, Mapping):
+			continue
+		if not bool(record.get("valid_for_energy_release", False)):
+			continue
+		records.append(
+			{
+				"dataset_name": str(record.get("fire_name", fire_name)),
+				"data_dir": Path(str(record["data_dir"])).expanduser().resolve(),
+				"geom_path": Path(str(record["geom_path"])).expanduser().resolve() if record.get("geom_path") else None,
+				"terrain_path": Path(str(record["terrain_path"])).expanduser().resolve() if record.get("terrain_path") else None,
+				"fire_root_dir": Path(str(record.get("fire_root_dir", record["data_dir"]))).expanduser().resolve(),
+			}
+		)
+	return records
+
+
+def _index_record_lookup_by_data_dir(index: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
+	"""Build a lookup from resolved data_dir string to fire-index record."""
+
+	fires = index.get("fires", {})
+	if not isinstance(fires, Mapping):
+		return {}
+	lookup: dict[str, Mapping[str, Any]] = {}
+	for record in fires.values():
+		if isinstance(record, Mapping) and record.get("data_dir"):
+			lookup[str(Path(str(record["data_dir"])).expanduser().resolve())] = record
+	return lookup
+
+
+def _records_from_scan(config: Mapping[str, Any]) -> list[dict[str, Any]]:
+	"""Build dataset records by scanning the main dataset directory directly."""
+
+	discovery = _resolve_discovery_config(config)
+	main_data_dir = _resolve_main_data_dir(config)
+	index = discover_fire_datasets(
+		main_data_dir=main_data_dir,
+		fire_dir_glob=discovery["fire_dir_glob"],
+		file_pattern=discovery["file_pattern"],
+		recursive=discovery["recursive"],
+		require_npy_files=discovery["require_npy_files"],
+		require_geom=discovery["require_geom"],
+		require_terrain=discovery["require_terrain"],
+	)
+	records: list[dict[str, Any]] = []
+	for fire_name, record in sorted(index["fires"].items()):
+		records.append(
+			{
+				"dataset_name": str(record.get("fire_name", fire_name)),
+				"data_dir": Path(str(record["data_dir"])).expanduser().resolve(),
+				"geom_path": Path(str(record["geom_path"])).expanduser().resolve() if record.get("geom_path") else None,
+				"terrain_path": Path(str(record["terrain_path"])).expanduser().resolve() if record.get("terrain_path") else None,
+				"fire_root_dir": Path(str(record.get("fire_root_dir", record["data_dir"]))).expanduser().resolve(),
+			}
+		)
+	return records
+
+
+def discover_data_dir_records(config: Mapping[str, Any]) -> list[dict[str, Any]]:
+	"""Resolve dataset directories plus optional geometry metadata."""
 
 	config_path_value = config.get("config_path", config.get("_config_path"))
 	config_path = Path(config_path_value).expanduser().resolve() if config_path_value else None
 	configured_data_dirs = config.get("data_dirs")
 	if isinstance(configured_data_dirs, Sequence) and not isinstance(configured_data_dirs, (str, bytes)):
-		resolved = [_resolve_path(config_path, item) for item in configured_data_dirs if str(item).strip()]
+		index_lookup: dict[str, Mapping[str, Any]] = {}
+		index_path = _resolve_fire_index_json_path(config)
+		if index_path.exists():
+			index_lookup = _index_record_lookup_by_data_dir(load_fire_dataset_index(index_path))
+		resolved = []
+		for item in configured_data_dirs:
+			if str(item).strip():
+				data_dir = _resolve_path(config_path, item)
+				index_record = index_lookup.get(str(data_dir.resolve()))
+				resolved.append(
+					{
+						"dataset_name": str(index_record.get("fire_name", data_dir.name)) if index_record is not None else data_dir.name,
+						"data_dir": data_dir,
+						"geom_path": Path(str(index_record["geom_path"])).expanduser().resolve() if index_record is not None and index_record.get("geom_path") else None,
+						"terrain_path": Path(str(index_record["terrain_path"])).expanduser().resolve() if index_record is not None and index_record.get("terrain_path") else None,
+					}
+				)
 		if resolved:
 			return resolved
+
+	discovery = _resolve_discovery_config(config)
+	mode = discovery["mode"]
+	if mode == "fire_index":
+		return _records_from_fire_index(config)
+	if mode == "scan_main_data_dir":
+		return _records_from_scan(config)
 
 	configured_data_dir = config.get("data_dir")
 	if configured_data_dir in (None, "", "null"):
 		raise KeyError("Config must define either a non-empty data_dirs list or a legacy data_dir path.")
-	return [_resolve_path(config_path, configured_data_dir)]
+	data_dir = _resolve_path(config_path, configured_data_dir)
+	return [{"dataset_name": data_dir.name, "data_dir": data_dir, "geom_path": None, "terrain_path": None}]
+
+
+def resolve_data_dirs(config: Mapping[str, Any]) -> list[Path]:
+	"""Resolve configured dataset directories after applying discovery mode."""
+
+	return [Path(record["data_dir"]).resolve() for record in discover_data_dir_records(config)]
 
 
 def discover_multiple_datasets(config: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -71,13 +243,14 @@ def discover_multiple_datasets(config: Mapping[str, Any]) -> list[dict[str, Any]
 
 	use_patches = bool(config.get("use_patches", False))
 	patch_size = int(config.get("patch_size", 64))
-	data_dirs = resolve_data_dirs(config)
+	data_dir_records = discover_data_dir_records(config)
 	dataset_records: list[dict[str, Any]] = []
 	reference_channel_count: int | None = None
-	reference_shape_hw: tuple[int, int] | None = None
 	spatial_sizes: set[tuple[int, int]] = set()
+	energy_enabled = bool(config.get("energy_release", {}).get("enabled", False)) if isinstance(config.get("energy_release"), Mapping) else False
 
-	for dataset_id, data_dir in enumerate(data_dirs):
+	for dataset_id, source_record in enumerate(data_dir_records):
+		data_dir = Path(source_record["data_dir"]).resolve()
 		if not data_dir.exists():
 			raise FileNotFoundError(f"Data directory does not exist: {data_dir}")
 		file_paths = discover_dataset_files(data_dir, file_pattern)
@@ -100,18 +273,24 @@ def discover_multiple_datasets(config: Mapping[str, Any]) -> list[dict[str, Any]
 				"patch_size must fit inside every dataset when use_patches=true. "
 				f"Got patch_size={patch_size}, dataset={data_dir.name}, raw_shape={raw_shape}."
 			)
-		reference_shape_hw = reference_shape_hw or (height, width)
 		spatial_sizes.add((height, width))
-		dataset_records.append(
-			{
-				"dataset_id": int(dataset_id),
-				"dataset_name": str(data_dir.name),
-				"data_dir": data_dir,
-				"file_paths": file_paths,
-				"num_files": len(file_paths),
-				"raw_shape": raw_shape,
-			}
-		)
+		record = {
+			"dataset_id": int(dataset_id),
+			"dataset_name": str(source_record.get("dataset_name", data_dir.name)),
+			"data_dir": data_dir,
+			"file_paths": file_paths,
+			"num_files": len(file_paths),
+			"raw_shape": raw_shape,
+		}
+		if energy_enabled:
+			record["geometry"] = load_fire_geometry(
+				data_dir=data_dir,
+				config=config,
+				geom_path=source_record.get("geom_path"),
+				terrain_path=source_record.get("terrain_path"),
+				expected_shape=(height, width),
+			)
+		dataset_records.append(record)
 
 	if not dataset_records:
 		raise ValueError("No datasets were discovered from the configured data directories.")

@@ -4,14 +4,26 @@
 
 # Main dataset directories used for training/validation/test in multi-dataset mode.
 # Options: a non-empty list of relative or absolute directory paths containing one .npy file per timestamp.
-data_dirs:
-  - ../keepz_08
-  - ../keepz_08_tuo
+main_data_dir: /media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/
+
+fire_dataset_index_json: ../fire_dataset_index.json
+
+data_dirs: []
+
+data_discovery:
+  mode: fire_index
+  fire_dir_glob: "*"
+  require_npy_files: true
+  file_pattern: "*.npy"
+  require_geom: true
+  require_terrain: false
+  recursive: false
+  update_fire_index_before_training: false
 
 # Legacy single dataset directory fallback.
 # Options: any relative or absolute directory path containing one .npy file per timestamp.
 # If data_dirs exists and is non-empty, code uses data_dirs and ignores this fallback.
-data_dir: ../keepz_08
+data_dir: null
 
 # External final-test dataset directory.
 # Options: null to disable external testing, or any relative/absolute directory path.
@@ -439,9 +451,6 @@ energy_release:
   canopy_sensible_flux_channel: 82
   canopy_latent_flux_channel: 83
   flux_units: W_per_m2
-  dx_m: null
-  dy_m: null
-  metadata_path: ./fire_metadata.json
   clamp_negative_flux_to_zero: true
   save_components: true
   add_as_input_history: false
@@ -450,6 +459,15 @@ energy_release:
   predict_total: true
   predict_sensible: false
   predict_latent: false
+
+geometry:
+  require_geom_file: true
+  earth_radius_m: 6371000.0
+  use_geom_cos_latitude: false
+  geom_cos_tolerance: 1.0e-5
+  spacing_tolerance_relative: 1.0e-4
+  validate_against_terrain_header: true
+  allow_area_transpose_if_needed: false
 
 target_normalization:
   # Whether to normalize target channels.

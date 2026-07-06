@@ -1,4 +1,19 @@
 {
+  "ARCHIECREEK": {
+    "dx": 4582.531,
+    "dy": 3333.333,
+    "fire_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/ARCHIECREEK",
+    "simulation_count": 1,
+    "simulations": [
+      {
+        "dx": 4582.531,
+        "dy": 3333.333,
+        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/ARCHIECREEK/asc_archm2_1of2/ARCHM2M02ASC.flux.0060",
+        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/ARCHIECREEK/asc_archm2_1of2",
+        "simulation_dir_relative_to_fire": "asc_archm2_1of2"
+      }
+    ]
+  },
   "CALWOOD": {
     "dx": 484.524,
     "dy": 370.37,
@@ -10,6 +25,21 @@
         "dy": 370.37,
         "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/CALWOOD/asc/CALWD1M04ASC.flux.0120",
         "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/CALWOOD/asc",
+        "simulation_dir_relative_to_fire": "asc"
+      }
+    ]
+  },
+  "CAMP": {
+    "dx": 473.969,
+    "dy": 370.37,
+    "fire_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/CAMP",
+    "simulation_count": 1,
+    "simulations": [
+      {
+        "dx": 473.969,
+        "dy": 370.37,
+        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/CAMP/asc/CAMPA3M04ASC.flux.0135",
+        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/CAMP/asc",
         "simulation_dir_relative_to_fire": "asc"
       }
     ]
@@ -48,7 +78,7 @@
     "dx": 456.074,
     "dy": 370.37,
     "fire_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/CHIMNEYTOPS2",
-    "simulation_count": 4,
+    "simulation_count": 1,
     "simulations": [
       {
         "dx": 456.074,
@@ -56,27 +86,6 @@
         "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/CHIMNEYTOPS2/ct2_dry_analysis_d4_asc1of4/CT2A01M04ASC.flux.0090",
         "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/CHIMNEYTOPS2/ct2_dry_analysis_d4_asc1of4",
         "simulation_dir_relative_to_fire": "ct2_dry_analysis_d4_asc1of4"
-      },
-      {
-        "dx": 456.074,
-        "dy": 370.37,
-        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/CHIMNEYTOPS2/ct2_dry_analysis_d4_asc2of4/CT2A01M04ASC.flux.0400",
-        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/CHIMNEYTOPS2/ct2_dry_analysis_d4_asc2of4",
-        "simulation_dir_relative_to_fire": "ct2_dry_analysis_d4_asc2of4"
-      },
-      {
-        "dx": 456.074,
-        "dy": 370.37,
-        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/CHIMNEYTOPS2/ct2_dry_analysis_d4_asc3of4/CT2A01M04ASC.flux.0700",
-        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/CHIMNEYTOPS2/ct2_dry_analysis_d4_asc3of4",
-        "simulation_dir_relative_to_fire": "ct2_dry_analysis_d4_asc3of4"
-      },
-      {
-        "dx": 456.074,
-        "dy": 370.37,
-        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/CHIMNEYTOPS2/ct2_dry_analysis_d4_asc4of4/CT2A01M04ASC.flux.1100",
-        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/CHIMNEYTOPS2/ct2_dry_analysis_d4_asc4of4",
-        "simulation_dir_relative_to_fire": "ct2_dry_analysis_d4_asc4of4"
       }
     ]
   },
@@ -84,7 +93,7 @@
     "dx": 465.465,
     "dy": 370.37,
     "fire_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/CREEK",
-    "simulation_count": 2,
+    "simulation_count": 1,
     "simulations": [
       {
         "dx": 465.465,
@@ -92,13 +101,6 @@
         "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/CREEK/asc_1/CREEKAM04ASC.flux.0060",
         "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/CREEK/asc_1",
         "simulation_dir_relative_to_fire": "asc_1"
-      },
-      {
-        "dx": 465.465,
-        "dy": 370.37,
-        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/CREEK/asc_2/CREEKAM04ASC.flux.1200",
-        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/CREEK/asc_2",
-        "simulation_dir_relative_to_fire": "asc_2"
       }
     ]
   },
@@ -106,7 +108,7 @@
     "dx": 481.376,
     "dy": 370.37,
     "fire_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/EASTTROUBLESOME",
-    "simulation_count": 2,
+    "simulation_count": 1,
     "simulations": [
       {
         "dx": 481.376,
@@ -114,13 +116,21 @@
         "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/EASTTROUBLESOME/asc_eastt1_const36_061721_1of2/EASTT1M04ASC.flux.0090",
         "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/EASTTROUBLESOME/asc_eastt1_const36_061721_1of2",
         "simulation_dir_relative_to_fire": "asc_eastt1_const36_061721_1of2"
-      },
+      }
+    ]
+  },
+  "ESPERANZA": {
+    "dx": 148.68,
+    "dy": 123.457,
+    "fire_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/ESPERANZA",
+    "simulation_count": 1,
+    "simulations": [
       {
-        "dx": 481.376,
-        "dy": 370.37,
-        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/EASTTROUBLESOME/asc_eastt1_const36_061721_2of2/EASTT1M04ASC.flux.0600",
-        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/EASTTROUBLESOME/asc_eastt1_const36_061721_2of2",
-        "simulation_dir_relative_to_fire": "asc_eastt1_const36_061721_2of2"
+        "dx": 148.68,
+        "dy": 123.457,
+        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/ESPERANZA/asc1/ESPBDWM05ASC.flux.0630",
+        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/ESPERANZA/asc1",
+        "simulation_dir_relative_to_fire": "asc1"
       }
     ]
   },
@@ -154,6 +164,106 @@
       }
     ]
   },
+  "KING": {
+    "dx": 475.117,
+    "dy": 370.37,
+    "fire_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/KING",
+    "simulation_count": 3,
+    "simulations": [
+      {
+        "dx": 475.117,
+        "dy": 370.37,
+        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/KING/period1/asc/KNG2V1M04ASC.flux.0180",
+        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/KING/period1/asc",
+        "simulation_dir_relative_to_fire": "period1/asc"
+      },
+      {
+        "dx": 475.117,
+        "dy": 370.37,
+        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/KING/period2/nosolar_actualNIROPS_asc_1of2_081214/KINGNSM04ASC.flux.0285",
+        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/KING/period2/nosolar_actualNIROPS_asc_1of2_081214",
+        "simulation_dir_relative_to_fire": "period2/nosolar_actualNIROPS_asc_1of2_081214"
+      },
+      {
+        "dx": 475.117,
+        "dy": 370.37,
+        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/KING/period3/asc/KING3AM04ASC.flux.0240",
+        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/KING/period3/asc",
+        "simulation_dir_relative_to_fire": "period3/asc"
+      }
+    ]
+  },
+  "LITTLEBEAR": {
+    "dx": 446.04,
+    "dy": 370.37,
+    "fire_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/LITTLEBEAR",
+    "simulation_count": 9,
+    "simulations": [
+      {
+        "dx": 446.04,
+        "dy": 370.37,
+        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/LITTLEBEAR/lbvaa/LBVAA5_asc_FINAL_1of3/LBVAA5M04ASC.flux.0450",
+        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/LITTLEBEAR/lbvaa/LBVAA5_asc_FINAL_1of3",
+        "simulation_dir_relative_to_fire": "lbvaa/LBVAA5_asc_FINAL_1of3"
+      },
+      {
+        "dx": 446.04,
+        "dy": 370.37,
+        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/LITTLEBEAR/lbvaa/LBVAA5_asc_FINAL_2of3/LBVAA5M04ASC.flux.1200",
+        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/LITTLEBEAR/lbvaa/LBVAA5_asc_FINAL_2of3",
+        "simulation_dir_relative_to_fire": "lbvaa/LBVAA5_asc_FINAL_2of3"
+      },
+      {
+        "dx": 446.04,
+        "dy": 370.37,
+        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/LITTLEBEAR/lbvaa/LBVAA5_asc_FINAL_3of3/LBVAA5M04ASC.flux.1900",
+        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/LITTLEBEAR/lbvaa/LBVAA5_asc_FINAL_3of3",
+        "simulation_dir_relative_to_fire": "lbvaa/LBVAA5_asc_FINAL_3of3"
+      },
+      {
+        "dx": 446.04,
+        "dy": 370.37,
+        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/LITTLEBEAR/lbvab/LBVAB5_asc_FINAL_1of3/LBVAB5M04ASC.flux.1185",
+        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/LITTLEBEAR/lbvab/LBVAB5_asc_FINAL_1of3",
+        "simulation_dir_relative_to_fire": "lbvab/LBVAB5_asc_FINAL_1of3"
+      },
+      {
+        "dx": 446.04,
+        "dy": 370.37,
+        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/LITTLEBEAR/lbvab/LBVAB5_asc_FINAL_2of3/LBVAB5M04ASC.flux.1700",
+        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/LITTLEBEAR/lbvab/LBVAB5_asc_FINAL_2of3",
+        "simulation_dir_relative_to_fire": "lbvab/LBVAB5_asc_FINAL_2of3"
+      },
+      {
+        "dx": 446.04,
+        "dy": 370.37,
+        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/LITTLEBEAR/lbvab/LBVAB5_asc_FINAL_3of3/LBVAB5M04ASC.flux.2200",
+        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/LITTLEBEAR/lbvab/LBVAB5_asc_FINAL_3of3",
+        "simulation_dir_relative_to_fire": "lbvab/LBVAB5_asc_FINAL_3of3"
+      },
+      {
+        "dx": 446.04,
+        "dy": 370.37,
+        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/LITTLEBEAR/lbvac/LBVAC5_asc_FINAL_1of3/LBVAC5M04ASC.flux.1875",
+        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/LITTLEBEAR/lbvac/LBVAC5_asc_FINAL_1of3",
+        "simulation_dir_relative_to_fire": "lbvac/LBVAC5_asc_FINAL_1of3"
+      },
+      {
+        "dx": 446.04,
+        "dy": 370.37,
+        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/LITTLEBEAR/lbvac/LBVAC5_asc_FINAL_2of3/LBVAC5M04ASC.flux.2100",
+        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/LITTLEBEAR/lbvac/LBVAC5_asc_FINAL_2of3",
+        "simulation_dir_relative_to_fire": "lbvac/LBVAC5_asc_FINAL_2of3"
+      },
+      {
+        "dx": 446.04,
+        "dy": 370.37,
+        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/LITTLEBEAR/lbvac/LBVAC5_asc_FINAL_3of3/LBVAC5M04ASC.flux.2500",
+        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/LITTLEBEAR/lbvac/LBVAC5_asc_FINAL_3of3",
+        "simulation_dir_relative_to_fire": "lbvac/LBVAC5_asc_FINAL_3of3"
+      }
+    ]
+  },
   "MARSHALL": {
     "dx": 242.262,
     "dy": 185.185,
@@ -166,6 +276,21 @@
         "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/MARSHALL/asc/MARSHWM05ASC.flux.0150",
         "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/MARSHALL/asc",
         "simulation_dir_relative_to_fire": "asc"
+      }
+    ]
+  },
+  "MCKINNEY": {
+    "dx": 497.008,
+    "dy": 370.37,
+    "fire_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/MCKINNEY",
+    "simulation_count": 1,
+    "simulations": [
+      {
+        "dx": 497.008,
+        "dy": 370.37,
+        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/MCKINNEY/asc_1/FRFCA1M04ASC.flux.0045",
+        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/MCKINNEY/asc_1",
+        "simulation_dir_relative_to_fire": "asc_1"
       }
     ]
   },
@@ -188,7 +313,7 @@
     "dx": 481.376,
     "dy": 370.37,
     "fire_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/NORTHCOMPLX",
-    "simulation_count": 3,
+    "simulation_count": 1,
     "simulations": [
       {
         "dx": 481.376,
@@ -196,20 +321,21 @@
         "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/NORTHCOMPLX/asc_NRTHA3_1of3_052321/NRTHA3M04ASC.flux.0150",
         "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/NORTHCOMPLX/asc_NRTHA3_1of3_052321",
         "simulation_dir_relative_to_fire": "asc_NRTHA3_1of3_052321"
-      },
+      }
+    ]
+  },
+  "PARKCTY_HYPOTHETICAL": {
+    "dx": 479.382,
+    "dy": 370.37,
+    "fire_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/PARKCTY_HYPOTHETICAL",
+    "simulation_count": 1,
+    "simulations": [
       {
-        "dx": 481.376,
+        "dx": 479.382,
         "dy": 370.37,
-        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/NORTHCOMPLX/asc_NRTHA3_2of3_052321/NRTHA3M04ASC.flux.1000",
-        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/NORTHCOMPLX/asc_NRTHA3_2of3_052321",
-        "simulation_dir_relative_to_fire": "asc_NRTHA3_2of3_052321"
-      },
-      {
-        "dx": 481.376,
-        "dy": 370.37,
-        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/NORTHCOMPLX/asc_NRTHA3_3of3_052321/NRTHA3M04ASC.flux.1700",
-        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/NORTHCOMPLX/asc_NRTHA3_3of3_052321",
-        "simulation_dir_relative_to_fire": "asc_NRTHA3_3of3_052321"
+        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/PARKCTY_HYPOTHETICAL/asc_1_expt4_alma_2ndig/FRFCA1M04ASC.flux.0000",
+        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/PARKCTY_HYPOTHETICAL/asc_1_expt4_alma_2ndig",
+        "simulation_dir_relative_to_fire": "asc_1_expt4_alma_2ndig"
       }
     ]
   },
@@ -232,7 +358,7 @@
     "dx": 469.367,
     "dy": 370.37,
     "fire_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/RIM",
-    "simulation_count": 4,
+    "simulation_count": 2,
     "simulations": [
       {
         "dx": 469.367,
@@ -244,23 +370,9 @@
       {
         "dx": 469.367,
         "dy": 370.37,
-        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/RIM/0820_Lee_LF_asc_2of2/RIMAB1M04ASC.flux.1300",
-        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/RIM/0820_Lee_LF_asc_2of2",
-        "simulation_dir_relative_to_fire": "0820_Lee_LF_asc_2of2"
-      },
-      {
-        "dx": 469.367,
-        "dy": 370.37,
         "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/RIM/0822_Lee_LF_asc_1of2/RM822AM04ASC.flux.0135",
         "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/RIM/0822_Lee_LF_asc_1of2",
         "simulation_dir_relative_to_fire": "0822_Lee_LF_asc_1of2"
-      },
-      {
-        "dx": 469.367,
-        "dy": 370.37,
-        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/RIM/0822_Lee_LF_asc_2of2/RM822AM04ASC.flux.1300",
-        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/RIM/0822_Lee_LF_asc_2of2",
-        "simulation_dir_relative_to_fire": "0822_Lee_LF_asc_2of2"
       }
     ]
   },
@@ -268,7 +380,7 @@
     "dx": 497.342,
     "dy": 370.37,
     "fire_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/SLATER",
-    "simulation_count": 2,
+    "simulation_count": 1,
     "simulations": [
       {
         "dx": 497.342,
@@ -276,13 +388,94 @@
         "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/SLATER/asc_d4_slata1_1of2/SLATA1M04ASC.flux.0120",
         "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/SLATER/asc_d4_slata1_1of2",
         "simulation_dir_relative_to_fire": "asc_d4_slata1_1of2"
+      }
+    ]
+  },
+  "SPRINGS": {
+    "dx": 446.283,
+    "dy": 370.37,
+    "fire_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/SPRINGS",
+    "simulation_count": 2,
+    "simulations": [
+      {
+        "dx": 446.283,
+        "dy": 370.37,
+        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/SPRINGS/asc/FRFCA1M04ASC.flux.0000",
+        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/SPRINGS/asc",
+        "simulation_dir_relative_to_fire": "asc"
       },
       {
-        "dx": 497.342,
+        "dx": 446.283,
         "dy": 370.37,
-        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/SLATER/asc_d4_slata1_2of2/SLATA1M04ASC.flux.1000",
-        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/SLATER/asc_d4_slata1_2of2",
-        "simulation_dir_relative_to_fire": "asc_d4_slata1_2of2"
+        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/SPRINGS/asc/flux_to_gis_no4/FRFCA1M04ASC.flux.0151",
+        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/SPRINGS/asc/flux_to_gis_no4",
+        "simulation_dir_relative_to_fire": "asc/flux_to_gis_no4"
+      }
+    ]
+  },
+  "THOMAS": {
+    "dx": 461.892,
+    "dy": 370.37,
+    "fire_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/THOMAS",
+    "simulation_count": 4,
+    "simulations": [
+      {
+        "dx": 461.892,
+        "dy": 370.37,
+        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/THOMAS/1204/asc/THONV2M04ASC.flux.0090",
+        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/THOMAS/1204/asc",
+        "simulation_dir_relative_to_fire": "1204/asc"
+      },
+      {
+        "dx": 461.892,
+        "dy": 370.37,
+        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/THOMAS/1208/asc/TH218IM04ASC.flux.0060",
+        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/THOMAS/1208/asc",
+        "simulation_dir_relative_to_fire": "1208/asc"
+      },
+      {
+        "dx": 461.892,
+        "dy": 370.37,
+        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/THOMAS/1209/asc/TH218IM04ASC.flux.0045",
+        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/THOMAS/1209/asc",
+        "simulation_dir_relative_to_fire": "1209/asc"
+      },
+      {
+        "dx": 461.892,
+        "dy": 370.37,
+        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/THOMAS/1210/asc/TH218IM04ASC.flux.0180",
+        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/THOMAS/1210/asc",
+        "simulation_dir_relative_to_fire": "1210/asc"
+      }
+    ]
+  },
+  "TRUCKEE_HYPOTHETICAL": {
+    "dx": 239.381,
+    "dy": 185.185,
+    "fire_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/TRUCKEE_HYPOTHETICAL",
+    "simulation_count": 1,
+    "simulations": [
+      {
+        "dx": 239.381,
+        "dy": 185.185,
+        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/TRUCKEE_HYPOTHETICAL/asc_1/FRFCA1M05ASC.flux.0060",
+        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/TRUCKEE_HYPOTHETICAL/asc_1",
+        "simulation_dir_relative_to_fire": "asc_1"
+      }
+    ]
+  },
+  "TUOLUMNE_65": {
+    "dx": 468.883,
+    "dy": 370.37,
+    "fire_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/TUOLUMNE_65",
+    "simulation_count": 1,
+    "simulations": [
+      {
+        "dx": 468.883,
+        "dy": 370.37,
+        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/TUOLUMNE_65/asc3/FRFCA1M04ASC.flux.0150",
+        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/TUOLUMNE_65/asc3",
+        "simulation_dir_relative_to_fire": "asc3"
       }
     ]
   },
@@ -290,7 +483,7 @@
     "dx": 442.033,
     "dy": 370.37,
     "fire_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/WITCHCREEK",
-    "simulation_count": 3,
+    "simulation_count": 1,
     "simulations": [
       {
         "dx": 442.033,
@@ -298,20 +491,36 @@
         "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/WITCHCREEK/asc_1/WTHCK1M04ASC.flux.0045",
         "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/WITCHCREEK/asc_1",
         "simulation_dir_relative_to_fire": "asc_1"
-      },
+      }
+    ]
+  },
+  "WOOLSEY": {
+    "dx": 447.992,
+    "dy": 370.37,
+    "fire_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/WOOLSEY",
+    "simulation_count": 1,
+    "simulations": [
       {
-        "dx": 442.033,
+        "dx": 447.992,
         "dy": 370.37,
-        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/WITCHCREEK/asc_2/WTHCK1M04ASC.flux.0800",
-        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/WITCHCREEK/asc_2",
-        "simulation_dir_relative_to_fire": "asc_2"
-      },
+        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/WOOLSEY/asc_1/WLS1A1M04ASC.flux.0120",
+        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/WOOLSEY/asc_1",
+        "simulation_dir_relative_to_fire": "asc_1"
+      }
+    ]
+  },
+  "YUBA_HYPOTHETICAL": {
+    "dx": 517.358,
+    "dy": 370.37,
+    "fire_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/YUBA_HYPOTHETICAL",
+    "simulation_count": 1,
+    "simulations": [
       {
-        "dx": 442.033,
+        "dx": 517.358,
         "dy": 370.37,
-        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/WITCHCREEK/asc_3/WTHCK1M04ASC.flux.1501",
-        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/WITCHCREEK/asc_3",
-        "simulation_dir_relative_to_fire": "asc_3"
+        "sample_flux_file": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/YUBA_HYPOTHETICAL/yubacan_lf5x5_asc_092417/YUBFT1M04ASC.flux.0300",
+        "simulation_dir": "/media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/YUBA_HYPOTHETICAL/yubacan_lf5x5_asc_092417",
+        "simulation_dir_relative_to_fire": "yubacan_lf5x5_asc_092417"
       }
     ]
   }

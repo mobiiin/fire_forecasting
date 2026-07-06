@@ -55,6 +55,8 @@ def discover_files(data_dir: Path, file_pattern: str) -> list[Path]:
 
     files = list(data_dir.glob(file_pattern))
     if not files:
+        files = list(data_dir.rglob(file_pattern))
+    if not files:
         raise FileNotFoundError(f"No files found in '{data_dir}' using pattern '{file_pattern}'.")
     return sort_chronologically(files)
 

@@ -23,12 +23,12 @@ except ImportError:  # pragma: no cover - environment-specific fallback
 from src.data.discovery import discover_dataset_files, discover_multiple_datasets, resolve_data_dirs, sort_chronologically
 from src.data.energy_release import (
 	compute_energy_release_maps,
-	resolve_dataset_energy_geometry,
 	resolve_energy_output_channel_names,
 	resolve_energy_release_config,
 	resolve_energy_target_count,
 	transform_energy_target,
 )
+from src.data.geometry import load_fire_geometry
 from src.data.preprocessing import load_normalization_stats, normalize_channel_map, normalize_tensor
 from src.data.splits import (
 	chronological_split_indices,
@@ -556,8 +556,7 @@ def build_engineered_features(
 			energy_maps = compute_energy_release_maps(
 				current_frame,
 				config=config,
-				dx_m=float(energy_geometry["dx_m"]),
-				dy_m=float(energy_geometry["dy_m"]),
+				area_2d_m2=np.asarray(energy_geometry["area_2d_m2"], dtype=np.float32),
 			)
 			energy_history = transform_energy_target(energy_maps["energy_release_total_MW"], config)
 			per_timestep_features.append(energy_history[:, :, None].astype(np.float32, copy=False))
@@ -659,8 +658,7 @@ def build_engineered_features_from_raw_window(
 			energy_maps = compute_energy_release_maps(
 				current_frame,
 				config=config,
-				dx_m=float(energy_geometry["dx_m"]),
-				dy_m=float(energy_geometry["dy_m"]),
+				area_2d_m2=np.asarray(energy_geometry["area_2d_m2"], dtype=np.float32),
 			)
 			energy_history = transform_energy_target(energy_maps["energy_release_total_MW"], config)
 			per_timestep_features.append(energy_history[:, :, None].astype(np.float32, copy=False))
@@ -798,8 +796,7 @@ def build_multitask_target(
 		energy_maps = compute_energy_release_maps(
 			future_frame,
 			config=config,
-			dx_m=float(energy_geometry["dx_m"]),
-			dy_m=float(energy_geometry["dy_m"]),
+			area_2d_m2=np.asarray(energy_geometry["area_2d_m2"], dtype=np.float32),
 		)
 		for energy_output_name in energy_output_names:
 			target_channels.append(transform_energy_target(energy_maps[energy_output_name], config))
@@ -945,13 +942,17 @@ class FireSequenceDataset(Dataset):
 		self.energy_geometry = None
 		if self.energy_release_config["enabled"] and (self.task_type == "multitask" or self.energy_history_channel_count > 0):
 			dataset_dir = self.file_paths[0].parent
-			self.energy_geometry = resolve_dataset_energy_geometry(data_dir=dataset_dir, config=self.config, dataset_name=dataset_dir.name)
+			self.energy_geometry = load_fire_geometry(
+				data_dir=dataset_dir,
+				config=self.config,
+				expected_shape=(self.expected_height, self.expected_width),
+			)
 			print(
 				"Energy release geometry | "
-				f"dataset={dataset_dir.name} dx_m={self.energy_geometry['dx_m']:.6f} "
-				f"dy_m={self.energy_geometry['dy_m']:.6f} "
-				f"A_cell_m2={self.energy_geometry['cell_area_m2']:.6f} "
-				f"source={self.energy_geometry['source']}"
+				f"dataset={dataset_dir.name} geom={self.energy_geometry['geom_path']} "
+				f"area_min_m2={self.energy_geometry['area_min_m2']:.6f} "
+				f"area_mean_m2={self.energy_geometry['area_mean_m2']:.6f} "
+				f"area_max_m2={self.energy_geometry['area_max_m2']:.6f}"
 			)
 
 	def _coerce_normalization_stats(
@@ -1221,14 +1222,19 @@ class FireSequenceDataset(Dataset):
 				energy_target_raw = compute_energy_release_maps(
 					future_tensor,
 					config=self.config,
-					dx_m=float(self.energy_geometry["dx_m"]),
-					dy_m=float(self.energy_geometry["dy_m"]),
+					area_2d_m2=np.asarray(self.energy_geometry["area_2d_m2"], dtype=np.float32),
 				)["energy_release_total_MW"]
 				if self.use_patches:
 					energy_target_raw = energy_target_raw[patch_top:patch_top + self.patch_size, patch_left:patch_left + self.patch_size]
-				metadata["energy_dx_m"] = float(self.energy_geometry["dx_m"])
-				metadata["energy_dy_m"] = float(self.energy_geometry["dy_m"])
-				metadata["energy_cell_area_m2"] = float(self.energy_geometry["cell_area_m2"])
+				metadata["geom_path"] = str(self.energy_geometry["geom_path"])
+				metadata["terrain_path"] = str(self.energy_geometry["terrain_path"]) if self.energy_geometry["terrain_path"] is not None else None
+				metadata["dy_m"] = float(self.energy_geometry["dy_m"])
+				metadata["dx_min_m"] = float(self.energy_geometry["dx_min_m"])
+				metadata["dx_max_m"] = float(self.energy_geometry["dx_max_m"])
+				metadata["dx_mean_m"] = float(self.energy_geometry["dx_mean_m"])
+				metadata["area_min_m2"] = float(self.energy_geometry["area_min_m2"])
+				metadata["area_max_m2"] = float(self.energy_geometry["area_max_m2"])
+				metadata["area_mean_m2"] = float(self.energy_geometry["area_mean_m2"])
 				metadata["energy_target_transform"] = str(self.energy_release_config["target_transform"])
 				metadata["energy_total_MW_min"] = float(np.min(energy_target_raw))
 				metadata["energy_total_MW_max"] = float(np.max(energy_target_raw))
@@ -1390,18 +1396,21 @@ class MultiFireSequenceDataset(FireSequenceDataset):
 		if self.energy_release_config["enabled"] and (self.task_type == "multitask" or self.energy_history_channel_count > 0):
 			for record in self.dataset_records:
 				dataset_id = int(record["dataset_id"])
-				geometry = resolve_dataset_energy_geometry(
-					data_dir=record["data_dir"],
-					config=self.config,
-					dataset_name=str(record["dataset_name"]),
-				)
+				geometry = dict(record.get("geometry", {})) if isinstance(record.get("geometry"), Mapping) else {}
+				if not geometry:
+					height, width = tuple(int(value) for value in record["raw_shape"][:2])
+					geometry = load_fire_geometry(
+						data_dir=Path(record["data_dir"]),
+						config=self.config,
+						expected_shape=(height, width),
+					)
 				self.energy_geometries[dataset_id] = geometry
 				print(
 					"Energy release geometry | "
-					f"dataset={record['dataset_name']} dx_m={geometry['dx_m']:.6f} "
-					f"dy_m={geometry['dy_m']:.6f} "
-					f"A_cell_m2={geometry['cell_area_m2']:.6f} "
-					f"source={geometry['source']}"
+					f"dataset={record['dataset_name']} geom={geometry['geom_path']} "
+					f"area_min_m2={geometry['area_min_m2']:.6f} "
+					f"area_mean_m2={geometry['area_mean_m2']:.6f} "
+					f"area_max_m2={geometry['area_max_m2']:.6f}"
 				)
 
 	def __len__(self) -> int:
@@ -1551,14 +1560,19 @@ class MultiFireSequenceDataset(FireSequenceDataset):
 				energy_target_raw = compute_energy_release_maps(
 					future_tensor,
 					config=self.config,
-					dx_m=float(energy_geometry["dx_m"]),
-					dy_m=float(energy_geometry["dy_m"]),
+					area_2d_m2=np.asarray(energy_geometry["area_2d_m2"], dtype=np.float32),
 				)["energy_release_total_MW"]
 				if self.use_patches:
 					energy_target_raw = energy_target_raw[patch_top:patch_top + self.patch_size, patch_left:patch_left + self.patch_size]
-				metadata["energy_dx_m"] = float(energy_geometry["dx_m"])
-				metadata["energy_dy_m"] = float(energy_geometry["dy_m"])
-				metadata["energy_cell_area_m2"] = float(energy_geometry["cell_area_m2"])
+				metadata["geom_path"] = str(energy_geometry["geom_path"])
+				metadata["terrain_path"] = str(energy_geometry["terrain_path"]) if energy_geometry["terrain_path"] is not None else None
+				metadata["dy_m"] = float(energy_geometry["dy_m"])
+				metadata["dx_min_m"] = float(energy_geometry["dx_min_m"])
+				metadata["dx_max_m"] = float(energy_geometry["dx_max_m"])
+				metadata["dx_mean_m"] = float(energy_geometry["dx_mean_m"])
+				metadata["area_min_m2"] = float(energy_geometry["area_min_m2"])
+				metadata["area_max_m2"] = float(energy_geometry["area_max_m2"])
+				metadata["area_mean_m2"] = float(energy_geometry["area_mean_m2"])
 				metadata["energy_target_transform"] = str(self.energy_release_config["target_transform"])
 				metadata["energy_total_MW_min"] = float(np.min(energy_target_raw))
 				metadata["energy_total_MW_max"] = float(np.max(energy_target_raw))

@@ -64,3 +64,37 @@ area_by_row = dx_by_row * dy
 # full 2D area array, NY x NX
 area = np.repeat(area_by_row[:, None], len(lons), axis=1)
 So every cell in the same latitude row gets the same area; area changes only north–south.
+
+
+
+
+
+
+
+
+
+The first line of the .terrain file is a header:
+
+nx ny nz dx dy
+
+where:
+
+nx = number of grid points in the west–east direction.
+ny = number of grid points in the south–north direction.
+nz = number of vertical levels in the associated 3D ASC files.
+dx = approximate west–east grid spacing (meters) at the center of the domain. This value has already been divided by cos(center latitude) because the model uses latitude/longitude coordinates. The true east–west grid spacing varies slightly with latitude.
+dy = approximate north–south grid spacing (meters) at the center of the domain. This is essentially constant across the domain.
+The remainder of the .terrain file contains the terrain elevation (meters above mean sea level) for each model grid cell.
+
+The .geom file contains metadata describing the model grid. Its first line has the same dimensions (nx ny nz).
+
+It is followed by:
+
+nx longitude values giving the longitude of each west–east grid column.
+ny latitude values giving the latitude of each south–north grid row.
+ny values of cos(latitude) corresponding to each grid row, from the southernmost to the northernmost row.
+These latitude and cosine values allow the actual east–west grid spacing for any row to be computed. If dx_header is the value in the header, then for a row with latitude φ:
+
+dx(ϕ)=dx_header​ × cos(ϕ)
+
+Thus, each row has a slightly different physical east–west cell width, while the north–south spacing remains essentially constant.
