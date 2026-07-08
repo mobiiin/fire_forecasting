@@ -17,7 +17,7 @@ data_discovery:
   file_pattern: "*.npy"
   require_geom: true
   require_terrain: false
-  recursive: false
+  recursive: true
   update_fire_index_before_training: false
 
 # Legacy single dataset directory fallback.
@@ -52,10 +52,59 @@ target_channel: 84
 
 # Dataset split policy.
 # Supported options:
-# - multi_dataset_chronological: split each dataset in data_dirs independently by time, then concatenate train/val/test samples
+# - multi_fire_chronological: split each fire independently by time, then concatenate train/val/test samples
+# - manual_fire_holdout: user manually assigns whole fires to train/val/test
 # - train_val_external_test: main data_dir -> chronological train/val only, test_data_dir used for final testing
 # - train_val_test: legacy chronological train/val/test split within data_dir
-split_mode: multi_dataset_chronological
+split_mode: manual_fire_holdout
+
+fire_filter:
+  # Optional include/exclude lists for multi_fire_chronological mode.
+  # If include_fires is non-empty, only those fires are used before exclude_fires is applied.
+  include_fires: []
+  exclude_fires: []
+
+manual_fire_split:
+  enabled: true
+
+  # Fire names must match keys in fire_dataset_index.json.
+  # These defaults are examples and should be updated to match the fires currently available in your mounted dataset tree.
+  train_fires:
+    - ARCHIECREEK
+    - CAMP
+    - CARR_FIRENADO
+    - CARR_GROWTHDAY
+    - CHIMNEYTOPS2
+    - CREEK
+    - GLASS
+    - HOLIDAYFARM
+    - MARSHALL
+    - NORTHCOMPLX
+    - PARKCTY_HYPOTHETICAL
+    - SPRINGS
+  val_fires:
+    - MCKINNEY
+    - MOSQUITO
+    - REDWOODVALLEY
+  test_fires:
+    - CALWOOD
+    - EASTTROUBLESOME
+    - ESPERANZA
+    - SLATER
+
+  use_full_fire_for_split: true
+  within_fire_train_fraction: 1.0
+  within_fire_val_fraction: 1.0
+  within_fire_test_fraction: 1.0
+
+  require_all_listed_fires_exist: true
+  disallow_overlap_between_splits: true
+  require_nonempty_train: true
+  require_nonempty_val: true
+  require_nonempty_test: true
+  save_resolved_split_json: true
+  resolved_split_json: artifacts/splits/manual_fire_split_resolved.json
+  fraction_warning_tolerance: 0.20
 
 # Learning task.
 # Supported options:
@@ -68,30 +117,41 @@ task_type: multitask
 # Options: any float threshold appropriate for the chosen target variable.
 fire_threshold: 0.5
 
-# Whether to sample spatial patches during training.
-# Options: true, false
+patching:
+  enabled: true
+  patch_size: 64
+  patch_height: 64
+  patch_width: 64
+  allow_padding_small_domains: false
+  pad_value_normalized: 0.0
+  train_sampling_mode: mixed_active_random
+  active_patch_probability: 0.8
+  random_patch_probability: 0.2
+  active_source: combined_target
+  consumed_active_threshold: 0.001
+  energy_active_threshold_MW: 0.001
+  min_active_pixels: 5
+  center_on_active_pixel: true
+  jitter_active_center: true
+  max_center_jitter_pixels: 16
+  eval_mode: sliding_window
+  eval_patch_size: 64
+  eval_stride: 32
+  include_border_patches: true
+  require_patch_divisible_by: 16
+  auto_pad_to_divisible: false
+
+# Backward-compatible top-level patch flags used by older scripts.
 use_patches: true
-
-# Whether to use patches during validation/external test/inference utilities.
-# Options: true, false
-use_patches_for_eval: false
-
-# Patch size used when patch mode is enabled.
-# Options: any positive integer <= min(H, W).
-patch_size: 72
-
-# Probability of sampling a patch around active pixels when patch mode is enabled.
-# Options: float in [0, 1].
-active_patch_probability: 0.7
-
-# Activity threshold used for active-patch sampling and some weighted metrics/losses.
-# Options: any float threshold in the target's physical range.
-active_threshold: 0.5
+use_patches_for_eval: true
+patch_size: 64
+active_patch_probability: 0.8
+active_threshold: 0.001
 
 # Chronological train fraction for the main dataset.
 # Options:
 # - for split_mode=train_val_external_test: train_fraction + val_fraction must sum to 1.0
-# - for split_mode=train_val_test or multi_dataset_chronological: train_fraction + val_fraction + test_fraction must sum to 1.0
+# - for split_mode=train_val_test or multi_fire_chronological: train_fraction + val_fraction + test_fraction must sum to 1.0
 train_fraction: 0.7
 
 # Chronological validation fraction for the main dataset.
@@ -111,13 +171,13 @@ dataset_id_in_metadata: true
 dataset_sampling:
   # Enable custom train sampling across datasets.
   # Options: true, false
-  enabled: false
+  enabled: true
 
   # Dataset sampling strategy.
   # Supported options:
   # - uniform_samples
-  # - balanced_by_dataset
-  mode: uniform_samples
+  # - balanced_by_fire
+  mode: balanced_by_fire
 
 # Batch size for DataLoaders.
 # Options: any positive integer >= 1, limited by memory.
@@ -527,6 +587,21 @@ normalization:
   # Saved normalization-stats file.
   # Options: any relative or absolute .npz path.
   path: ./artifacts/normalization_stats.npz
+
+  # Normalization sampling mode.
+  # Supported options:
+  # - full_domain
+  # - patch_sampled
+  mode: patch_sampled
+
+  # Max number of train samples/patches used when estimating stats.
+  max_patches: 5000
+
+  # Minimum normalization contribution target per training fire when manual holdout is used.
+  patches_per_fire_min: 100
+
+  # Whether normalization should use the same active/random patching policy as training.
+  use_active_patch_sampling: true
 
   # Input normalization method.
   # Currently implemented options:

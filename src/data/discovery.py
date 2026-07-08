@@ -65,9 +65,61 @@ def _resolve_discovery_config(config: Mapping[str, Any]) -> dict[str, Any]:
 		"file_pattern": str(data_discovery.get("file_pattern", config.get("file_pattern", "*.npy"))),
 		"require_geom": bool(data_discovery.get("require_geom", True)),
 		"require_terrain": bool(data_discovery.get("require_terrain", False)),
-		"recursive": bool(data_discovery.get("recursive", False)),
+		"recursive": bool(data_discovery.get("recursive", True)),
 		"update_fire_index_before_training": bool(data_discovery.get("update_fire_index_before_training", False)),
 	}
+
+
+def _resolve_fire_filter_config(config: Mapping[str, Any]) -> dict[str, list[str]]:
+	"""Resolve optional include/exclude fire filters."""
+
+	section = config.get("fire_filter", {}) if isinstance(config.get("fire_filter"), Mapping) else {}
+	def _coerce_list(key: str) -> list[str]:
+		value = section.get(key, [])
+		if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+			return [str(item) for item in value if str(item).strip()]
+		return []
+	return {
+		"include_fires": _coerce_list("include_fires"),
+		"exclude_fires": _coerce_list("exclude_fires"),
+	}
+
+
+def _resolve_manual_split_selected_fires(config: Mapping[str, Any]) -> set[str] | None:
+	"""Return the explicitly selected fires when manual holdout is active."""
+
+	split_mode = str(config.get("split_mode", "")).lower()
+	if split_mode != "manual_fire_holdout":
+		return None
+	section = config.get("manual_fire_split", {}) if isinstance(config.get("manual_fire_split"), Mapping) else {}
+	selected: set[str] = set()
+	for key in ("train_fires", "val_fires", "test_fires"):
+		value = section.get(key, [])
+		if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+			selected.update(str(item) for item in value if str(item).strip())
+	return selected
+
+
+def _apply_data_dir_record_filters(data_dir_records: Sequence[Mapping[str, Any]], config: Mapping[str, Any]) -> list[dict[str, Any]]:
+	"""Apply include/exclude fire filters and manual split selection."""
+
+	selected_manual = _resolve_manual_split_selected_fires(config)
+	fire_filter = _resolve_fire_filter_config(config)
+	include_fires = set(fire_filter["include_fires"])
+	exclude_fires = set(fire_filter["exclude_fires"])
+	filtered: list[dict[str, Any]] = []
+
+	for record in data_dir_records:
+		dataset_name = str(record["dataset_name"])
+		if selected_manual is not None:
+			if dataset_name not in selected_manual:
+				continue
+		elif include_fires and dataset_name not in include_fires:
+			continue
+		if selected_manual is None and dataset_name in exclude_fires:
+			continue
+		filtered.append(dict(record))
+	return filtered
 
 
 def _resolve_main_data_dir(config: Mapping[str, Any]) -> Path:
@@ -141,6 +193,8 @@ def _records_from_fire_index(config: Mapping[str, Any]) -> list[dict[str, Any]]:
 				"geom_path": Path(str(record["geom_path"])).expanduser().resolve() if record.get("geom_path") else None,
 				"terrain_path": Path(str(record["terrain_path"])).expanduser().resolve() if record.get("terrain_path") else None,
 				"fire_root_dir": Path(str(record.get("fire_root_dir", record["data_dir"]))).expanduser().resolve(),
+				"geom_requires_transpose": bool(record.get("geom_requires_transpose", False)),
+				"geom_tensor_orientation": record.get("geom_tensor_orientation"),
 			}
 		)
 	return records
@@ -182,6 +236,8 @@ def _records_from_scan(config: Mapping[str, Any]) -> list[dict[str, Any]]:
 				"geom_path": Path(str(record["geom_path"])).expanduser().resolve() if record.get("geom_path") else None,
 				"terrain_path": Path(str(record["terrain_path"])).expanduser().resolve() if record.get("terrain_path") else None,
 				"fire_root_dir": Path(str(record.get("fire_root_dir", record["data_dir"]))).expanduser().resolve(),
+				"geom_requires_transpose": bool(record.get("geom_requires_transpose", False)),
+				"geom_tensor_orientation": record.get("geom_tensor_orientation"),
 			}
 		)
 	return records
@@ -209,6 +265,8 @@ def discover_data_dir_records(config: Mapping[str, Any]) -> list[dict[str, Any]]
 						"data_dir": data_dir,
 						"geom_path": Path(str(index_record["geom_path"])).expanduser().resolve() if index_record is not None and index_record.get("geom_path") else None,
 						"terrain_path": Path(str(index_record["terrain_path"])).expanduser().resolve() if index_record is not None and index_record.get("terrain_path") else None,
+						"geom_requires_transpose": bool(index_record.get("geom_requires_transpose", False)) if index_record is not None else False,
+						"geom_tensor_orientation": index_record.get("geom_tensor_orientation") if index_record is not None else None,
 					}
 				)
 		if resolved:
@@ -243,7 +301,9 @@ def discover_multiple_datasets(config: Mapping[str, Any]) -> list[dict[str, Any]
 
 	use_patches = bool(config.get("use_patches", False))
 	patch_size = int(config.get("patch_size", 64))
-	data_dir_records = discover_data_dir_records(config)
+	data_dir_records = _apply_data_dir_record_filters(discover_data_dir_records(config), config)
+	if not data_dir_records:
+		raise ValueError("No dataset directories remained after applying discovery/manual fire filters.")
 	dataset_records: list[dict[str, Any]] = []
 	reference_channel_count: int | None = None
 	spatial_sizes: set[tuple[int, int]] = set()
@@ -252,7 +312,11 @@ def discover_multiple_datasets(config: Mapping[str, Any]) -> list[dict[str, Any]
 	for dataset_id, source_record in enumerate(data_dir_records):
 		data_dir = Path(source_record["data_dir"]).resolve()
 		if not data_dir.exists():
-			raise FileNotFoundError(f"Data directory does not exist: {data_dir}")
+			raise FileNotFoundError(
+				f"Data directory does not exist for discovered fire {source_record.get('dataset_name', data_dir.name)!r}: {data_dir}. "
+				"If this path came from fire_dataset_index.json, refresh the index with "
+				"'python scripts/discover_fire_datasets.py --main_data_dir /media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/'."
+			)
 		file_paths = discover_dataset_files(data_dir, file_pattern)
 		first_tensor = np.load(file_paths[0], mmap_mode="r", allow_pickle=False)
 		if first_tensor.ndim != 3:
@@ -281,11 +345,18 @@ def discover_multiple_datasets(config: Mapping[str, Any]) -> list[dict[str, Any]
 			"file_paths": file_paths,
 			"num_files": len(file_paths),
 			"raw_shape": raw_shape,
+			"geom_requires_transpose": bool(source_record.get("geom_requires_transpose", False)),
+			"geom_tensor_orientation": source_record.get("geom_tensor_orientation"),
 		}
 		if energy_enabled:
+			geometry_config = dict(config)
+			if bool(source_record.get("geom_requires_transpose", False)):
+				geometry_section = dict(geometry_config.get("geometry", {})) if isinstance(geometry_config.get("geometry"), Mapping) else {}
+				geometry_section["allow_area_transpose_if_needed"] = True
+				geometry_config["geometry"] = geometry_section
 			record["geometry"] = load_fire_geometry(
 				data_dir=data_dir,
-				config=config,
+				config=geometry_config,
 				geom_path=source_record.get("geom_path"),
 				terrain_path=source_record.get("terrain_path"),
 				expected_shape=(height, width),

@@ -138,6 +138,31 @@ class FireIndexGeometryTests(unittest.TestCase):
 		self.assertEqual(record["geom_tensor_orientation"], "transposed")
 		self.assertTrue(record["geom_requires_transpose"])
 
+	def test_discovery_finds_nested_keepz_sections(self) -> None:
+		fire_root = self.root / "LITTLEBEAR"
+		section_a = fire_root / "lbvaa" / "keepz_08"
+		section_b = fire_root / "lbvab" / "keepz_08"
+		section_a.mkdir(parents=True, exist_ok=True)
+		section_b.mkdir(parents=True, exist_ok=True)
+
+		for section, geom_name in ((section_a, "lbvaa.geom"), (section_b, "lbvab.geom")):
+			np.save(section / "tensor0000.npy", np.zeros((2, 3, 86), dtype=np.float32))
+			_write_fake_geom(
+				section / geom_name,
+				nx=3,
+				ny=2,
+				nz=1,
+				lons=[-120.0, -119.99, -119.98],
+				lats=[35.0, 35.01],
+			)
+
+		index = discover_fire_datasets(self.root, require_geom=True, require_terrain=False)
+		self.assertEqual(index["num_fires"], 2)
+		self.assertIn("LITTLEBEAR__lbvaa__keepz_08", index["fires"])
+		self.assertIn("LITTLEBEAR__lbvab__keepz_08", index["fires"])
+		self.assertEqual(Path(index["fires"]["LITTLEBEAR__lbvaa__keepz_08"]["data_dir"]).name, "keepz_08")
+		self.assertEqual(Path(index["fires"]["LITTLEBEAR__lbvab__keepz_08"]["data_dir"]).parent.name, "lbvab")
+
 	def test_parse_fake_geom(self) -> None:
 		fire_dir = self._make_fire("FIRE_GEOM", with_terrain=False)
 		info = parse_geom_file(fire_dir / "FIRE_GEOM.geom")

@@ -21,6 +21,16 @@ def _sorted_unique_directories(paths: Sequence[Path]) -> list[Path]:
 	return sorted({path.resolve() for path in paths})
 
 
+def _discover_keepz_directories(fire_root: Path, recursive: bool) -> list[Path]:
+	"""Find every keepz_08 directory beneath one fire root."""
+
+	if recursive:
+		keepz_dirs = [path for path in fire_root.rglob("keepz_08") if path.is_dir()]
+	else:
+		keepz_dirs = [path for path in fire_root.glob("keepz_08") if path.is_dir()]
+	return _sorted_unique_directories(keepz_dirs)
+
+
 def infer_raw_shape_from_first_npy(fire_dir: Path, file_pattern: str) -> list[int]:
 	"""Load only the first `.npy` file and infer its shape."""
 
@@ -67,16 +77,17 @@ def _match_geom_to_shape(
 def _resolve_fire_key(fire_root: Path, npy_dirs: Sequence[Path], npy_dir: Path) -> str:
 	"""Build a stable key for one discovered dataset entry."""
 
-	if len(npy_dirs) == 1:
+	relative_parts = npy_dir.resolve().relative_to(fire_root.resolve()).parts
+	if len(npy_dirs) == 1 and len(relative_parts) == 1:
 		return fire_root.name
-	return f"{fire_root.name}__{npy_dir.name}"
+	return "__".join((fire_root.name, *relative_parts))
 
 
 def discover_fire_datasets(
 	main_data_dir: Path,
 	fire_dir_glob: str = "*",
 	file_pattern: str = "*.npy",
-	recursive: bool = False,
+	recursive: bool = True,
 	require_npy_files: bool = True,
 	require_geom: bool = True,
 	require_terrain: bool = False,
@@ -93,12 +104,17 @@ def discover_fire_datasets(
 	records: dict[str, Any] = {}
 
 	for fire_root in fire_roots:
-		npy_dirs = _discover_candidate_npy_dirs(fire_root, file_pattern=file_pattern, recursive=recursive)
+		npy_dirs = _discover_keepz_directories(fire_root, recursive=recursive)
+		if not npy_dirs:
+			npy_dirs = _discover_candidate_npy_dirs(fire_root, file_pattern=file_pattern, recursive=recursive)
 		if not npy_dirs and require_npy_files:
 			continue
 
 		for npy_dir in npy_dirs:
-			npy_files = sorted(path for path in npy_dir.glob(file_pattern) if path.is_file())
+			if recursive:
+				npy_files = sorted(path for path in npy_dir.rglob(file_pattern) if path.is_file())
+			else:
+				npy_files = sorted(path for path in npy_dir.glob(file_pattern) if path.is_file())
 			if require_npy_files and not npy_files:
 				continue
 			geom_files = sorted(path for path in npy_dir.glob("*.geom") if path.is_file())

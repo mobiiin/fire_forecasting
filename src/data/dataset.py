@@ -29,11 +29,21 @@ from src.data.energy_release import (
 	transform_energy_target,
 )
 from src.data.geometry import load_fire_geometry
+from src.data.patching import (
+	extract_patch_array,
+	resolve_patching_config,
+	sample_active_patch,
+	sample_random_patch,
+	validate_patch_dict,
+)
 from src.data.preprocessing import load_normalization_stats, normalize_channel_map, normalize_tensor
 from src.data.splits import (
+	build_eval_patch_refs,
 	chronological_split_indices,
 	chronological_train_val_split_indices,
+	manual_fire_holdout_splits,
 	multi_dataset_chronological_splits,
+	multi_fire_chronological_splits,
 )
 
 
@@ -252,6 +262,20 @@ def _resolve_target_normalization_config(config: Mapping[str, Any]) -> dict[str,
 		"enabled": bool(section.get("enabled", section.get("normalize_target", False))),
 		"method": str(section.get("method", "zscore")).lower(),
 	}
+
+
+def _resolve_square_patch_size_from_config(config: Mapping[str, Any]) -> int:
+	"""Resolve one square patch size from patching config or legacy top-level keys."""
+
+	patching = resolve_patching_config(config)
+	patch_height = int(patching["patch_height"])
+	patch_width = int(patching["patch_width"])
+	if patch_height != patch_width:
+		raise ValueError(
+			"Current dataset classes require square patches. "
+			f"Got patch_height={patch_height}, patch_width={patch_width}."
+		)
+	return int(patch_height)
 
 
 def _count_fuel_flux_engineered_channels(config: Mapping[str, Any]) -> int:
@@ -1268,6 +1292,7 @@ class MultiFireSequenceDataset(FireSequenceDataset):
 		target_transform=None,
 		return_metadata: bool = False,
 		config: Mapping[str, Any] | None = None,
+		split: str = "train",
 	) -> None:
 		self.dataset_records = [
 			{
@@ -1298,6 +1323,7 @@ class MultiFireSequenceDataset(FireSequenceDataset):
 		self.transform = transform
 		self.target_transform = target_transform
 		self.return_metadata = bool(return_metadata)
+		self.split = str(split).lower()
 		self.config = dict(config) if isinstance(config, Mapping) else {
 			"task_type": self.task_type,
 			"target_channel": self.target_channel,
@@ -1368,10 +1394,19 @@ class MultiFireSequenceDataset(FireSequenceDataset):
 		self.input_channels_after_engineering = self.total_input_channels
 		self.engineered_feature_slices = resolve_engineered_feature_slices(self.config, self.base_input_channel_count)
 
-		self.sample_refs = [
-			{"dataset_id": int(ref["dataset_id"]), "sample_index": int(ref["sample_index"])}
-			for ref in sample_refs
-		]
+		self.patching_config = resolve_patching_config(self.config)
+		self.random_generator = np.random.default_rng()
+		self.sample_refs = []
+		for ref in sample_refs:
+			normalized_ref: dict[str, Any] = {
+				"dataset_id": int(ref["dataset_id"]),
+				"dataset_name": str(ref.get("dataset_name", "")),
+				"sample_index": int(ref["sample_index"]),
+				"fire_split_group": str(ref.get("fire_split_group", self.split)),
+			}
+			if ref.get("patch") is not None:
+				normalized_ref["patch"] = validate_patch_dict(ref["patch"])
+			self.sample_refs.append(normalized_ref)
 		for ref in self.sample_refs:
 			dataset_id = int(ref["dataset_id"])
 			if dataset_id < 0 or dataset_id >= len(self.dataset_records):
@@ -1384,6 +1419,21 @@ class MultiFireSequenceDataset(FireSequenceDataset):
 					f"Dataset={record['dataset_name']} valid range=[0, {max_valid_start}], "
 					f"got {ref['sample_index']}."
 				)
+			patch = ref.get("patch")
+			if patch is not None:
+				patch = validate_patch_dict(patch)
+				patch_height = int(patch["y1"] - patch["y0"])
+				patch_width = int(patch["x1"] - patch["x0"])
+				record_height, record_width = tuple(int(value) for value in record["raw_shape"][:2])
+				if patch_height != self.patch_size or patch_width != self.patch_size:
+					raise ValueError(
+						f"Explicit patch size must match dataset patch_size={self.patch_size}. Got patch={patch}."
+					)
+				if patch["y0"] < 0 or patch["x0"] < 0 or patch["y1"] > record_height or patch["x1"] > record_width:
+					raise ValueError(
+						f"Explicit patch {patch} is out of bounds for dataset {record['dataset_name']} "
+						f"with raw shape {record['raw_shape']}."
+					)
 
 		self.normalization_stats = FireSequenceDataset._coerce_normalization_stats(self, normalization_stats)
 		self.target_mean, self.target_std = FireSequenceDataset._resolve_target_normalization_stats(self)
@@ -1399,9 +1449,14 @@ class MultiFireSequenceDataset(FireSequenceDataset):
 				geometry = dict(record.get("geometry", {})) if isinstance(record.get("geometry"), Mapping) else {}
 				if not geometry:
 					height, width = tuple(int(value) for value in record["raw_shape"][:2])
+					geometry_config = dict(self.config)
+					if bool(record.get("geom_requires_transpose", False)):
+						geometry_section = dict(geometry_config.get("geometry", {})) if isinstance(geometry_config.get("geometry"), Mapping) else {}
+						geometry_section["allow_area_transpose_if_needed"] = True
+						geometry_config["geometry"] = geometry_section
 					geometry = load_fire_geometry(
 						data_dir=Path(record["data_dir"]),
-						config=self.config,
+						config=geometry_config,
 						expected_shape=(height, width),
 					)
 				self.energy_geometries[dataset_id] = geometry
@@ -1427,6 +1482,83 @@ class MultiFireSequenceDataset(FireSequenceDataset):
 				f"Inconsistent tensor shape in {file_path}. "
 				f"Expected {expected_shape}, got {tuple(int(dimension) for dimension in tensor.shape)}."
 			)
+
+	def _build_activity_map_for_patching(self, target_array: np.ndarray) -> np.ndarray:
+		"""Build the 2D activity map used for active patch sampling."""
+
+		if self.task_type != "multitask":
+			return np.asarray(target_array, dtype=np.float32)
+
+		active_source = str(self.patching_config["active_source"])
+		if active_source == "mask":
+			return np.asarray(target_array[2], dtype=np.float32)
+		if active_source == "step_consumed_fuel":
+			return np.maximum(np.asarray(target_array[0], dtype=np.float32), np.asarray(target_array[1], dtype=np.float32))
+		if active_source == "energy_release" and target_array.shape[0] > 3:
+			energy_map = np.asarray(target_array[3], dtype=np.float32)
+			energy_threshold = float(
+				transform_energy_target(
+					np.asarray([[self.patching_config["energy_active_threshold_MW"]]], dtype=np.float32),
+					self.config,
+				)[0, 0]
+			)
+			return (energy_map > energy_threshold).astype(np.float32, copy=False)
+		if active_source == "combined_target":
+			combined = np.asarray(target_array[2], dtype=np.float32).copy()
+			consumed_threshold = float(self.patching_config["consumed_active_threshold"])
+			combined = np.maximum(
+				combined,
+				(np.asarray(target_array[0], dtype=np.float32) > consumed_threshold).astype(np.float32, copy=False),
+			)
+			combined = np.maximum(
+				combined,
+				(np.asarray(target_array[1], dtype=np.float32) > consumed_threshold).astype(np.float32, copy=False),
+			)
+			if target_array.shape[0] > 3:
+				energy_threshold = float(
+					transform_energy_target(
+						np.asarray([[self.patching_config["energy_active_threshold_MW"]]], dtype=np.float32),
+						self.config,
+					)[0, 0]
+				)
+				combined = np.maximum(
+					combined,
+					(np.asarray(target_array[3], dtype=np.float32) > energy_threshold).astype(np.float32, copy=False),
+				)
+			return combined.astype(np.float32, copy=False)
+		return np.asarray(target_array[2], dtype=np.float32)
+
+	def _select_patch_for_ref(self, ref: Mapping[str, Any], target_array: np.ndarray, dataset_record: Mapping[str, Any]) -> dict[str, int] | None:
+		"""Resolve either an explicit patch or a sampled train-time patch."""
+
+		explicit_patch = ref.get("patch")
+		if explicit_patch is not None:
+			return validate_patch_dict(explicit_patch)
+		if not self.use_patches:
+			return None
+
+		height, width = tuple(int(value) for value in dataset_record["raw_shape"][:2])
+		activity_map = self._build_activity_map_for_patching(target_array)
+		active_patch = sample_active_patch(
+			activity_map=(activity_map > 0).astype(np.float32, copy=False),
+			patch_h=self.patch_size,
+			patch_w=self.patch_size,
+			rng=self.random_generator,
+			min_active_pixels=int(self.patching_config["min_active_pixels"]),
+			center_on_active_pixel=bool(self.patching_config["center_on_active_pixel"]),
+			jitter_active_center=bool(self.patching_config["jitter_active_center"]),
+			max_center_jitter_pixels=int(self.patching_config["max_center_jitter_pixels"]),
+		)
+		active_probability = float(self.patching_config["active_patch_probability"])
+		if active_patch is not None and self.random_generator.random() < active_probability:
+			return active_patch
+		return sample_random_patch(
+			height=height,
+			width=width,
+			patch_h=self.patch_size,
+			patch_w=self.patch_size,
+			rng=self.random_generator,
+		)
 
 	def __getitem__(self, index: int):
 		if torch is None:
@@ -1475,7 +1607,6 @@ class MultiFireSequenceDataset(FireSequenceDataset):
 			target_array = raw_target_array.copy()
 			if self.task_type == "segmentation":
 				target_array = (target_array > self.fire_threshold).astype(np.float32, copy=False)
-			target_map_for_sampling = raw_target_array
 
 		stacked_inputs = np.stack(base_input_frames, axis=0).astype(np.float32, copy=False)
 		engineered_inputs = build_engineered_features(
@@ -1497,17 +1628,16 @@ class MultiFireSequenceDataset(FireSequenceDataset):
 		if engineered_inputs.shape[-1] > 0:
 			stacked_inputs = np.concatenate([stacked_inputs, engineered_inputs], axis=-1)
 
-		patch_top = None
-		patch_left = None
-		if self.use_patches:
-			patch_top, patch_left = FireSequenceDataset._sample_patch_origin(self, target_map_for_sampling)
-			patch_bottom = patch_top + self.patch_size
-			patch_right = patch_left + self.patch_size
-			stacked_inputs = stacked_inputs[:, patch_top:patch_bottom, patch_left:patch_right, :]
+		resolved_patch = self._select_patch_for_ref(ref, target_array, dataset_record)
+		if resolved_patch is not None:
+			stacked_inputs = extract_patch_array(stacked_inputs, resolved_patch)
 			if self.task_type == "multitask":
-				target_array = target_array[:, patch_top:patch_bottom, patch_left:patch_right]
+				target_array = np.transpose(
+					extract_patch_array(np.transpose(target_array, (1, 2, 0)), resolved_patch),
+					(2, 0, 1),
+				)
 			else:
-				target_array = target_array[patch_top:patch_bottom, patch_left:patch_right]
+				target_array = extract_patch_array(target_array, resolved_patch)
 
 		stacked_inputs = FireSequenceDataset._normalize_inputs(self, stacked_inputs)
 		target_array = FireSequenceDataset._normalize_target(self, target_array)
@@ -1552,9 +1682,14 @@ class MultiFireSequenceDataset(FireSequenceDataset):
 				"engineered_channel_count": int(self.engineered_channel_count),
 				"total_input_channels": int(self.total_input_channels),
 			}
-			if self.use_patches:
-				metadata["patch_top"] = int(patch_top)
-				metadata["patch_left"] = int(patch_left)
+			metadata["split"] = self.split
+			metadata["fire_split_group"] = str(ref.get("fire_split_group", self.split))
+			if resolved_patch is not None:
+				metadata["patch"] = dict(resolved_patch)
+				metadata["patch_top"] = int(resolved_patch["y0"])
+				metadata["patch_left"] = int(resolved_patch["x0"])
+				metadata["patch_bottom"] = int(resolved_patch["y1"])
+				metadata["patch_right"] = int(resolved_patch["x1"])
 				metadata["patch_size"] = int(self.patch_size)
 			if energy_geometry is not None and self.task_type == "multitask" and target_array.shape[0] > 3:
 				energy_target_raw = compute_energy_release_maps(
@@ -1562,8 +1697,8 @@ class MultiFireSequenceDataset(FireSequenceDataset):
 					config=self.config,
 					area_2d_m2=np.asarray(energy_geometry["area_2d_m2"], dtype=np.float32),
 				)["energy_release_total_MW"]
-				if self.use_patches:
-					energy_target_raw = energy_target_raw[patch_top:patch_top + self.patch_size, patch_left:patch_left + self.patch_size]
+				if resolved_patch is not None:
+					energy_target_raw = extract_patch_array(energy_target_raw, resolved_patch)
 				metadata["geom_path"] = str(energy_geometry["geom_path"])
 				metadata["terrain_path"] = str(energy_geometry["terrain_path"]) if energy_geometry["terrain_path"] is not None else None
 				metadata["dy_m"] = float(energy_geometry["dy_m"])
@@ -1580,6 +1715,10 @@ class MultiFireSequenceDataset(FireSequenceDataset):
 			return x_tensor, y_tensor, metadata
 
 		return x_tensor, y_tensor
+
+
+class MultiFirePatchSequenceDataset(MultiFireSequenceDataset):
+	"""Backward-compatible explicit name for the multi-fire patch-aware dataset."""
 
 
 def create_dataloaders(config):
@@ -1605,14 +1744,18 @@ def create_dataloaders(config):
 	if input_channel_count <= 0:
 		raise KeyError("Config must define a positive input_channel_count or model.input_channels.")
 	split_mode = str(config.get("split_mode", "train_val_test")).lower()
+	if split_mode == "multi_dataset_chronological":
+		split_mode = "multi_fire_chronological"
 	train_fraction = float(config.get("train_fraction", 0.7))
 	val_fraction = float(config.get("val_fraction", 0.15))
 	test_fraction = float(config.get("test_fraction", 0.15))
 
 	task_type = str(config.get("task_type", _get_section(config, "training").get("task_type", "regression"))).lower()
 	target_normalization = _resolve_target_normalization_config(config)
-	use_train_patches = bool(config.get("use_patches", False))
-	use_eval_patches = bool(config.get("use_patches_for_eval", False))
+	patching_config = resolve_patching_config(config)
+	patch_size = _resolve_square_patch_size_from_config(config)
+	use_train_patches = bool(patching_config["enabled"])
+	use_eval_patches = bool(patching_config["enabled"] and patching_config["eval_mode"] == "sliding_window")
 	return_metadata_for_multi = True
 
 	normalization_stats = None
@@ -1623,21 +1766,33 @@ def create_dataloaders(config):
 		if resolved_normalization_path.exists():
 			normalization_stats = resolved_normalization_path
 
-	if split_mode == "multi_dataset_chronological":
+	if split_mode in {"multi_fire_chronological", "manual_fire_holdout"}:
 		data_dirs = resolve_data_dirs(config)
 		if "data_dirs" in config and config.get("data_dirs"):
 			print(f"Using data_dirs mode with {len(data_dirs)} datasets.")
 		else:
 			print("Using legacy data_dir fallback as a single-item data_dirs list.")
 		dataset_records = discover_multiple_datasets(config)
-		sample_refs = multi_dataset_chronological_splits(
-			dataset_records=dataset_records,
-			input_sequence_length=input_sequence_length,
-			prediction_horizon=prediction_horizon,
-			train_fraction=train_fraction,
-			val_fraction=val_fraction,
-			test_fraction=test_fraction,
-		)
+		if split_mode == "manual_fire_holdout":
+			manual_section = _get_section(config, "manual_fire_split")
+			sample_refs = manual_fire_holdout_splits(
+				dataset_records=dataset_records,
+				train_fire_names=manual_section.get("train_fires", []),
+				val_fire_names=manual_section.get("val_fires", []),
+				test_fire_names=manual_section.get("test_fires", []),
+				input_sequence_length=input_sequence_length,
+				prediction_horizon=prediction_horizon,
+				config=config,
+			)
+		else:
+			sample_refs = multi_fire_chronological_splits(
+				dataset_records=dataset_records,
+				input_sequence_length=input_sequence_length,
+				prediction_horizon=prediction_horizon,
+				train_fraction=train_fraction,
+				val_fraction=val_fraction,
+				test_fraction=test_fraction,
+			)
 		normalization_stats = None
 		normalization_config = _get_section(config, "normalization")
 		normalization_path = normalization_config.get("path")
@@ -1655,17 +1810,37 @@ def create_dataloaders(config):
 			"input_channel_indices": config.get("input_channel_indices"),
 			"task_type": task_type,
 			"fire_threshold": float(config.get("fire_threshold", _get_section(config, "training").get("fire_threshold", 0.5))),
-			"patch_size": int(config.get("patch_size", 64)),
-			"active_patch_probability": float(config.get("active_patch_probability", 0.7)),
+			"patch_size": int(patch_size),
+			"active_patch_probability": float(patching_config["active_patch_probability"]),
 			"active_threshold": float(config.get("active_threshold", config.get("fire_threshold", 0.5))),
 			"normalization_stats": normalization_stats,
 			"normalize_target": bool(target_normalization["enabled"]),
 			"return_metadata": return_metadata_for_multi,
 			"config": config,
 		}
-		train_dataset = MultiFireSequenceDataset(sample_refs=sample_refs["train"], use_patches=use_train_patches, **common_multi_kwargs)
-		val_dataset = MultiFireSequenceDataset(sample_refs=sample_refs["val"], use_patches=use_eval_patches, **common_multi_kwargs)
-		test_dataset = MultiFireSequenceDataset(sample_refs=sample_refs["test"], use_patches=use_eval_patches, **common_multi_kwargs)
+		val_refs = sample_refs["val"]
+		test_refs = sample_refs["test"]
+		if use_eval_patches:
+			val_refs = build_eval_patch_refs(dataset_records=dataset_records, sample_refs=val_refs, config=config, split_name="val")
+			test_refs = build_eval_patch_refs(dataset_records=dataset_records, sample_refs=test_refs, config=config, split_name="test")
+		train_dataset = MultiFirePatchSequenceDataset(
+			sample_refs=sample_refs["train"],
+			use_patches=use_train_patches,
+			split="train",
+			**common_multi_kwargs,
+		)
+		val_dataset = MultiFirePatchSequenceDataset(
+			sample_refs=val_refs,
+			use_patches=use_eval_patches,
+			split="val",
+			**common_multi_kwargs,
+		)
+		test_dataset = MultiFirePatchSequenceDataset(
+			sample_refs=test_refs,
+			use_patches=use_eval_patches,
+			split="test",
+			**common_multi_kwargs,
+		)
 
 		batch_size = int(config.get("batch_size", 4))
 		num_workers = int(config.get("num_workers", 0))
@@ -1673,7 +1848,7 @@ def create_dataloaders(config):
 		dataset_sampling = _get_section(config, "dataset_sampling")
 		if bool(dataset_sampling.get("enabled", False)):
 			sampling_mode = str(dataset_sampling.get("mode", "uniform_samples")).lower()
-			if sampling_mode == "balanced_by_dataset":
+			if sampling_mode in {"balanced_by_dataset", "balanced_by_fire"}:
 				if WeightedRandomSampler is None:
 					print("WARNING: WeightedRandomSampler is unavailable; falling back to normal shuffled training.")
 				else:
@@ -1682,10 +1857,15 @@ def create_dataloaders(config):
 						dataset_id = int(ref["dataset_id"])
 						counts_by_dataset[dataset_id] = counts_by_dataset.get(dataset_id, 0) + 1
 					weights = [1.0 / counts_by_dataset[int(ref["dataset_id"])] for ref in train_dataset.sample_refs]
+					for dataset_id, count in sorted(counts_by_dataset.items()):
+						print(
+							f"Train fire sampling weight | dataset={train_dataset.dataset_records[dataset_id]['dataset_name']} "
+							f"samples={count} weight={1.0 / count:.6f}"
+						)
 					sampler = WeightedRandomSampler(weights=weights, num_samples=len(weights), replacement=True)
 			elif sampling_mode != "uniform_samples":
 				print(
-					"WARNING: Unsupported dataset_sampling.mode for multi_dataset_chronological; "
+					"WARNING: Unsupported dataset_sampling.mode for multi-fire loading; "
 					f"falling back to normal shuffle: {sampling_mode!r}"
 				)
 
@@ -1750,8 +1930,8 @@ def create_dataloaders(config):
 		"input_channel_indices": config.get("input_channel_indices"),
 		"task_type": task_type,
 		"fire_threshold": float(config.get("fire_threshold", _get_section(config, "training").get("fire_threshold", 0.5))),
-		"patch_size": int(config.get("patch_size", 64)),
-		"active_patch_probability": float(config.get("active_patch_probability", 0.7)),
+		"patch_size": int(patch_size),
+		"active_patch_probability": float(patching_config["active_patch_probability"]),
 		"active_threshold": float(config.get("active_threshold", config.get("fire_threshold", 0.5))),
 		"normalization_stats": normalization_stats,
 		"normalize_target": bool(target_normalization["enabled"]),

@@ -11,15 +11,19 @@ from src.config import load_config
 from src.data.discovery import discover_dataset_files, discover_multiple_datasets
 from src.data.dataset import (
 	FireSequenceDataset,
+	MultiFirePatchSequenceDataset,
 	MultiFireSequenceDataset,
 	_count_fuel_flux_engineered_channels,
 	count_atmospheric_engineered_channels,
 )
+from src.data.patching import resolve_patching_config
 from src.data.splits import (
+	manual_fire_holdout_splits,
 	chronological_split_indices,
 	chronological_train_val_split_indices,
 	chronological_split_indices_for_dataset,
 	multi_dataset_chronological_splits,
+	multi_fire_chronological_splits,
 )
 
 
@@ -87,21 +91,42 @@ def main() -> None:
 		raise KeyError("Config is missing normalization.path.")
 
 	split_mode = str(config.get("split_mode", "train_val_test")).lower()
+	if split_mode == "multi_dataset_chronological":
+		split_mode = "multi_fire_chronological"
 	train_fraction = float(config["train_fraction"])
 	val_fraction = float(config["val_fraction"])
 	test_fraction = float(config.get("test_fraction", 0.0))
 	file_pattern = str(config["file_pattern"])
-	if split_mode == "multi_dataset_chronological":
-		dataset_records = discover_multiple_datasets(config)
-		sample_refs = multi_dataset_chronological_splits(
-			dataset_records=dataset_records,
-			input_sequence_length=int(config["input_sequence_length"]),
-			prediction_horizon=int(config["prediction_horizon"]),
-			train_fraction=train_fraction,
-			val_fraction=val_fraction,
-			test_fraction=test_fraction,
+	patching_config = resolve_patching_config(config)
+	patch_size = int(patching_config["patch_height"])
+	if patch_size != int(patching_config["patch_width"]):
+		raise ValueError(
+			"compute_normalization currently requires square patches. "
+			f"Got patch_height={patching_config['patch_height']} patch_width={patching_config['patch_width']}."
 		)
-		train_dataset = MultiFireSequenceDataset(
+	if split_mode in {"multi_fire_chronological", "manual_fire_holdout"}:
+		dataset_records = discover_multiple_datasets(config)
+		if split_mode == "manual_fire_holdout":
+			manual_section = config.get("manual_fire_split", {}) if isinstance(config.get("manual_fire_split"), dict) else {}
+			sample_refs = manual_fire_holdout_splits(
+				dataset_records=dataset_records,
+				train_fire_names=manual_section.get("train_fires", []),
+				val_fire_names=manual_section.get("val_fires", []),
+				test_fire_names=manual_section.get("test_fires", []),
+				input_sequence_length=int(config["input_sequence_length"]),
+				prediction_horizon=int(config["prediction_horizon"]),
+				config=config,
+			)
+		else:
+			sample_refs = multi_fire_chronological_splits(
+				dataset_records=dataset_records,
+				input_sequence_length=int(config["input_sequence_length"]),
+				prediction_horizon=int(config["prediction_horizon"]),
+				train_fraction=train_fraction,
+				val_fraction=val_fraction,
+				test_fraction=test_fraction,
+			)
+		train_dataset = MultiFirePatchSequenceDataset(
 			dataset_records=dataset_records,
 			sample_refs=sample_refs["train"],
 			input_sequence_length=int(config["input_sequence_length"]),
@@ -111,30 +136,23 @@ def main() -> None:
 			input_channel_indices=config.get("input_channel_indices"),
 			task_type=str(config.get("task_type", config.get("training", {}).get("task_type", "regression"))),
 			fire_threshold=float(config.get("fire_threshold", config.get("training", {}).get("fire_threshold", 0.5))),
-			use_patches=False,
-			patch_size=int(config.get("patch_size", 64)),
-			active_patch_probability=float(config.get("active_patch_probability", 0.7)),
+			use_patches=bool(patching_config["enabled"]),
+			patch_size=patch_size,
+			active_patch_probability=float(patching_config["active_patch_probability"]),
 			active_threshold=float(config.get("active_threshold", config.get("fire_threshold", 0.5))),
 			normalization_stats=None,
 			normalize_target=False,
 			config=config,
+			split="train",
 		)
 		per_dataset_train_counts: dict[str, int] = {}
 		per_dataset_val_counts: dict[str, int] = {}
 		per_dataset_test_counts: dict[str, int] = {}
 		for dataset_record in dataset_records:
 			dataset_name = str(dataset_record["dataset_name"])
-			dataset_splits = chronological_split_indices_for_dataset(
-				num_timesteps=int(dataset_record["num_files"]),
-				input_sequence_length=int(config["input_sequence_length"]),
-				prediction_horizon=int(config["prediction_horizon"]),
-				train_fraction=train_fraction,
-				val_fraction=val_fraction,
-				test_fraction=test_fraction,
-			)
-			per_dataset_train_counts[dataset_name] = len(dataset_splits["train"])
-			per_dataset_val_counts[dataset_name] = len(dataset_splits["val"])
-			per_dataset_test_counts[dataset_name] = len(dataset_splits["test"])
+			per_dataset_train_counts[dataset_name] = sum(1 for ref in sample_refs["train"] if str(ref["dataset_name"]) == dataset_name)
+			per_dataset_val_counts[dataset_name] = sum(1 for ref in sample_refs["val"] if str(ref["dataset_name"]) == dataset_name)
+			per_dataset_test_counts[dataset_name] = sum(1 for ref in sample_refs["test"] if str(ref["dataset_name"]) == dataset_name)
 		splits = {
 			"train": sample_refs["train"],
 			"val": sample_refs["val"],
@@ -180,8 +198,8 @@ def main() -> None:
 			task_type=str(config.get("task_type", config.get("training", {}).get("task_type", "regression"))),
 			fire_threshold=float(config.get("fire_threshold", config.get("training", {}).get("fire_threshold", 0.5))),
 			use_patches=False,
-			patch_size=int(config.get("patch_size", 64)),
-			active_patch_probability=float(config.get("active_patch_probability", 0.7)),
+			patch_size=patch_size,
+			active_patch_probability=float(patching_config["active_patch_probability"]),
 			active_threshold=float(config.get("active_threshold", config.get("fire_threshold", 0.5))),
 			normalization_stats=None,
 			normalize_target=False,
@@ -292,11 +310,11 @@ def main() -> None:
 	atmospheric_engineered_channel_count = count_atmospheric_engineered_channels(config)
 	print(f"C: {channel_mean.shape[0]}")
 	print(f"split mode: {split_mode}")
-	if split_mode == "multi_dataset_chronological":
+	if split_mode in {"multi_fire_chronological", "manual_fire_holdout"}:
 		print(f"number of datasets: {len(dataset_records)}")
 		for dataset_name, train_count in per_dataset_train_counts.items():
 			print(
-				f"dataset {dataset_name}: train={train_count} "
+				f"dataset {dataset_name}: normalization_train={train_count} "
 				f"val={per_dataset_val_counts.get(dataset_name, 0)} "
 				f"test={per_dataset_test_counts.get(dataset_name, 0)}"
 			)
