@@ -71,26 +71,42 @@ manual_fire_split:
   # These defaults are examples and should be updated to match the fires currently available in your mounted dataset tree.
   train_fires:
     - ARCHIECREEK
+    - CALWOOD
     - CAMP
     - CARR_FIRENADO
     - CARR_GROWTHDAY
     - CHIMNEYTOPS2
     - CREEK
-    - GLASS
-    - HOLIDAYFARM
-    - MARSHALL
-    - NORTHCOMPLX
-    - PARKCTY_HYPOTHETICAL
-    - SPRINGS
-  val_fires:
-    - MCKINNEY
-    - MOSQUITO
-    - REDWOODVALLEY
-  test_fires:
-    - CALWOOD
-    - EASTTROUBLESOME
     - ESPERANZA
+    - KING__period1__keepz_08
+    - KING__period2__keepz_08
+    - KING__period3__keepz_08
+    - MARSHALL
+    - MOSQUITO
+    - NORTHCOMPLX
+    - RIM__0820__keepz_08
+    - RIM__0822__keepz_08
     - SLATER
+    - THOMAS__1204__keepz_08
+    - THOMAS__1208__keepz_08
+    - THOMAS__1209__keepz_08
+    - THOMAS__1210__keepz_08
+
+  val_fires:
+    - EASTTROUBLESOME
+    - LITTLEBEAR__lbvaa__keepz_08
+    - LITTLEBEAR__lbvab__keepz_08
+    - LITTLEBEAR__lbvac__keepz_08
+    - PARKCTY_HYPOTHETICAL
+    - Tubbs
+    - WITCHCREEK
+
+  test_fires:
+    - MCKINNEY
+    - TRUCKEE_HYPOTHETICAL
+    - TUOLUMNE_65
+    - WOOLSEY
+    - YUBA_HYPOTHETICAL
 
   use_full_fire_for_split: true
   within_fire_train_fraction: 1.0

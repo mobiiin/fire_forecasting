@@ -124,7 +124,7 @@ python scripts/discover_fire_datasets.py --main_data_dir /media/mhabibp/Elements
 The resulting `fire_dataset_index.json` is written to the project root by default and is used to pair processed `.npy` folders with the matching geometry source. If energy release is enabled, old 3-channel checkpoints are incompatible with the 4-channel model head and must not be reused without retraining.
 
 ## Manual Fire Splits
-For cross-fire generalization experiments, the project now supports assigning whole fires to train, validation, and test with `split_mode: manual_fire_holdout` in [configs/default.yaml](/media/mhabibp/Elements/Mobin_CPS_files/nosolar_actualNIROPS_asc_1of2_081214/fire_forecasting/configs/default.yaml:1). In this mode, `manual_fire_split.train_fires`, `val_fires`, and `test_fires` must match keys in `fire_dataset_index.json`, and validation/test fires are completely held out from training and normalization.
+For cross-fire generalization experiments, the project now supports assigning whole fires to train, validation, and test with `split_mode: manual_fire_holdout` in [configs/default.yaml]. In this mode, `manual_fire_split.train_fires`, `val_fires`, and `test_fires` must match keys in `fire_dataset_index.json`, and validation/test fires are completely held out from training and normalization.
 
 Recommended workflow:
 
