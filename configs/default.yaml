@@ -4,7 +4,9 @@
 
 # Main dataset directories used for training/validation/test in multi-dataset mode.
 # Options: a non-empty list of relative or absolute directory paths containing one .npy file per timestamp.
-main_data_dir: /media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/
+
+# main_data_dir: /media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/
+main_data_dir: /project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE
 
 fire_dataset_index_json: ../fire_dataset_index.json
 
@@ -91,6 +93,8 @@ manual_fire_split:
     - THOMAS__1208__keepz_08
     - THOMAS__1209__keepz_08
     - THOMAS__1210__keepz_08
+    - REDWOODVALLEY
+    - GLASS
 
   val_fires:
     - EASTTROUBLESOME
@@ -106,6 +110,7 @@ manual_fire_split:
     - TRUCKEE_HYPOTHETICAL
     - TUOLUMNE_65
     - WOOLSEY
+    - SPRINGS
     - YUBA_HYPOTHETICAL
 
   use_full_fire_for_split: true

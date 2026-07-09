@@ -12,11 +12,12 @@ from typing import List, Sequence, Tuple
 import numpy as np
 
 from src.config import load_config
-from src.data.discovery import discover_multiple_datasets, resolve_data_dirs
+from src.data.discovery import discover_multiple_datasets
 from src.data.splits import (
     chronological_split_indices,
     chronological_train_val_split_indices,
-    multi_dataset_chronological_splits,
+    manual_fire_holdout_splits,
+    multi_fire_chronological_splits,
 )
 
 
@@ -421,14 +422,34 @@ def report_multi_dataset_split_sample_counts(config: dict) -> None:
             f"    files={dataset_record['num_files']} raw_shape={dataset_record['raw_shape']}"
         )
 
-    splits = multi_dataset_chronological_splits(
-        dataset_records=dataset_records,
-        input_sequence_length=int(config["input_sequence_length"]),
-        prediction_horizon=int(config["prediction_horizon"]),
-        train_fraction=float(config["train_fraction"]),
-        val_fraction=float(config["val_fraction"]),
-        test_fraction=float(config["test_fraction"]),
-    )
+    split_mode = str(config.get("split_mode", "train_val_test")).lower()
+    if split_mode == "multi_dataset_chronological":
+        split_mode = "multi_fire_chronological"
+
+    if split_mode == "manual_fire_holdout":
+        manual_section = (
+            config.get("manual_fire_split", {})
+            if isinstance(config.get("manual_fire_split"), dict)
+            else {}
+        )
+        splits = manual_fire_holdout_splits(
+            dataset_records=dataset_records,
+            train_fire_names=manual_section.get("train_fires", []),
+            val_fire_names=manual_section.get("val_fires", []),
+            test_fire_names=manual_section.get("test_fires", []),
+            input_sequence_length=int(config["input_sequence_length"]),
+            prediction_horizon=int(config["prediction_horizon"]),
+            config=config,
+        )
+    else:
+        splits = multi_fire_chronological_splits(
+            dataset_records=dataset_records,
+            input_sequence_length=int(config["input_sequence_length"]),
+            prediction_horizon=int(config["prediction_horizon"]),
+            train_fraction=float(config["train_fraction"]),
+            val_fraction=float(config["val_fraction"]),
+            test_fraction=float(config["test_fraction"]),
+        )
 
     print("combined totals:")
     print(f"  train samples: {len(splits['train'])}")
@@ -471,14 +492,19 @@ def main() -> None:
         raise KeyError("Config is missing required key 'file_pattern'.")
 
     split_mode = str(config.get("split_mode", "train_val_test")).lower()
-    if split_mode == "multi_dataset_chronological":
-        resolve_data_dirs(config)
+    if split_mode in {
+        "manual_fire_holdout",
+        "multi_fire_chronological",
+        "multi_dataset_chronological",
+    }:
         report_multi_dataset_split_sample_counts(config)
         return
 
-    if "data_dir" not in config:
-        raise KeyError("Config is missing required key 'data_dir'.")
-    configured_data_dir = str(config["data_dir"])
+    # Use main_data_dir if data_dir is not set, for compatibility with multi-dataset configs
+    data_dir_config = config.get("data_dir") or config.get("main_data_dir")
+    if not data_dir_config:
+        raise KeyError("Config is missing required key 'data_dir' or 'main_data_dir'.")
+    configured_data_dir = str(data_dir_config)
     data_dir = resolve_path(config_path, args.data_dir or configured_data_dir)
     file_pattern = str(config["file_pattern"])
 
