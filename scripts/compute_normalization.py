@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import Any, Mapping
 
 import numpy as np
 
@@ -71,7 +72,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 	parser = argparse.ArgumentParser(description="Compute normalization statistics.")
 	parser.add_argument("--config", type=str, default="configs/default.yaml", help="Path to the YAML configuration file.")
+	parser.add_argument("--from_cache", action="store_true", help="Compute stats from the precomputed train patch cache.")
 	return parser
+
+
+def _save_stats(
+	config_path: Path,
+	normalization_config: Mapping[str, Any],
+	stats: dict[str, np.ndarray],
+) -> Path:
+	"""Save normalization stats to the configured archive path."""
+
+	output_path = _resolve_path(config_path, normalization_config["path"])
+	output_path.parent.mkdir(parents=True, exist_ok=True)
+	np.savez_compressed(output_path, **stats)
+	return output_path
 
 
 def main() -> None:
@@ -89,6 +104,88 @@ def main() -> None:
 	normalization_config = dict(config.get("normalization", {}))
 	if "path" not in normalization_config:
 		raise KeyError("Config is missing normalization.path.")
+
+	compute_from_cache = bool(args.from_cache or normalization_config.get("compute_from_patch_cache", False))
+	if compute_from_cache:
+		from src.data.cache import get_patch_cache_dir, validate_patch_cache
+		from src.data.cached_patch_dataset import CachedPatchDataset
+
+		cache_config = dict(config.get("cache", {})) if isinstance(config.get("cache"), dict) else {}
+		if bool(cache_config.get("save_normalized_inputs", False)):
+			raise ValueError(
+				"Cannot compute raw input normalization from cache because cache.save_normalized_inputs=true. "
+				"Use an unnormalized train patch cache or keep the existing stats file."
+			)
+		validate_patch_cache(config, split="train")
+		train_dataset = CachedPatchDataset(
+			cache_dir=get_patch_cache_dir(config),
+			split="train",
+			config=config,
+			normalization_stats=None,
+			return_metadata=False,
+		)
+		first_x_tensor, _ = train_dataset[0][:2]
+		actual_input_channel_count = int(first_x_tensor.shape[1])
+		configured_model_input_channels = int(config.get("model", {}).get("input_channels", actual_input_channel_count))
+		if configured_model_input_channels != actual_input_channel_count:
+			raise ValueError(
+				"model.input_channels does not match the cached train patch input width. "
+				f"Configured model.input_channels={configured_model_input_channels}, cached channels={actual_input_channel_count}."
+			)
+
+		count = 0
+		mean = None
+		m2 = None
+		channel_min = None
+		channel_max = None
+		for sample_index in range(len(train_dataset)):
+			x_tensor, _ = train_dataset[sample_index][:2]
+			x_array = x_tensor.detach().cpu().numpy().transpose(0, 2, 3, 1)
+			count, mean, m2, channel_min, channel_max = _update_running_stats(
+				x_array,
+				count,
+				mean,
+				m2,
+				channel_min,
+				channel_max,
+			)
+			if (sample_index + 1) % 500 == 0:
+				print(f"cache normalization: processed {sample_index + 1}/{len(train_dataset)} train patches")
+
+		if mean is None or m2 is None or channel_min is None or channel_max is None:
+			raise ValueError("Failed to compute any input normalization statistics from the patch cache.")
+		eps = float(normalization_config.get("epsilon", 1e-6))
+		variance = m2 / max(count, 1)
+		std = np.sqrt(np.maximum(variance, 0.0))
+		std = np.maximum(std, eps)
+		stats: dict[str, np.ndarray] = {
+			"mean": mean.astype(np.float32),
+			"std": std.astype(np.float32),
+			"min": channel_min.astype(np.float32),
+			"max": channel_max.astype(np.float32),
+			"input_channel_count": np.asarray(train_dataset.total_input_channels, dtype=np.int64),
+			"base_input_channel_count": np.asarray(train_dataset.base_input_channel_count, dtype=np.int64),
+			"fuel_flux_engineered_channel_count": np.asarray(train_dataset.fuel_flux_engineered_channel_count, dtype=np.int64),
+			"atmospheric_engineered_channel_count": np.asarray(train_dataset.atmospheric_engineered_channel_count, dtype=np.int64),
+			"engineered_channel_count": np.asarray(train_dataset.engineered_channel_count, dtype=np.int64),
+		}
+		output_path = _save_stats(config_path, normalization_config, stats)
+		channel_mean = stats["mean"]
+		channel_std = stats["std"]
+		near_zero_std = int(np.sum(channel_std <= max(eps, 1e-6) * 10.0))
+		print(f"C: {channel_mean.shape[0]}")
+		print("split mode: patch_cache")
+		print(f"train patches used for normalization: {len(train_dataset)}")
+		print(f"raw/base input channels: {train_dataset.base_input_channel_count}")
+		print(f"fuel/flux engineered channels: {train_dataset.fuel_flux_engineered_channel_count}")
+		print(f"atmospheric engineered channels: {train_dataset.atmospheric_engineered_channel_count}")
+		print(f"total model input channels: {train_dataset.total_input_channels}")
+		print(f"saved stats shape: mean={channel_mean.shape} std={channel_std.shape}")
+		print(f"global channel mean range: {channel_mean.min():.6g} to {channel_mean.max():.6g}")
+		print(f"global channel std range: {channel_std.min():.6g} to {channel_std.max():.6g}")
+		print(f"channels with near-zero std: {near_zero_std}")
+		print(f"output path: {output_path}")
+		return
 
 	split_mode = str(config.get("split_mode", "train_val_test")).lower()
 	if split_mode == "multi_dataset_chronological":

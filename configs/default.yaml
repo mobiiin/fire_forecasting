@@ -138,6 +138,25 @@ task_type: multitask
 # Options: any float threshold appropriate for the chosen target variable.
 fire_threshold: 0.5
 
+cache:
+  enabled: true
+  scratch_root: /scratch/mhabibp/
+  cache_dir: /scratch/mhabibp/fire_forecasting_patch_cache/
+  cache_version: v1
+  use_precomputed_patches: true
+  allow_dynamic_fallback: false
+  validate_cache_before_training: true
+  overwrite_existing: false
+  allow_config_hash_mismatch: false
+  shard_format: npz
+  samples_per_shard: 512
+  compressed: false
+  save_metadata: true
+  save_preview_images: true
+  num_preview_images: 50
+  save_normalized_inputs: false
+  shard_memory_cache_size: 2
+
 patching:
   enabled: true
   patch_size: 64
@@ -146,8 +165,8 @@ patching:
   allow_padding_small_domains: false
   pad_value_normalized: 0.0
   train_sampling_mode: mixed_active_random
-  active_patch_probability: 0.8
-  random_patch_probability: 0.2
+  active_patch_probability: 0.4
+  random_patch_probability: 0.6
   active_source: combined_target
   consumed_active_threshold: 0.001
   energy_active_threshold_MW: 0.001
@@ -166,7 +185,7 @@ patching:
 use_patches: true
 use_patches_for_eval: true
 patch_size: 64
-active_patch_probability: 0.8
+active_patch_probability: 0.4
 active_threshold: 0.001
 
 # Chronological train fraction for the main dataset.
@@ -202,7 +221,7 @@ dataset_sampling:
 
 # Batch size for DataLoaders.
 # Options: any positive integer >= 1, limited by memory.
-batch_size: 4
+batch_size: 64
 
 # Top-level learning rate fallback.
 # Options: any positive float > 0.
@@ -215,7 +234,7 @@ epochs: 50
 
 # Number of DataLoader workers.
 # Options: any integer >= 0.
-num_workers: 4
+num_workers: 8
 
 # Device selection.
 # Supported options in code:
@@ -609,6 +628,10 @@ normalization:
   # Options: any relative or absolute .npz path.
   path: ./artifacts/normalization_stats.npz
 
+  # Compute normalization from the precomputed train patch cache.
+  # Options: true, false
+  compute_from_patch_cache: true
+
   # Normalization sampling mode.
   # Supported options:
   # - full_domain
@@ -671,6 +694,10 @@ visualization:
   target_threshold: 0.5
 
 training:
+  # Total training epochs.
+  # Options: any positive integer >= 1.
+  epochs: 50
+
   # Optimizer choice.
   # Supported options:
   # - adam
@@ -691,7 +718,56 @@ training:
   # Enable automatic mixed precision during training.
   # Options: true, false
   # Only has effect on CUDA devices.
-  mixed_precision: false
+  mixed_precision: true
+
+  # Reduce validation cost on normal epochs.
+  # Options: null for full validation every epoch, or positive integer batch cap.
+  max_val_batches_per_epoch: 200
+
+  # Run full validation every N epochs when max_val_batches_per_epoch is set.
+  # Options: positive integer; 5 means epochs 5, 10, 15, ...
+  full_validation_every_n_epochs: 5
+
+  # Compute expensive train metrics every batch.
+  # Options: true, false
+  compute_train_metrics_every_batch: false
+
+  # Compute train metrics every N batches when compute_train_metrics_every_batch=false.
+  # Options: positive integer >= 1
+  train_metrics_every_n_batches: 100
+
+  # Compute validation metrics for validation batches.
+  # Options: true, false
+  compute_val_metrics: true
+
+  # DataLoader worker count for train/val/test loaders.
+  # Options: integer >= 0
+  num_workers: 8
+
+  # Use pinned host memory for faster non-blocking CUDA transfers.
+  # Options: true, false
+  pin_memory: true
+
+  # Keep worker processes alive between epochs.
+  # Options: true, false; only used when num_workers > 0
+  persistent_workers: true
+
+  # Number of batches prefetched per worker.
+  # Options: positive integer; only used when num_workers > 0
+  prefetch_factor: 4
+
+  # Let cuDNN benchmark convolution algorithms for fixed patch shapes.
+  # Options: true, false
+  cudnn_benchmark: true
+
+  # Optionally compile the model with torch.compile.
+  # Options: true, false
+  torch_compile: false
+
+  # Log batch timing breakdowns to the training log.
+  # Options: true, false
+  log_timing: true
+  timing_log_every_n_batches: 50
 
   # Whether to run external test evaluation automatically after training.
   # Options: true, false

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import time
 from collections import defaultdict
 from contextlib import nullcontext
 from pathlib import Path
@@ -138,19 +139,19 @@ def _assert_batch_shapes(
 def _infer_input_channels_from_loader(train_loader) -> int:
 	"""Infer the channel count from one training batch, falling back to the dataset."""
 
+	dataset = getattr(train_loader, "dataset", None)
+	for attribute_name in ("total_input_channels", "input_channels_after_engineering", "num_channels"):
+		dataset_channels = getattr(dataset, attribute_name, None)
+		if dataset_channels is not None:
+			return int(dataset_channels)
+
 	try:
 		first_batch = next(iter(train_loader))
 	except StopIteration as exc:
-		dataset_channels = getattr(getattr(train_loader, "dataset", None), "num_channels", None)
-		if dataset_channels is not None:
-			return int(dataset_channels)
 		raise ValueError("Training DataLoader is empty; cannot infer input channels.") from exc
 
 	x_batch, y_batch = _as_batch(first_batch)
 	if not torch.is_tensor(x_batch) or not torch.is_tensor(y_batch):
-		dataset_channels = getattr(getattr(train_loader, "dataset", None), "num_channels", None)
-		if dataset_channels is not None:
-			return int(dataset_channels)
 		raise TypeError("Expected tensor batches from the training DataLoader.")
 
 	if x_batch.ndim != 5:
@@ -239,26 +240,56 @@ def _run_epoch(
 	scaler=None,
 	gradient_clip_norm: float | None = None,
 	mixed_precision: bool = False,
+	max_batches: int | None = None,
+	logger=None,
+	epoch_number: int | None = None,
 ) -> dict[str, float]:
 	"""Execute one train or validation epoch and return averaged losses/metrics."""
 
 	desc = "train" if train else "val"
 	model.train(mode=train)
+	training_config = _get_section(config, "training")
+	log_timing = bool(training_config.get("log_timing", False))
+	timing_interval = max(1, int(training_config.get("timing_log_every_n_batches", 50)))
+	compute_train_metrics_every_batch = bool(training_config.get("compute_train_metrics_every_batch", False))
+	train_metrics_every_n_batches = max(1, int(training_config.get("train_metrics_every_n_batches", 100)))
+	compute_val_metrics = bool(training_config.get("compute_val_metrics", True))
 
 	total_samples = 0
 	total_loss = 0.0
+	metric_samples = 0
 	metric_totals: dict[str, float] = defaultdict(float)
 	loss_component_totals: dict[str, float] = defaultdict(float)
-	progress_bar = tqdm(loader, desc=desc, total=len(loader), leave=False) if tqdm is not None else loader
+	total_loader_batches = len(loader)
+	total_batches = total_loader_batches if max_batches is None else min(total_loader_batches, int(max_batches))
+	if total_batches <= 0:
+		raise ValueError(f"The {desc} DataLoader produced no batches.")
+	progress_bar = tqdm(range(total_batches), desc=desc, total=total_batches, leave=False) if tqdm is not None else range(total_batches)
+	iterator = iter(loader)
 
-	for batch in progress_bar:
+	def _sync_if_timing() -> None:
+		if log_timing and device.type == "cuda":
+			torch.cuda.synchronize(device)
+
+	for batch_offset in progress_bar:
+		batch_number = int(batch_offset) + 1
+		fetch_start_time = time.perf_counter()
+		try:
+			batch = next(iterator)
+		except StopIteration:
+			break
+		fetch_end_time = time.perf_counter()
+		data_wait_time = fetch_end_time - fetch_start_time
 		x_batch, y_batch = _as_batch(batch)
 		if not torch.is_tensor(x_batch) or not torch.is_tensor(y_batch):
 			raise TypeError("Expected tensor batches from the DataLoader.")
 
 		_assert_batch_shapes(x_batch, y_batch, input_sequence_length, input_channels, output_channels)
+		h2d_start_time = time.perf_counter()
 		x_batch = x_batch.to(device, non_blocking=True)
 		y_batch = y_batch.to(device, non_blocking=True)
+		_sync_if_timing()
+		h2d_time = time.perf_counter() - h2d_start_time
 
 		if train and optimizer is None:
 			raise ValueError("An optimizer is required for training epochs.")
@@ -266,9 +297,18 @@ def _run_epoch(
 		if train:
 			optimizer.zero_grad(set_to_none=True)
 
+		forward_time = 0.0
+		loss_time = 0.0
+		backward_time = 0.0
+		optimizer_time = 0.0
+		metrics_time = 0.0
+		batch_metrics: dict[str, float] = {}
 		with torch.set_grad_enabled(train):
 			with _maybe_autocast(mixed_precision and train):
+				forward_start_time = time.perf_counter()
 				y_pred = model(x_batch)
+				_sync_if_timing()
+				forward_time = time.perf_counter() - forward_start_time
 				if y_pred.ndim != 4:
 					raise ValueError(f"Model output must have shape (B, C, H, W), got {tuple(y_pred.shape)}.")
 				if y_pred.shape[0] != x_batch.shape[0]:
@@ -282,40 +322,83 @@ def _run_epoch(
 						f"Model output channels {y_pred.shape[1]} do not match target channels {y_batch.shape[1]}."
 					)
 
+				loss_start_time = time.perf_counter()
 				loss_result = criterion(y_pred, y_batch)
 				loss, batch_loss_components = _coerce_loss_result(loss_result)
+				_sync_if_timing()
+				loss_time = time.perf_counter() - loss_start_time
 
 			if train:
 				if scaler is not None and mixed_precision:
+					backward_start_time = time.perf_counter()
 					scaler.scale(loss).backward()
 					if gradient_clip_norm is not None:
 						scaler.unscale_(optimizer)
 						torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
+					_sync_if_timing()
+					backward_time = time.perf_counter() - backward_start_time
+					optimizer_start_time = time.perf_counter()
 					scaler.step(optimizer)
 					scaler.update()
+					_sync_if_timing()
+					optimizer_time = time.perf_counter() - optimizer_start_time
 				else:
+					backward_start_time = time.perf_counter()
 					loss.backward()
 					if gradient_clip_norm is not None:
 						torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
+					_sync_if_timing()
+					backward_time = time.perf_counter() - backward_start_time
+					optimizer_start_time = time.perf_counter()
 					optimizer.step()
+					_sync_if_timing()
+					optimizer_time = time.perf_counter() - optimizer_start_time
 
 		batch_size = int(x_batch.shape[0])
+		batch_loss_value = float(loss.detach().item())
 		total_samples += batch_size
-		total_loss += float(loss.detach().item()) * batch_size
+		total_loss += batch_loss_value * batch_size
 		for component_name, component_value in batch_loss_components.items():
 			loss_component_totals[component_name] += float(component_value) * batch_size
 
-		metric_prediction, metric_target = _denormalize_target_tensors_for_metrics(
-			loader,
-			y_pred.detach(),
-			y_batch.detach(),
+		should_compute_metrics = (
+			(compute_train_metrics_every_batch or batch_number % train_metrics_every_n_batches == 0 or batch_number == total_batches)
+			if train
+			else compute_val_metrics
 		)
-		batch_metrics = compute_metrics(metric_prediction, metric_target, config)
-		for metric_name, metric_value in batch_metrics.items():
-			metric_totals[metric_name] += float(metric_value) * batch_size
+		if should_compute_metrics:
+			metrics_start_time = time.perf_counter()
+			metric_prediction, metric_target = _denormalize_target_tensors_for_metrics(
+				loader,
+				y_pred.detach(),
+				y_batch.detach(),
+			)
+			batch_metrics = compute_metrics(metric_prediction, metric_target, config)
+			_sync_if_timing()
+			metrics_time = time.perf_counter() - metrics_start_time
+			metric_samples += batch_size
+			for metric_name, metric_value in batch_metrics.items():
+				metric_totals[metric_name] += float(metric_value) * batch_size
+
+		batch_total_time = time.perf_counter() - fetch_start_time
+		samples_per_second = batch_size / max(batch_total_time, 1.0e-9)
+		if log_timing and (batch_number % timing_interval == 0 or batch_number == total_batches):
+			message = (
+				f"[timing] epoch={epoch_number if epoch_number is not None else '?'} "
+				f"phase={desc} batch={batch_number}/{total_batches} "
+				f"data_wait={data_wait_time:.3f}s h2d={h2d_time:.3f}s "
+				f"forward={forward_time:.3f}s loss={loss_time:.3f}s "
+				f"backward={backward_time:.3f}s optimizer={optimizer_time:.3f}s "
+				f"metrics={metrics_time:.3f}s batch={batch_total_time:.3f}s "
+				f"samples/s={samples_per_second:.2f}"
+			)
+			if logger is not None:
+				logger.info(message)
+			else:
+				print(message)
 
 		if tqdm is not None and hasattr(progress_bar, "set_postfix"):
-			postfix = {"loss": f"{float(loss.detach().item()):.5f}"}
+			postfix = {"loss": f"{batch_loss_value:.5f}"}
 			for component_name, component_value in batch_loss_components.items():
 				postfix[component_name] = f"{float(component_value):.5f}"
 			for metric_name, metric_value in batch_metrics.items():
@@ -329,7 +412,9 @@ def _run_epoch(
 	for component_name, total_value in loss_component_totals.items():
 		results[f"{desc}_{component_name}"] = total_value / total_samples
 	for metric_name, total_value in metric_totals.items():
-		results[f"{desc}_{metric_name}"] = total_value / total_samples
+		results[f"{desc}_{metric_name}"] = total_value / max(metric_samples, 1)
+	results[f"{desc}_samples"] = float(total_samples)
+	results[f"{desc}_batches"] = float(batch_number)
 	return results
 
 
@@ -404,6 +489,19 @@ def _resolve_training_paths(config: Mapping[str, Any]) -> tuple[Path, Path]:
 	config_path = Path(config_path_value).expanduser().resolve() if config_path_value else None
 	resolved_latest = _resolve_path(config_path, checkpoint_path)
 	return latest_and_best_checkpoint_paths(resolved_latest)
+
+
+def _resolve_existing_normalization_stats_path(config: Mapping[str, Any]) -> Path | None:
+	"""Resolve normalization.path when the stats archive exists."""
+
+	normalization_config = _get_section(config, "normalization")
+	normalization_path = normalization_config.get("path")
+	if not normalization_path:
+		return None
+	config_path_value = config.get("config_path", config.get("_config_path"))
+	config_path = Path(config_path_value).expanduser().resolve() if config_path_value else None
+	resolved_path = _resolve_path(config_path, normalization_path)
+	return resolved_path if resolved_path.exists() else None
 
 
 def _build_optimizer(model: nn.Module, config: Mapping[str, Any]):
@@ -639,17 +737,48 @@ def train_model(config_path: str | Path) -> dict[str, Any]:
 		raise ImportError("PyTorch is required to train the ConvLSTM U-Net model.")
 
 	config = _ensure_config_path(load_config(config_path), config_path)
+	config["return_metadata"] = False
 	training_config = _get_section(config, "training")
 	logging_config = _get_section(config, "logging")
 	checkpoint_config = _get_section(config, "checkpoint")
 
 	seed = int(training_config.get("seed", config.get("seed", 42)))
 	set_seed(seed)
+	if bool(training_config.get("cudnn_benchmark", False)) and torch.backends.cudnn.is_available():
+		torch.backends.cudnn.deterministic = False
+		torch.backends.cudnn.benchmark = True
 
 	log_level = str(logging_config.get("level", "INFO"))
 	log_dir = Path(logging_config.get("log_dir", "./artifacts/logs")).expanduser().resolve()
 	log_dir.mkdir(parents=True, exist_ok=True)
 	logger = setup_logging(log_level, str(log_dir / "train_convlstm_unet.log"))
+
+	cache_config = _get_section(config, "cache")
+	if bool(cache_config.get("enabled", False)) and bool(cache_config.get("use_precomputed_patches", False)):
+		from src.data.cache import get_patch_cache_dir, validate_patch_cache
+
+		try:
+			cache_summary = validate_patch_cache(config, split=["train", "val"])
+		except Exception as exc:
+			if bool(cache_config.get("allow_dynamic_fallback", False)):
+				logger.warning("Patch-cache validation failed; dynamic fallback is enabled: %s", exc)
+			else:
+				raise
+		else:
+			normalization_stats_path = _resolve_existing_normalization_stats_path(config)
+			if not bool(cache_config.get("save_normalized_inputs", False)) and normalization_stats_path is None:
+				raise RuntimeError(
+					"Training is configured to load unnormalized precomputed patch shards, "
+					"but normalization stats were not found. Run:\n"
+					"python scripts/compute_normalization.py --config configs/default.yaml --from_cache"
+				)
+			logger.info(
+				"Using precomputed patch cache: %s | train=%s | val=%s | normalization=%s",
+				get_patch_cache_dir(config),
+				cache_summary["splits"]["train"]["num_samples"],
+				cache_summary["splits"]["val"]["num_samples"],
+				normalization_stats_path,
+			)
 	logger.info("Loading dataloaders")
 
 	train_loader, val_loader, test_loader = create_dataloaders(config)
@@ -670,6 +799,15 @@ def train_model(config_path: str | Path) -> dict[str, Any]:
 
 	model = build_model_from_config(config, input_channels=input_channels)
 	model = model.to(device)
+	if bool(training_config.get("torch_compile", False)):
+		if not hasattr(torch, "compile"):
+			logger.warning("training.torch_compile=true, but this PyTorch build does not provide torch.compile.")
+		else:
+			try:
+				model = torch.compile(model)
+				logger.info("Enabled torch.compile for the model.")
+			except Exception as exc:  # pragma: no cover - backend-specific
+				logger.warning("torch.compile failed; continuing without compilation: %s", exc)
 
 	criterion = get_loss_function(config)
 	optimizer = _build_optimizer(model, config)
@@ -742,7 +880,25 @@ def train_model(config_path: str | Path) -> dict[str, Any]:
 			scaler=scaler,
 			gradient_clip_norm=gradient_clip_norm,
 			mixed_precision=use_mixed_precision,
+			logger=logger,
+			epoch_number=epoch_number,
 		)
+		max_val_batches_value = training_config.get("max_val_batches_per_epoch", None)
+		max_val_batches = None
+		if max_val_batches_value not in (None, "", "null"):
+			max_val_batches = max(1, int(max_val_batches_value))
+		full_validation_every_n_epochs = int(training_config.get("full_validation_every_n_epochs", 1) or 0)
+		run_full_validation = max_val_batches is None or (
+			full_validation_every_n_epochs > 0 and epoch_number % full_validation_every_n_epochs == 0
+		)
+		val_max_batches = None if run_full_validation else max_val_batches
+		if val_max_batches is not None:
+			logger.info(
+				"Validation capped at %s batch(es) for epoch %s; full validation every %s epoch(s).",
+				val_max_batches,
+				epoch_number,
+				full_validation_every_n_epochs,
+			)
 		val_results = _run_epoch(
 			model=model,
 			loader=val_loader,
@@ -753,6 +909,9 @@ def train_model(config_path: str | Path) -> dict[str, Any]:
 			input_channels=input_channels,
 			output_channels=output_channels,
 			train=False,
+			max_batches=val_max_batches,
+			logger=logger,
+			epoch_number=epoch_number,
 		)
 
 		val_loss = float(val_results["val_loss"])

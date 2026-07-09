@@ -130,11 +130,31 @@ Recommended workflow:
 
 ```bash
 python scripts/discover_fire_datasets.py --main_data_dir /media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/
-python scripts/compute_normalization.py --config configs/default.yaml
+python scripts/precompute_patch_cache.py --config configs/default.yaml --split train
+python scripts/compute_normalization.py --config configs/default.yaml --from_cache
+python scripts/precompute_patch_cache.py --config configs/default.yaml --split val
+python scripts/precompute_patch_cache.py --config configs/default.yaml --split test
+python scripts/inspect_patch_cache.py --config configs/default.yaml --split all
 python scripts/train_convlstm_unet.py --config configs/default.yaml
 ```
 
 Choose training fires to cover a range of fire sizes, durations, energy-release regimes, and spatial extents. Hold out validation/test fires as unseen events when you want a scientifically cleaner cross-fire generalization result.
+
+## Fast Patch Cache Training
+The default config can train from precomputed patch shards under `/scratch/mhabibp/fire_forecasting_patch_cache/`. This avoids reopening full `.npy` frames and rebuilding full-domain engineered features, multitask targets, and energy-release maps inside every training batch.
+
+Use `scripts/precompute_patch_cache.py` to save `X` patches shaped `(N,T,C,H,W)` and `y` patches shaped `(N,4,H,W)`. Inputs are stored unnormalized by default, so compute normalization from the train cache before training:
+
+```bash
+python scripts/precompute_patch_cache.py --config configs/default.yaml --split train
+python scripts/compute_normalization.py --config configs/default.yaml --from_cache
+python scripts/precompute_patch_cache.py --config configs/default.yaml --split val
+python scripts/precompute_patch_cache.py --config configs/default.yaml --split test
+python scripts/inspect_patch_cache.py --config configs/default.yaml --split all
+python scripts/train_convlstm_unet.py --config configs/default.yaml
+```
+
+If `/scratch` purges the cache, training raises a clear error and asks you to rerun precompute unless `cache.allow_dynamic_fallback: true` is set.
 
 ## Atmospheric Engineered Features
 From the raw atmospheric `U`, `V`, and `W` channels, the dataset can append three atmospheric feature groups for every input timestep.
@@ -254,8 +274,15 @@ All commands below assume the Conda environment above is already active.
 ### Core Python Scripts
 - Inspect dataset split and file counts:
   `python scripts/inspect_dataset.py --config configs/default.yaml`
-- Compute normalization from the main training split only:
-  `python scripts/compute_normalization.py --config configs/default.yaml`
+- Precompute train patch shards on scratch:
+  `python scripts/precompute_patch_cache.py --config configs/default.yaml --split train`
+- Compute normalization from the precomputed train patch cache:
+  `python scripts/compute_normalization.py --config configs/default.yaml --from_cache`
+- Precompute validation and test patch shards:
+  `python scripts/precompute_patch_cache.py --config configs/default.yaml --split val`
+  `python scripts/precompute_patch_cache.py --config configs/default.yaml --split test`
+- Inspect the patch cache and save random previews:
+  `python scripts/inspect_patch_cache.py --config configs/default.yaml --split all`
 - Run the main project sanity check:
   `python scripts/sanity_check_project.py --config configs/default.yaml`
 - Run lightweight smoke checks:
@@ -288,7 +315,7 @@ All commands below assume the Conda environment above is already active.
 - Inspect atmospheric engineered features for one sample:
 
   `python scripts/inspect_atmospheric_features.py --config configs/default.yaml --sample_index 0`
-- Cache engineered per-timestep tensors to disk:
+- Legacy cache for engineered per-timestep tensors only:
 
   `python scripts/cache_engineered_dataset.py --config configs/default.yaml --output_dir ../keepz_05_engineered`
 

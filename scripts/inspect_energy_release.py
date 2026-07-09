@@ -196,6 +196,7 @@ def main() -> None:
 	args = parser.parse_args()
 
 	config = _ensure_config_path(load_config(args.config), args.config)
+	config["return_metadata"] = True
 	config["main_data_dir"] = str(Path(args.main_data_dir).expanduser().resolve())
 	config["fire_dataset_index_json"] = str(DEFAULT_FIRE_INDEX_JSON)
 	energy_release = resolve_energy_release_config(config)

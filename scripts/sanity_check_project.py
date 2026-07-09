@@ -26,6 +26,7 @@ from src.data.dataset import (
 	create_dataloaders,
 	resolve_engineered_feature_slices,
 )
+from src.data.discovery import discover_multiple_datasets
 from src.data.spatial_transforms import infer_with_external_test_spatial_handling
 from src.models.convlstm_unet import build_model_from_config
 from src.training.losses import get_loss_function
@@ -116,9 +117,17 @@ def main() -> None:
 	config["config_path"] = str(config_path)
 
 	_print_environment_info()
-	data_dir = _resolve_path(config_path, config["data_dir"])
+	data_dir_value = config.get("data_dir")
+	if data_dir_value in (None, "", "null"):
+		dataset_records = discover_multiple_datasets(config)
+		if not dataset_records:
+			raise ValueError("No dataset records were discovered for sanity checks.")
+		raw_files = list(dataset_records[0]["file_paths"])
+		data_dir = Path(dataset_records[0]["data_dir"])
+	else:
+		data_dir = _resolve_path(config_path, data_dir_value)
+		raw_files = _sort_chronologically(list(data_dir.glob(str(config["file_pattern"]))))
 	atmospheric = _resolve_atmospheric_features_config(config)
-	raw_files = _sort_chronologically(list(data_dir.glob(str(config["file_pattern"]))))
 	if not raw_files:
 		raise FileNotFoundError(f"No files found in '{data_dir}' using pattern '{config['file_pattern']}'.")
 	first_file = raw_files[0]
@@ -227,7 +236,7 @@ def main() -> None:
 		else:
 			print("  channel 2 label: mask = max(initial fuel - future surface/canopy fuel) > consumed_fuel_threshold")
 
-	expected_y_channels = 3 if task_type == "multitask" else 1
+	expected_y_channels = int(config.get("model", {}).get("output_channels", 3 if task_type == "multitask" else 1))
 	if y_batch.shape[1] != expected_y_channels:
 		raise ValueError(f"Expected y channel dimension {expected_y_channels}, got {y_batch.shape[1]}")
 	if tuple(y_pred.shape) != tuple(y_batch.shape):

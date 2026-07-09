@@ -1721,6 +1721,139 @@ class MultiFirePatchSequenceDataset(MultiFireSequenceDataset):
 	"""Backward-compatible explicit name for the multi-fire patch-aware dataset."""
 
 
+def _resolve_dataloader_options(config: Mapping[str, Any]) -> dict[str, Any]:
+	"""Resolve DataLoader performance options from training config with top-level fallbacks."""
+
+	training_config = _get_section(config, "training")
+	batch_size = int(training_config.get("batch_size", config.get("batch_size", 4)))
+	num_workers = int(training_config.get("num_workers", config.get("num_workers", 0)))
+	options: dict[str, Any] = {
+		"batch_size": batch_size,
+		"num_workers": num_workers,
+		"pin_memory": bool(training_config.get("pin_memory", torch.cuda.is_available())),
+		"drop_last": False,
+	}
+	if num_workers > 0:
+		options["persistent_workers"] = bool(training_config.get("persistent_workers", False))
+		if "prefetch_factor" in training_config:
+			options["prefetch_factor"] = int(training_config["prefetch_factor"])
+	return options
+
+
+def _resolve_normalization_stats_path(
+	config: Mapping[str, Any],
+	config_path: Path | None,
+) -> Path | None:
+	"""Resolve the configured normalization stats path when it exists."""
+
+	normalization_config = _get_section(config, "normalization")
+	normalization_path = normalization_config.get("path")
+	if not normalization_path:
+		return None
+	resolved_normalization_path = _resolve_path(config_path, normalization_path)
+	if resolved_normalization_path.exists():
+		return resolved_normalization_path
+	return None
+
+
+def _build_cached_dataloaders(
+	config: Mapping[str, Any],
+	normalization_stats: Path | None,
+):
+	"""Build DataLoaders backed by precomputed patch-cache shards."""
+
+	from src.data.cache import get_patch_cache_dir, validate_patch_cache
+	from src.data.cached_patch_dataset import CachedPatchDataset
+
+	cache_config = _get_section(config, "cache")
+	cache_dir = get_patch_cache_dir(config)
+	try:
+		cache_summary = validate_patch_cache(config, split=["train", "val", "test"])
+	except Exception as exc:
+		if bool(cache_config.get("allow_dynamic_fallback", False)):
+			print(f"WARNING: patch-cache validation failed; falling back to dynamic Dataset: {exc}")
+			return None
+		raise
+
+	if not bool(cache_config.get("save_normalized_inputs", False)) and normalization_stats is None:
+		raise RuntimeError(
+			"cache.use_precomputed_patches=true and cache.save_normalized_inputs=false, "
+			"but normalization stats were not found. Run:\n"
+			"python scripts/compute_normalization.py --config configs/default.yaml --from_cache"
+		)
+
+	return_metadata = bool(config.get("return_metadata", False))
+	train_dataset = CachedPatchDataset(
+		cache_dir=cache_dir,
+		split="train",
+		config=config,
+		normalization_stats=normalization_stats,
+		return_metadata=return_metadata,
+	)
+	val_dataset = CachedPatchDataset(
+		cache_dir=cache_dir,
+		split="val",
+		config=config,
+		normalization_stats=normalization_stats,
+		return_metadata=return_metadata,
+	)
+	test_dataset = CachedPatchDataset(
+		cache_dir=cache_dir,
+		split="test",
+		config=config,
+		normalization_stats=normalization_stats,
+		return_metadata=return_metadata,
+	)
+
+	dataloader_options = _resolve_dataloader_options(config)
+	sampler = None
+	dataset_sampling = _get_section(config, "dataset_sampling")
+	if bool(dataset_sampling.get("enabled", False)):
+		sampling_mode = str(dataset_sampling.get("mode", "uniform_samples")).lower()
+		if sampling_mode in {"balanced_by_dataset", "balanced_by_fire"}:
+			if WeightedRandomSampler is None:
+				print("WARNING: WeightedRandomSampler is unavailable; falling back to shuffled cached training.")
+			elif not train_dataset.metadata:
+				print("WARNING: cached train metadata is unavailable; falling back to shuffled cached training.")
+			else:
+				counts_by_dataset: dict[int, int] = {}
+				for item in train_dataset.metadata:
+					dataset_id = int(item.get("dataset_id", -1))
+					counts_by_dataset[dataset_id] = counts_by_dataset.get(dataset_id, 0) + 1
+				weights = [1.0 / counts_by_dataset[int(item.get("dataset_id", -1))] for item in train_dataset.metadata]
+				sampler = WeightedRandomSampler(weights=weights, num_samples=len(weights), replacement=True)
+		elif sampling_mode != "uniform_samples":
+			print(
+				"WARNING: Unsupported dataset_sampling.mode for cached loading; "
+				f"falling back to normal shuffle: {sampling_mode!r}"
+			)
+
+	train_loader = DataLoader(
+		train_dataset,
+		shuffle=sampler is None,
+		sampler=sampler,
+		**dataloader_options,
+	)
+	val_loader = DataLoader(
+		val_dataset,
+		shuffle=False,
+		**dataloader_options,
+	)
+	test_loader = DataLoader(
+		test_dataset,
+		shuffle=False,
+		**dataloader_options,
+	)
+	print(
+		"Using precomputed patch cache | "
+		f"cache_dir={cache_dir} "
+		f"train={cache_summary['splits']['train']['num_samples']} "
+		f"val={cache_summary['splits']['val']['num_samples']} "
+		f"test={cache_summary['splits']['test']['num_samples']}"
+	)
+	return train_loader, val_loader, test_loader
+
+
 def create_dataloaders(config):
 	"""Build train/validation/test DataLoaders from a configuration dictionary."""
 
@@ -1756,15 +1889,16 @@ def create_dataloaders(config):
 	patch_size = _resolve_square_patch_size_from_config(config)
 	use_train_patches = bool(patching_config["enabled"])
 	use_eval_patches = bool(patching_config["enabled"] and patching_config["eval_mode"] == "sliding_window")
-	return_metadata_for_multi = True
+	return_metadata_for_multi = bool(config.get("return_metadata", False))
 
 	normalization_stats = None
-	normalization_config = _get_section(config, "normalization")
-	normalization_path = normalization_config.get("path")
-	if normalization_path:
-		resolved_normalization_path = _resolve_path(config_path, normalization_path)
-		if resolved_normalization_path.exists():
-			normalization_stats = resolved_normalization_path
+	normalization_stats = _resolve_normalization_stats_path(config, config_path)
+
+	cache_config = _get_section(config, "cache")
+	if bool(cache_config.get("enabled", False)) and bool(cache_config.get("use_precomputed_patches", False)):
+		cached_loaders = _build_cached_dataloaders(config, normalization_stats)
+		if cached_loaders is not None:
+			return cached_loaders
 
 	if split_mode in {"multi_fire_chronological", "manual_fire_holdout"}:
 		data_dirs = resolve_data_dirs(config)
@@ -1793,13 +1927,7 @@ def create_dataloaders(config):
 				val_fraction=val_fraction,
 				test_fraction=test_fraction,
 			)
-		normalization_stats = None
-		normalization_config = _get_section(config, "normalization")
-		normalization_path = normalization_config.get("path")
-		if normalization_path:
-			resolved_normalization_path = _resolve_path(config_path, normalization_path)
-			if resolved_normalization_path.exists():
-				normalization_stats = resolved_normalization_path
+		normalization_stats = _resolve_normalization_stats_path(config, config_path)
 
 		common_multi_kwargs = {
 			"dataset_records": dataset_records,
@@ -1842,8 +1970,7 @@ def create_dataloaders(config):
 			**common_multi_kwargs,
 		)
 
-		batch_size = int(config.get("batch_size", 4))
-		num_workers = int(config.get("num_workers", 0))
+		dataloader_options = _resolve_dataloader_options(config)
 		sampler = None
 		dataset_sampling = _get_section(config, "dataset_sampling")
 		if bool(dataset_sampling.get("enabled", False)):
@@ -1871,28 +1998,19 @@ def create_dataloaders(config):
 
 		train_loader = DataLoader(
 			train_dataset,
-			batch_size=batch_size,
 			shuffle=sampler is None,
 			sampler=sampler,
-			num_workers=num_workers,
-			pin_memory=torch.cuda.is_available(),
-			drop_last=False,
+			**dataloader_options,
 		)
 		val_loader = DataLoader(
 			val_dataset,
-			batch_size=batch_size,
 			shuffle=False,
-			num_workers=num_workers,
-			pin_memory=torch.cuda.is_available(),
-			drop_last=False,
+			**dataloader_options,
 		)
 		test_loader = DataLoader(
 			test_dataset,
-			batch_size=batch_size,
 			shuffle=False,
-			num_workers=num_workers,
-			pin_memory=torch.cuda.is_available(),
-			drop_last=False,
+			**dataloader_options,
 		)
 		return train_loader, val_loader, test_loader
 
@@ -1962,33 +2080,23 @@ def create_dataloaders(config):
 	else:
 		test_dataset = FireSequenceDataset(sample_indices=split_indices["test"], use_patches=use_eval_patches, **dataset_kwargs)
 
-	batch_size = int(config.get("batch_size", 4))
-	num_workers = int(config.get("num_workers", 0))
+	dataloader_options = _resolve_dataloader_options(config)
 	train_loader = DataLoader(
 		train_dataset,
-		batch_size=batch_size,
 		shuffle=True,
-		num_workers=num_workers,
-		pin_memory=torch.cuda.is_available(),
-		drop_last=False,
+		**dataloader_options,
 	)
 	val_loader = DataLoader(
 		val_dataset,
-		batch_size=batch_size,
 		shuffle=False,
-		num_workers=num_workers,
-		pin_memory=torch.cuda.is_available(),
-		drop_last=False,
+		**dataloader_options,
 	)
 	test_loader = None
 	if test_dataset is not None:
 		test_loader = DataLoader(
 			test_dataset,
-			batch_size=batch_size,
 			shuffle=False,
-			num_workers=num_workers,
-			pin_memory=torch.cuda.is_available(),
-			drop_last=False,
+			**dataloader_options,
 		)
 	return train_loader, val_loader, test_loader
 

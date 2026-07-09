@@ -89,6 +89,8 @@ def _resolve_rollout_config(config: Mapping[str, Any]) -> dict[str, Any]:
 def _build_dataset_for_split(config: Mapping[str, Any], split: str):
 	"""Build the dataset backing one requested split."""
 
+	config = dict(config)
+	config["return_metadata"] = True
 	train_loader, val_loader, test_loader = create_dataloaders(config)
 	split = str(split).lower()
 	loader_by_split = {"train": train_loader, "val": val_loader, "test": test_loader}

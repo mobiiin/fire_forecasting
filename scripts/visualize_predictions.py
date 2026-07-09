@@ -85,6 +85,8 @@ def _build_dataset_for_split(config: Mapping[str, Any], normalization_stats, spl
 	split = str(split).lower()
 	split_mode = str(config.get("split_mode", "train_val_test")).lower()
 	if split_mode == "multi_dataset_chronological":
+		config = dict(config)
+		config["return_metadata"] = True
 		train_loader, val_loader, test_loader = create_dataloaders(config)
 		loader_by_split = {"train": train_loader, "val": val_loader, "test": test_loader}
 		if split not in loader_by_split:
