@@ -95,12 +95,12 @@ manual_fire_split:
     - THOMAS__1210__keepz_08
     - REDWOODVALLEY
     - GLASS
-
-  val_fires:
-    - EASTTROUBLESOME
     - LITTLEBEAR__lbvaa__keepz_08
     - LITTLEBEAR__lbvab__keepz_08
     - LITTLEBEAR__lbvac__keepz_08
+
+  val_fires:
+    - EASTTROUBLESOME
     - PARKCTY_HYPOTHETICAL
     - Tubbs
     - WITCHCREEK
