@@ -218,6 +218,133 @@ Why fuel/flux history is allowed as input:
 - past fuel/flux are known historical state
 - future fuel/perimeter are prediction targets
 
+## Earthformer-lite Transformer Baseline
+This project now includes `earthformer_lite`, an in-project simplified Earthformer-inspired model for comparison. It is not the full official Earthformer implementation.
+
+The design uses axial space-time attention inspired by cuboid attention:
+- temporal attention
+- height attention
+- width attention
+
+Canonical patch-cache input/output:
+- input: `(B, 6, 129, 64, 64)`
+- output: `(B, 4, 64, 64)`
+
+The model predicts:
+- surface consumed fuel
+- canopy consumed fuel
+- mask logits
+- `log1p` energy release
+
+Commands:
+
+Smoke test:
+```bash
+python scripts/smoke_test_earthformer_lite.py --config configs/default.yaml
+```
+
+Train:
+```bash
+python scripts/train_earthformer_lite.py --config configs/default.yaml
+```
+
+Test:
+```bash
+python scripts/test_earthformer_lite.py --config configs/default.yaml --checkpoint artifacts/checkpoints/earthformer_lite/best_model.pt --split test
+```
+
+Compare baselines and model:
+```bash
+python scripts/evaluate_all_baselines.py --config configs/default.yaml --split test --include_model --checkpoint artifacts/checkpoints/earthformer_lite/best_model.pt --model_architecture earthformer_lite
+```
+
+## ST-Mamba-Lite Architecture
+This project also includes `st_mamba_lite`, a CAWFE-tailored spatiotemporal Mamba model for dense wildfire forecasting. It is inspired by MetMamba's route-based 3D scanning ideas and ST-Mamba's ST-Mixer / ST-SSM design pattern, but it is not an official reproduction of either paper.
+
+Canonical patch-cache input/output:
+- input: `(B, 6, 129, 64, 64)`
+- output: `(B, 4, 64, 64)`
+
+Output channels:
+- surface consumed fuel
+- canopy consumed fuel
+- fire/perimeter mask logits
+- `log1p` energy release map
+
+The model uses:
+- a per-timestep CNN stem
+- route-based spatial-temporal Mamba scans over `(T, H, W)`
+- local depthwise 3D convolution mixing
+- temporal readout to a final 2D map
+- a U-Net-style decoder for dense output reconstruction
+
+Commands:
+
+Smoke test:
+```bash
+python scripts/smoke_test_st_mamba_lite.py --config configs/default.yaml
+```
+
+Train:
+```bash
+python scripts/train_st_mamba_lite.py --config configs/default.yaml
+```
+
+Test:
+```bash
+python scripts/test_st_mamba_lite.py --config configs/default.yaml --checkpoint artifacts/checkpoints/st_mamba_lite/best_model.pt --split test
+```
+
+Compare with baselines:
+```bash
+python scripts/evaluate_all_baselines.py --config configs/default.yaml --split test --include_model --checkpoint artifacts/checkpoints/st_mamba_lite/best_model.pt --model_architecture st_mamba_lite
+```
+
+For real training, install `mamba-ssm` and set `st_mamba_lite.mamba_backend: mamba_ssm`. If `mamba_backend: auto` and `mamba-ssm` is unavailable, the code falls back to a gated sequence block meant for smoke testing and debugging only. Do not treat fallback-backend results as a publishable Mamba comparison.
+
+OOM troubleshooting:
+- reduce `batch_size`
+- reduce `earthformer_lite.embed_dim`
+- reduce `earthformer_lite.depths`
+- reduce `earthformer_lite.num_heads`
+- increase `training.gradient_accumulation_steps`
+- keep `training.mixed_precision: true`
+
+## ST-Mamba-Lite Baseline
+This project is also being extended with `st_mamba_lite`, a CAWFE-tailored spatial-temporal Mamba baseline for dense wildfire forecasting. It should not be described as an official reproduction of any prior Mamba paper.
+
+Planned/expected patch-cache input/output:
+- input: `(B, 6, 129, 64, 64)`
+- output: `(B, 4, 64, 64)`
+
+Planned prediction targets:
+- surface consumed fuel
+- canopy consumed fuel
+- mask logits
+- `log1p` energy release
+
+Expected command syntax for the model-specific scripts:
+
+Smoke test:
+```bash
+python scripts/smoke_test_st_mamba_lite.py --config configs/default.yaml
+```
+
+Train:
+```bash
+python scripts/train_st_mamba_lite.py --config configs/default.yaml
+```
+
+Test:
+```bash
+python scripts/test_st_mamba_lite.py --config configs/default.yaml --checkpoint artifacts/checkpoints/st_mamba_lite/best_model.pt --split test
+```
+
+Expected comparison command once the architecture scripts are present:
+```bash
+python scripts/evaluate_all_baselines.py --config configs/default.yaml --split test --include_model --checkpoint artifacts/checkpoints/st_mamba_lite/best_model.pt --model_architecture st_mamba_lite
+```
+
 ## Multitask Labels
 For sample start index `i`:
 - input frames: `i ... i + input_sequence_length - 1`

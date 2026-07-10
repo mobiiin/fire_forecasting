@@ -592,6 +592,9 @@ model:
   # Model family.
   # Currently implemented/used here:
   # - convlstm_unet
+  # - earthformer_lite
+  # - st_mamba_lite
+  architecture: convlstm_unet
   name: convlstm_unet
 
   # Total input channels after all enabled engineered features are appended.
@@ -630,6 +633,63 @@ model:
   # - relu
   # Note: multitask mode forces this to null internally.
   output_activation: null
+
+earthformer_lite:
+  input_sequence_length: 6
+  patch_size: 64
+  embed_dim: 64
+  depths: [2, 2]
+  num_heads: [4, 8]
+  mlp_ratio: 4.0
+  dropout: 0.0
+  attention_dropout: 0.0
+  drop_path: 0.1
+  attention_pattern: axial
+  use_shifted_windows: false
+  use_global_vectors: true
+  num_global_vectors: 8
+  downsample_stages: 2
+  patch_merge_factor: 2
+  use_time_pos_embed: true
+  use_space_pos_embed: true
+  temporal_readout: attention_pool
+  output_mode: final_step
+  output_channels: 4
+  gradient_checkpointing: false
+  required_patch_divisibility: 16
+
+st_mamba_lite:
+  input_sequence_length: 6
+  patch_size: 64
+  embed_dim: 64
+  encoder_channels: [64, 128]
+  decoder_channels: [128, 64]
+  depths: [2, 2]
+  mamba_backend: auto
+  d_state: 16
+  d_conv: 4
+  expand: 2
+  scan_mode: route_pair
+  scan_routes: [HVT, TVH]
+  bidirectional_scan: true
+  bidirectional_merge: mean
+  route_merge: mean
+  use_depthwise_conv3d: true
+  depthwise_conv3d_kernel_size: [3, 3, 3]
+  use_st_mixer: true
+  st_mixer_sequence_order: THW
+  temporal_readout: attention_pool
+  use_unet_decoder: true
+  use_skip_connections: true
+  upsample_mode: bilinear
+  dropout: 0.0
+  drop_path: 0.1
+  norm_type: layernorm
+  mlp_ratio: 4.0
+  use_adaln_conditioning: false
+  use_fire_static_embedding: false
+  gradient_checkpointing: false
+  required_patch_divisibility: 16
 
 normalization:
   # Saved normalization-stats file.
@@ -728,6 +788,10 @@ training:
   # Only has effect on CUDA devices.
   mixed_precision: true
 
+  # Number of micro-batches to accumulate before each optimizer step.
+  # Options: integer >= 1
+  gradient_accumulation_steps: 1
+
   # Reduce validation cost on normal epochs.
   # Options: null for full validation every epoch, or positive integer batch cap.
   max_val_batches_per_epoch: 200
@@ -822,3 +886,7 @@ logging:
   # Log directory.
   # Options: any relative or absolute directory path.
   log_dir: ./artifacts/logs
+
+  # CSV path for epoch-level training metrics.
+  # Options: any relative or absolute file path.
+  training_log_path: ./artifacts/logs/training_log.csv

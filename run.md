@@ -50,6 +50,26 @@ python scripts/run_linear_extrapolation_baseline.py --config configs/default.yam
 python scripts/evaluate_all_baselines.py --config configs/default.yaml --splits train val test
 ```
 
+Running Earthformer-lite:
+```bash
+python scripts/inspect_patch_cache.py --config configs/default.yaml
+python scripts/compute_normalization.py --config configs/default.yaml --from_cache
+python scripts/smoke_test_earthformer_lite.py --config configs/default.yaml
+python scripts/train_earthformer_lite.py --config configs/default.yaml
+python scripts/test_earthformer_lite.py --config configs/default.yaml --checkpoint artifacts/checkpoints/earthformer_lite/best_model.pt --split test
+python scripts/evaluate_all_baselines.py --config configs/default.yaml --split test --include_model --checkpoint artifacts/checkpoints/earthformer_lite/best_model.pt --model_architecture earthformer_lite
+```
+
+Running ST-Mamba-Lite:
+```bash
+python scripts/inspect_patch_cache.py --config configs/default.yaml
+python scripts/compute_normalization.py --config configs/default.yaml --from_cache
+python scripts/smoke_test_st_mamba_lite.py --config configs/default.yaml
+python scripts/train_st_mamba_lite.py --config configs/default.yaml
+python scripts/test_st_mamba_lite.py --config configs/default.yaml --checkpoint artifacts/checkpoints/st_mamba_lite/best_model.pt --split test
+python scripts/evaluate_all_baselines.py --config configs/default.yaml --split test --include_model --checkpoint artifacts/checkpoints/st_mamba_lite/best_model.pt --model_architecture st_mamba_lite
+```
+
 Train the model:
 
 ```bash
@@ -102,3 +122,24 @@ After the run, inspect these outputs:
 - the visualization output directory configured for your run
 
 If training fails with a data-directory error, rerun dataset discovery so `fire_dataset_index.json` matches the mounted `New_CAWFE` tree, then fix the manual fire lists if needed.
+
+## Running ST-Mamba-Lite
+`st_mamba_lite` is the CAWFE-tailored spatial-temporal Mamba architecture in this repo. It is inspired by MetMamba and ST-Mamba ideas, but it is not an official reproduction of either paper.
+
+Recommended workflow:
+
+```bash
+python scripts/inspect_patch_cache.py --config configs/default.yaml
+python scripts/compute_normalization.py --config configs/default.yaml --from_cache
+python scripts/smoke_test_st_mamba_lite.py --config configs/default.yaml
+python scripts/train_st_mamba_lite.py --config configs/default.yaml
+python scripts/test_st_mamba_lite.py --config configs/default.yaml --checkpoint artifacts/checkpoints/st_mamba_lite/best_model.pt --split test
+python scripts/evaluate_all_baselines.py --config configs/default.yaml --split test --include_model --checkpoint artifacts/checkpoints/st_mamba_lite/best_model.pt --model_architecture st_mamba_lite
+```
+
+Notes:
+- canonical ST-Mamba-Lite patch input is `(B, 6, 129, 64, 64)`
+- canonical output is `(B, 4, 64, 64)`
+- channel `2` remains mask logits; the model does not apply sigmoid internally
+- for real comparisons, install `mamba-ssm` and set `st_mamba_lite.mamba_backend: mamba_ssm`
+- if `st_mamba_lite.mamba_backend: auto` and `mamba-ssm` is missing, the fallback backend is intended for smoke/debug use only

@@ -37,7 +37,8 @@ except ImportError:  # pragma: no cover - environment-specific fallback
 from src.config import load_config
 from src.data.dataset import create_dataloaders
 from src.data.spatial_transforms import infer_with_external_test_spatial_handling
-from src.models.convlstm_unet import build_model_from_config
+from src.models.architecture_registry import resolve_model_architecture
+from src.models.model_factory import build_model_from_config
 from src.training.checkpoints import (
 	latest_and_best_checkpoint_paths,
 	load_checkpoint,
@@ -240,6 +241,7 @@ def _run_epoch(
 	scaler=None,
 	gradient_clip_norm: float | None = None,
 	mixed_precision: bool = False,
+	gradient_accumulation_steps: int = 1,
 	max_batches: int | None = None,
 	logger=None,
 	epoch_number: int | None = None,
@@ -248,6 +250,7 @@ def _run_epoch(
 
 	desc = "train" if train else "val"
 	model.train(mode=train)
+	gradient_accumulation_steps = max(1, int(gradient_accumulation_steps))
 	training_config = _get_section(config, "training")
 	log_timing = bool(training_config.get("log_timing", False))
 	timing_interval = max(1, int(training_config.get("timing_log_every_n_batches", 50)))
@@ -294,7 +297,7 @@ def _run_epoch(
 		if train and optimizer is None:
 			raise ValueError("An optimizer is required for training epochs.")
 
-		if train:
+		if train and (batch_number - 1) % gradient_accumulation_steps == 0:
 			optimizer.zero_grad(set_to_none=True)
 
 		forward_time = 0.0
@@ -325,34 +328,38 @@ def _run_epoch(
 				loss_start_time = time.perf_counter()
 				loss_result = criterion(y_pred, y_batch)
 				loss, batch_loss_components = _coerce_loss_result(loss_result)
+				loss_for_backward = loss / float(gradient_accumulation_steps)
 				_sync_if_timing()
 				loss_time = time.perf_counter() - loss_start_time
 
 			if train:
+				should_step = (batch_number % gradient_accumulation_steps == 0) or (batch_number == total_batches)
 				if scaler is not None and mixed_precision:
 					backward_start_time = time.perf_counter()
-					scaler.scale(loss).backward()
-					if gradient_clip_norm is not None:
+					scaler.scale(loss_for_backward).backward()
+					if should_step and gradient_clip_norm is not None:
 						scaler.unscale_(optimizer)
 						torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
 					_sync_if_timing()
 					backward_time = time.perf_counter() - backward_start_time
-					optimizer_start_time = time.perf_counter()
-					scaler.step(optimizer)
-					scaler.update()
-					_sync_if_timing()
-					optimizer_time = time.perf_counter() - optimizer_start_time
+					if should_step:
+						optimizer_start_time = time.perf_counter()
+						scaler.step(optimizer)
+						scaler.update()
+						_sync_if_timing()
+						optimizer_time = time.perf_counter() - optimizer_start_time
 				else:
 					backward_start_time = time.perf_counter()
-					loss.backward()
-					if gradient_clip_norm is not None:
+					loss_for_backward.backward()
+					if should_step and gradient_clip_norm is not None:
 						torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
 					_sync_if_timing()
 					backward_time = time.perf_counter() - backward_start_time
-					optimizer_start_time = time.perf_counter()
-					optimizer.step()
-					_sync_if_timing()
-					optimizer_time = time.perf_counter() - optimizer_start_time
+					if should_step:
+						optimizer_start_time = time.perf_counter()
+						optimizer.step()
+						_sync_if_timing()
+						optimizer_time = time.perf_counter() - optimizer_start_time
 
 		batch_size = int(x_batch.shape[0])
 		batch_loss_value = float(loss.detach().item())
@@ -488,7 +495,20 @@ def _resolve_training_paths(config: Mapping[str, Any]) -> tuple[Path, Path]:
 	config_path_value = config.get("config_path", config.get("_config_path"))
 	config_path = Path(config_path_value).expanduser().resolve() if config_path_value else None
 	resolved_latest = _resolve_path(config_path, checkpoint_path)
+	best_override = checkpoint_config.get("best_path")
+	if best_override:
+		return resolved_latest, _resolve_path(config_path, best_override)
 	return latest_and_best_checkpoint_paths(resolved_latest)
+
+
+def _resolve_training_log_path(config: Mapping[str, Any]) -> Path:
+	"""Resolve the CSV path used for epoch-level training logs."""
+
+	logging_config = _get_section(config, "logging")
+	configured = logging_config.get("training_log_path", "outputs/training_log.csv")
+	config_path_value = config.get("config_path", config.get("_config_path"))
+	config_path = Path(config_path_value).expanduser().resolve() if config_path_value else None
+	return _resolve_path(config_path, configured)
 
 
 def _resolve_existing_normalization_stats_path(config: Mapping[str, Any]) -> Path | None:
@@ -521,6 +541,336 @@ def _build_optimizer(model: nn.Module, config: Mapping[str, Any]):
 		return torch.optim.SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
 
 	raise ValueError(f"Unsupported optimizer: {optimizer_name}")
+
+
+def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
+	"""Train a model from an already-loaded configuration mapping."""
+
+	if torch is None:
+		raise ImportError("PyTorch is required to train the wildfire model.")
+
+	config = dict(config)
+	config["return_metadata"] = False
+	training_config = _get_section(config, "training")
+	logging_config = _get_section(config, "logging")
+	checkpoint_config = _get_section(config, "checkpoint")
+	architecture = resolve_model_architecture(config)
+
+	seed = int(training_config.get("seed", config.get("seed", 42)))
+	set_seed(seed)
+	if bool(training_config.get("cudnn_benchmark", False)) and torch.backends.cudnn.is_available():
+		torch.backends.cudnn.deterministic = False
+		torch.backends.cudnn.benchmark = True
+
+	log_level = str(logging_config.get("level", "INFO"))
+	log_dir = Path(logging_config.get("log_dir", "./artifacts/logs")).expanduser().resolve()
+	log_dir.mkdir(parents=True, exist_ok=True)
+	logger = setup_logging(log_level, str(log_dir / f"train_{architecture}.log"))
+
+	cache_config = _get_section(config, "cache")
+	if bool(cache_config.get("enabled", False)) and bool(cache_config.get("use_precomputed_patches", False)):
+		from src.data.cache import get_patch_cache_dir, validate_patch_cache
+
+		try:
+			cache_summary = validate_patch_cache(config, split=["train", "val"])
+		except Exception as exc:
+			if bool(cache_config.get("allow_dynamic_fallback", False)):
+				logger.warning("Patch-cache validation failed; dynamic fallback is enabled: %s", exc)
+			else:
+				raise
+		else:
+			normalization_stats_path = _resolve_existing_normalization_stats_path(config)
+			if not bool(cache_config.get("save_normalized_inputs", False)) and normalization_stats_path is None:
+				raise RuntimeError(
+					"Training is configured to load unnormalized precomputed patch shards, "
+					"but normalization stats were not found. Run:\n"
+					"python scripts/compute_normalization.py --config configs/default.yaml --from_cache"
+				)
+			logger.info(
+				"Using precomputed patch cache: %s | train=%s | val=%s | normalization=%s",
+				get_patch_cache_dir(config),
+				cache_summary["splits"]["train"]["num_samples"],
+				cache_summary["splits"]["val"]["num_samples"],
+				normalization_stats_path,
+			)
+	logger.info("Loading dataloaders")
+
+	train_loader, val_loader, test_loader = create_dataloaders(config)
+	input_sequence_length = int(config.get("input_sequence_length", training_config.get("input_sequence_length", 1)))
+	output_channels = int(_get_section(config, "model").get("output_channels", 1))
+
+	input_channels = _infer_input_channels_from_loader(train_loader)
+	configured_input_channels = int(_get_section(config, "model").get("input_channels", input_channels))
+	if configured_input_channels != input_channels:
+		logger.warning(
+			"Overriding configured input_channels=%s with inferred input_channels=%s.",
+			configured_input_channels,
+			input_channels,
+		)
+
+	device = _get_device(config)
+	logger.info("Using device: %s", device)
+
+	model = build_model_from_config(config, input_channels=input_channels)
+	model = model.to(device)
+	if bool(training_config.get("torch_compile", False)):
+		if not hasattr(torch, "compile"):
+			logger.warning("training.torch_compile=true, but this PyTorch build does not provide torch.compile.")
+		else:
+			try:
+				model = torch.compile(model)
+				logger.info("Enabled torch.compile for the model.")
+			except Exception as exc:  # pragma: no cover - backend-specific
+				logger.warning("torch.compile failed; continuing without compilation: %s", exc)
+
+	criterion = get_loss_function(config)
+	optimizer = _build_optimizer(model, config)
+	epochs = int(config.get("epochs", training_config.get("epochs", 1)))
+	scheduler = _build_scheduler(optimizer, config, epochs)
+
+	use_mixed_precision = bool(training_config.get("mixed_precision", False)) and device.type == "cuda"
+	scaler = GradScaler(enabled=use_mixed_precision) if use_mixed_precision and GradScaler is not None else None
+	gradient_clip_norm_value = training_config.get("gradient_clip_norm", config.get("gradient_clip_norm", None))
+	gradient_clip_norm = None if gradient_clip_norm_value in (None, "", 0, 0.0) else float(gradient_clip_norm_value)
+	gradient_accumulation_steps = max(1, int(training_config.get("gradient_accumulation_steps", 1)))
+
+	latest_checkpoint_path, best_checkpoint_path = _resolve_training_paths(config)
+	resume_enabled = bool(checkpoint_config.get("resume", True))
+	start_epoch = 0
+	best_val_loss = math.inf
+	resumed_from_checkpoint = False
+	history_rows: list[dict[str, float | int]] = []
+
+	if resume_enabled and latest_checkpoint_path.exists():
+		logger.info("Resuming from checkpoint: %s", latest_checkpoint_path)
+		checkpoint = load_checkpoint(latest_checkpoint_path, map_location="cpu")
+		validate_checkpoint_model_compatibility(model, checkpoint, latest_checkpoint_path)
+		model.load_state_dict(checkpoint["model_state_dict"])
+		if checkpoint.get("optimizer_state_dict") is not None:
+			optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+		if checkpoint.get("scheduler_state_dict") is not None and scheduler is not None:
+			scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+		start_epoch = int(checkpoint.get("epoch", -1)) + 1
+		best_val_loss = float(checkpoint.get("best_val_loss", math.inf))
+		resumed_from_checkpoint = True
+		history_rows = _coerce_history_rows(checkpoint.get("history", []))
+
+	if start_epoch >= epochs:
+		logger.info("Checkpoint already covers requested epochs (%s). Skipping training.", epochs)
+
+	training_log_path = _resolve_training_log_path(config)
+	training_log_path.parent.mkdir(parents=True, exist_ok=True)
+	append_log = training_log_path.exists() and start_epoch > 0
+
+	logger.info("Starting training for %s epochs", epochs)
+	test_sample_count = 0 if test_loader is None else len(test_loader.dataset)
+	logger.info("Train samples: %s | Val samples: %s | External test samples: %s", len(train_loader.dataset), len(val_loader.dataset), test_sample_count)
+	logger.info("Inferred input channels: %s", input_channels)
+	logger.info("Model architecture: %s", architecture)
+	logger.info("Model output channels: %s", output_channels)
+	logger.info(
+		"Patch mode | train=%s eval=%s patch_size=%s active_patch_probability=%s active_threshold=%s grad_accum=%s",
+		bool(config.get("use_patches", False)),
+		bool(config.get("use_patches_for_eval", False)),
+		int(config.get("patch_size", 64)),
+		float(config.get("active_patch_probability", 0.7)),
+		float(config.get("active_threshold", config.get("fire_threshold", 0.5))),
+		gradient_accumulation_steps,
+	)
+
+	final_epoch_summary: dict[str, Any] = dict(history_rows[-1]) if history_rows else {}
+	for epoch_index in range(start_epoch, epochs):
+		epoch_number = epoch_index + 1
+		logger.info("Epoch %s/%s", epoch_number, epochs)
+
+		train_results = _run_epoch(
+			model=model,
+			loader=train_loader,
+			criterion=criterion,
+			config=config,
+			device=device,
+			input_sequence_length=input_sequence_length,
+			input_channels=input_channels,
+			output_channels=output_channels,
+			train=True,
+			optimizer=optimizer,
+			scaler=scaler,
+			gradient_clip_norm=gradient_clip_norm,
+			mixed_precision=use_mixed_precision,
+			gradient_accumulation_steps=gradient_accumulation_steps,
+			logger=logger,
+			epoch_number=epoch_number,
+		)
+		max_val_batches_value = training_config.get("max_val_batches_per_epoch", None)
+		max_val_batches = None
+		if max_val_batches_value not in (None, "", "null"):
+			max_val_batches = max(1, int(max_val_batches_value))
+		full_validation_every_n_epochs = int(training_config.get("full_validation_every_n_epochs", 1) or 0)
+		run_full_validation = max_val_batches is None or (
+			full_validation_every_n_epochs > 0 and epoch_number % full_validation_every_n_epochs == 0
+		)
+		val_max_batches = None if run_full_validation else max_val_batches
+		if val_max_batches is not None:
+			logger.info(
+				"Validation capped at %s batch(es) for epoch %s; full validation every %s epoch(s).",
+				val_max_batches,
+				epoch_number,
+				full_validation_every_n_epochs,
+			)
+		val_results = _run_epoch(
+			model=model,
+			loader=val_loader,
+			criterion=criterion,
+			config=config,
+			device=device,
+			input_sequence_length=input_sequence_length,
+			input_channels=input_channels,
+			output_channels=output_channels,
+			train=False,
+			max_batches=val_max_batches,
+			logger=logger,
+			epoch_number=epoch_number,
+		)
+
+		val_loss = float(val_results["val_loss"])
+		if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+			scheduler.step(val_loss)
+		else:
+			scheduler.step()
+
+		next_best_val_loss = min(best_val_loss, val_loss)
+		row = {
+			"epoch": epoch_number,
+			"learning_rate": _current_lr(optimizer),
+			"train_loss": train_results["train_loss"],
+			"val_loss": val_results["val_loss"],
+			"best_val_loss": next_best_val_loss,
+			"use_patches_train": int(bool(config.get("use_patches", False))),
+			"use_patches_eval": int(bool(config.get("use_patches_for_eval", False))),
+			"patch_size": int(config.get("patch_size", 64)),
+		}
+		for metric_name, metric_value in train_results.items():
+			if metric_name != "train_loss":
+				row[metric_name] = metric_value
+		for metric_name, metric_value in val_results.items():
+			if metric_name != "val_loss":
+				row[metric_name] = metric_value
+
+		history_rows.append(row)
+		is_best_epoch = val_loss < best_val_loss
+		if is_best_epoch:
+			best_val_loss = val_loss
+			save_checkpoint(
+				best_checkpoint_path,
+				config=config,
+				model=model,
+				optimizer=optimizer,
+				scheduler=scheduler,
+				epoch=epoch_index,
+				best_val_loss=best_val_loss,
+				input_channels=input_channels,
+				resumed_from_checkpoint=resumed_from_checkpoint,
+				history=history_rows,
+			)
+			if not best_checkpoint_path.exists():
+				raise RuntimeError(f"Best checkpoint was not created at: {best_checkpoint_path}")
+
+		save_checkpoint(
+			latest_checkpoint_path,
+			config=config,
+			model=model,
+			optimizer=optimizer,
+			scheduler=scheduler,
+			epoch=epoch_index,
+			best_val_loss=best_val_loss,
+			input_channels=input_channels,
+			resumed_from_checkpoint=resumed_from_checkpoint,
+			history=history_rows,
+		)
+		if not latest_checkpoint_path.exists():
+			raise RuntimeError(f"Latest checkpoint was not created at: {latest_checkpoint_path}")
+
+		_log_to_csv(training_log_path, row, append=append_log)
+		if not training_log_path.exists():
+			raise RuntimeError(f"Training log CSV was not created at: {training_log_path}")
+		append_log = True
+		final_epoch_summary = row
+
+		logger.info(
+			"Epoch %s summary | train_loss=%.6f | val_loss=%.6f | best_val_loss=%.6f",
+			epoch_number,
+			train_results["train_loss"],
+			val_results["val_loss"],
+			best_val_loss,
+		)
+
+	test_results: dict[str, float] = {}
+	test_plot_results: dict[str, float] = {}
+	run_test_after_training = bool(training_config.get("run_test_after_training", config.get("run_test_after_training", False)))
+	run_external_test_after_training = bool(training_config.get("run_external_test_after_training", config.get("run_external_test_after_training", False)))
+	run_final_test_after_training = bool(run_test_after_training or run_external_test_after_training)
+	split_mode = str(config.get("split_mode", "train_val_test")).lower()
+	logger.info("Training complete. Best checkpoint selected using validation split.")
+	if split_mode == "train_val_external_test":
+		logger.info("Run scripts/test_model.py with test_data_dir configured for external testing.")
+	else:
+		logger.info("Run scripts/test_model.py to evaluate the combined internal test split.")
+	if run_final_test_after_training and test_loader is not None and len(test_loader.dataset) > 0:
+		logger.info("Loading best checkpoint for optional post-training test evaluation.")
+		if best_checkpoint_path.exists():
+			checkpoint = load_checkpoint(best_checkpoint_path, map_location=device)
+			validate_checkpoint_model_compatibility(model, checkpoint, best_checkpoint_path)
+			model.load_state_dict(checkpoint["model_state_dict"])
+		if split_mode == "train_val_external_test":
+			test_plot_results, spatial_mode_counts = _run_external_test_epoch_with_spatial_handling(
+				model=model,
+				loader=test_loader,
+				criterion=criterion,
+				config=config,
+				device=device,
+			)
+		else:
+			val_like_test_results = _run_epoch(
+				model=model,
+				loader=test_loader,
+				criterion=criterion,
+				config=config,
+				device=device,
+				input_sequence_length=input_sequence_length,
+				input_channels=input_channels,
+				output_channels=output_channels,
+				train=False,
+			)
+			test_plot_results = _rename_result_prefix(val_like_test_results, "val_", "test_")
+			spatial_mode_counts = {}
+		test_results = dict(test_plot_results)
+		logger.info("Test loss: %.6f", test_plot_results["test_loss"])
+		if spatial_mode_counts:
+			logger.info("External test spatial mode counts: %s", spatial_mode_counts)
+		for metric_name, metric_value in test_plot_results.items():
+			if metric_name != "test_loss":
+				logger.info("Test %s: %.6f", metric_name.removeprefix("test_"), metric_value)
+	elif run_final_test_after_training:
+		logger.info("Post-training test evaluation requested, but no test dataset is configured.")
+
+	training_curve_paths: list[str] = []
+	for checkpoint_path in (latest_checkpoint_path, best_checkpoint_path):
+		figure_path = _save_training_curves_figure(checkpoint_path, history_rows, test_plot_results)
+		if figure_path is not None and str(figure_path) not in training_curve_paths:
+			training_curve_paths.append(str(figure_path))
+			logger.info("Saved training curves: %s", figure_path)
+
+	return {
+		"start_epoch": start_epoch,
+		"epochs": epochs,
+		"best_val_loss": best_val_loss,
+		"latest_checkpoint_path": str(latest_checkpoint_path),
+		"best_checkpoint_path": str(best_checkpoint_path),
+		"training_log_path": str(training_log_path),
+		"training_curve_paths": training_curve_paths,
+		"final_epoch_summary": final_epoch_summary,
+		"test_results": test_results,
+	}
 
 
 def _build_scheduler(optimizer, config: Mapping[str, Any], epochs: int):
@@ -737,322 +1087,7 @@ def train_model(config_path: str | Path) -> dict[str, Any]:
 		raise ImportError("PyTorch is required to train the ConvLSTM U-Net model.")
 
 	config = _ensure_config_path(load_config(config_path), config_path)
-	config["return_metadata"] = False
-	training_config = _get_section(config, "training")
-	logging_config = _get_section(config, "logging")
-	checkpoint_config = _get_section(config, "checkpoint")
-
-	seed = int(training_config.get("seed", config.get("seed", 42)))
-	set_seed(seed)
-	if bool(training_config.get("cudnn_benchmark", False)) and torch.backends.cudnn.is_available():
-		torch.backends.cudnn.deterministic = False
-		torch.backends.cudnn.benchmark = True
-
-	log_level = str(logging_config.get("level", "INFO"))
-	log_dir = Path(logging_config.get("log_dir", "./artifacts/logs")).expanduser().resolve()
-	log_dir.mkdir(parents=True, exist_ok=True)
-	logger = setup_logging(log_level, str(log_dir / "train_convlstm_unet.log"))
-
-	cache_config = _get_section(config, "cache")
-	if bool(cache_config.get("enabled", False)) and bool(cache_config.get("use_precomputed_patches", False)):
-		from src.data.cache import get_patch_cache_dir, validate_patch_cache
-
-		try:
-			cache_summary = validate_patch_cache(config, split=["train", "val"])
-		except Exception as exc:
-			if bool(cache_config.get("allow_dynamic_fallback", False)):
-				logger.warning("Patch-cache validation failed; dynamic fallback is enabled: %s", exc)
-			else:
-				raise
-		else:
-			normalization_stats_path = _resolve_existing_normalization_stats_path(config)
-			if not bool(cache_config.get("save_normalized_inputs", False)) and normalization_stats_path is None:
-				raise RuntimeError(
-					"Training is configured to load unnormalized precomputed patch shards, "
-					"but normalization stats were not found. Run:\n"
-					"python scripts/compute_normalization.py --config configs/default.yaml --from_cache"
-				)
-			logger.info(
-				"Using precomputed patch cache: %s | train=%s | val=%s | normalization=%s",
-				get_patch_cache_dir(config),
-				cache_summary["splits"]["train"]["num_samples"],
-				cache_summary["splits"]["val"]["num_samples"],
-				normalization_stats_path,
-			)
-	logger.info("Loading dataloaders")
-
-	train_loader, val_loader, test_loader = create_dataloaders(config)
-	input_sequence_length = int(config.get("input_sequence_length", training_config.get("input_sequence_length", 1)))
-	output_channels = int(_get_section(config, "model").get("output_channels", 1))
-
-	input_channels = _infer_input_channels_from_loader(train_loader)
-	configured_input_channels = int(_get_section(config, "model").get("input_channels", input_channels))
-	if configured_input_channels != input_channels:
-		logger.warning(
-			"Overriding configured input_channels=%s with inferred input_channels=%s.",
-			configured_input_channels,
-			input_channels,
-		)
-
-	device = _get_device(config)
-	logger.info("Using device: %s", device)
-
-	model = build_model_from_config(config, input_channels=input_channels)
-	model = model.to(device)
-	if bool(training_config.get("torch_compile", False)):
-		if not hasattr(torch, "compile"):
-			logger.warning("training.torch_compile=true, but this PyTorch build does not provide torch.compile.")
-		else:
-			try:
-				model = torch.compile(model)
-				logger.info("Enabled torch.compile for the model.")
-			except Exception as exc:  # pragma: no cover - backend-specific
-				logger.warning("torch.compile failed; continuing without compilation: %s", exc)
-
-	criterion = get_loss_function(config)
-	optimizer = _build_optimizer(model, config)
-	epochs = int(config.get("epochs", training_config.get("epochs", 1)))
-	scheduler = _build_scheduler(optimizer, config, epochs)
-
-	use_mixed_precision = bool(training_config.get("mixed_precision", False)) and device.type == "cuda"
-	scaler = GradScaler(enabled=use_mixed_precision) if use_mixed_precision and GradScaler is not None else None
-	gradient_clip_norm_value = training_config.get("gradient_clip_norm", config.get("gradient_clip_norm", None))
-	gradient_clip_norm = None if gradient_clip_norm_value in (None, "", 0, 0.0) else float(gradient_clip_norm_value)
-
-	latest_checkpoint_path, best_checkpoint_path = _resolve_training_paths(config)
-	resume_enabled = bool(checkpoint_config.get("resume", True))
-	start_epoch = 0
-	best_val_loss = math.inf
-	resumed_from_checkpoint = False
-	history_rows: list[dict[str, float | int]] = []
-
-	if resume_enabled and latest_checkpoint_path.exists():
-		logger.info("Resuming from checkpoint: %s", latest_checkpoint_path)
-		checkpoint = load_checkpoint(latest_checkpoint_path, map_location="cpu")
-		validate_checkpoint_model_compatibility(model, checkpoint, latest_checkpoint_path)
-		model.load_state_dict(checkpoint["model_state_dict"])
-		if checkpoint.get("optimizer_state_dict") is not None:
-			optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-		if checkpoint.get("scheduler_state_dict") is not None and scheduler is not None:
-			scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-		start_epoch = int(checkpoint.get("epoch", -1)) + 1
-		best_val_loss = float(checkpoint.get("best_val_loss", math.inf))
-		resumed_from_checkpoint = True
-		history_rows = _coerce_history_rows(checkpoint.get("history", []))
-
-	if start_epoch >= epochs:
-		logger.info("Checkpoint already covers requested epochs (%s). Skipping training.", epochs)
-
-	training_log_path = Path("outputs/training_log.csv").resolve()
-	training_log_path.parent.mkdir(parents=True, exist_ok=True)
-	append_log = training_log_path.exists() and start_epoch > 0
-
-	logger.info("Starting training for %s epochs", epochs)
-	test_sample_count = 0 if test_loader is None else len(test_loader.dataset)
-	logger.info("Train samples: %s | Val samples: %s | External test samples: %s", len(train_loader.dataset), len(val_loader.dataset), test_sample_count)
-	logger.info("Inferred input channels: %s", input_channels)
-	logger.info("Model output channels: %s", output_channels)
-	logger.info(
-		"Patch mode | train=%s eval=%s patch_size=%s active_patch_probability=%s active_threshold=%s",
-		bool(config.get("use_patches", False)),
-		bool(config.get("use_patches_for_eval", False)),
-		int(config.get("patch_size", 64)),
-		float(config.get("active_patch_probability", 0.7)),
-		float(config.get("active_threshold", config.get("fire_threshold", 0.5))),
-	)
-
-	final_epoch_summary: dict[str, Any] = dict(history_rows[-1]) if history_rows else {}
-	for epoch_index in range(start_epoch, epochs):
-		epoch_number = epoch_index + 1
-		logger.info("Epoch %s/%s", epoch_number, epochs)
-
-		train_results = _run_epoch(
-			model=model,
-			loader=train_loader,
-			criterion=criterion,
-			config=config,
-			device=device,
-			input_sequence_length=input_sequence_length,
-			input_channels=input_channels,
-			output_channels=output_channels,
-			train=True,
-			optimizer=optimizer,
-			scaler=scaler,
-			gradient_clip_norm=gradient_clip_norm,
-			mixed_precision=use_mixed_precision,
-			logger=logger,
-			epoch_number=epoch_number,
-		)
-		max_val_batches_value = training_config.get("max_val_batches_per_epoch", None)
-		max_val_batches = None
-		if max_val_batches_value not in (None, "", "null"):
-			max_val_batches = max(1, int(max_val_batches_value))
-		full_validation_every_n_epochs = int(training_config.get("full_validation_every_n_epochs", 1) or 0)
-		run_full_validation = max_val_batches is None or (
-			full_validation_every_n_epochs > 0 and epoch_number % full_validation_every_n_epochs == 0
-		)
-		val_max_batches = None if run_full_validation else max_val_batches
-		if val_max_batches is not None:
-			logger.info(
-				"Validation capped at %s batch(es) for epoch %s; full validation every %s epoch(s).",
-				val_max_batches,
-				epoch_number,
-				full_validation_every_n_epochs,
-			)
-		val_results = _run_epoch(
-			model=model,
-			loader=val_loader,
-			criterion=criterion,
-			config=config,
-			device=device,
-			input_sequence_length=input_sequence_length,
-			input_channels=input_channels,
-			output_channels=output_channels,
-			train=False,
-			max_batches=val_max_batches,
-			logger=logger,
-			epoch_number=epoch_number,
-		)
-
-		val_loss = float(val_results["val_loss"])
-		if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-			scheduler.step(val_loss)
-		else:
-			scheduler.step()
-
-		next_best_val_loss = min(best_val_loss, val_loss)
-		row = {
-			"epoch": epoch_number,
-			"learning_rate": _current_lr(optimizer),
-			"train_loss": train_results["train_loss"],
-			"val_loss": val_results["val_loss"],
-			"best_val_loss": next_best_val_loss,
-			"use_patches_train": int(bool(config.get("use_patches", False))),
-			"use_patches_eval": int(bool(config.get("use_patches_for_eval", False))),
-			"patch_size": int(config.get("patch_size", 64)),
-		}
-		for metric_name, metric_value in train_results.items():
-			if metric_name != "train_loss":
-				row[metric_name] = metric_value
-		for metric_name, metric_value in val_results.items():
-			if metric_name != "val_loss":
-				row[metric_name] = metric_value
-
-		history_rows.append(row)
-		is_best_epoch = val_loss < best_val_loss
-		if is_best_epoch:
-			best_val_loss = val_loss
-			save_checkpoint(
-				best_checkpoint_path,
-				config=config,
-				model=model,
-				optimizer=optimizer,
-				scheduler=scheduler,
-				epoch=epoch_index,
-				best_val_loss=best_val_loss,
-				input_channels=input_channels,
-				resumed_from_checkpoint=resumed_from_checkpoint,
-				history=history_rows,
-			)
-			if not best_checkpoint_path.exists():
-				raise RuntimeError(f"Best checkpoint was not created at: {best_checkpoint_path}")
-
-		save_checkpoint(
-			latest_checkpoint_path,
-			config=config,
-			model=model,
-			optimizer=optimizer,
-			scheduler=scheduler,
-			epoch=epoch_index,
-			best_val_loss=best_val_loss,
-			input_channels=input_channels,
-			resumed_from_checkpoint=resumed_from_checkpoint,
-			history=history_rows,
-		)
-		if not latest_checkpoint_path.exists():
-			raise RuntimeError(f"Latest checkpoint was not created at: {latest_checkpoint_path}")
-
-		_log_to_csv(training_log_path, row, append=append_log)
-		if not training_log_path.exists():
-			raise RuntimeError(f"Training log CSV was not created at: {training_log_path}")
-		append_log = True
-		final_epoch_summary = row
-
-		logger.info(
-			"Epoch %s summary | train_loss=%.6f | val_loss=%.6f | best_val_loss=%.6f",
-			epoch_number,
-			train_results["train_loss"],
-			val_results["val_loss"],
-			best_val_loss,
-		)
-
-	test_results: dict[str, float] = {}
-	test_plot_results: dict[str, float] = {}
-	run_test_after_training = bool(training_config.get("run_test_after_training", config.get("run_test_after_training", False)))
-	run_external_test_after_training = bool(training_config.get("run_external_test_after_training", config.get("run_external_test_after_training", False)))
-	run_final_test_after_training = bool(run_test_after_training or run_external_test_after_training)
-	split_mode = str(config.get("split_mode", "train_val_test")).lower()
-	logger.info("Training complete. Best checkpoint selected using validation split.")
-	if split_mode == "train_val_external_test":
-		logger.info("Run scripts/test_model.py with test_data_dir configured for external testing.")
-	else:
-		logger.info("Run scripts/test_model.py to evaluate the combined internal test split.")
-	if run_final_test_after_training and test_loader is not None and len(test_loader.dataset) > 0:
-		logger.info("Loading best checkpoint for optional post-training test evaluation.")
-		if best_checkpoint_path.exists():
-			checkpoint = load_checkpoint(best_checkpoint_path, map_location=device)
-			validate_checkpoint_model_compatibility(model, checkpoint, best_checkpoint_path)
-			model.load_state_dict(checkpoint["model_state_dict"])
-		if split_mode == "train_val_external_test":
-			test_plot_results, spatial_mode_counts = _run_external_test_epoch_with_spatial_handling(
-				model=model,
-				loader=test_loader,
-				criterion=criterion,
-				config=config,
-				device=device,
-			)
-		else:
-			val_like_test_results = _run_epoch(
-				model=model,
-				loader=test_loader,
-				criterion=criterion,
-				config=config,
-				device=device,
-				input_sequence_length=input_sequence_length,
-				input_channels=input_channels,
-				output_channels=output_channels,
-				train=False,
-			)
-			test_plot_results = _rename_result_prefix(val_like_test_results, "val_", "test_")
-			spatial_mode_counts = {}
-		test_results = dict(test_plot_results)
-		logger.info("Test loss: %.6f", test_plot_results["test_loss"])
-		if spatial_mode_counts:
-			logger.info("External test spatial mode counts: %s", spatial_mode_counts)
-		for metric_name, metric_value in test_plot_results.items():
-			if metric_name != "test_loss":
-				logger.info("Test %s: %.6f", metric_name.removeprefix("test_"), metric_value)
-	elif run_final_test_after_training:
-		logger.info("Post-training test evaluation requested, but no test dataset is configured.")
-
-	training_curve_paths: list[str] = []
-	for checkpoint_path in (latest_checkpoint_path, best_checkpoint_path):
-		figure_path = _save_training_curves_figure(checkpoint_path, history_rows, test_plot_results)
-		if figure_path is not None and str(figure_path) not in training_curve_paths:
-			training_curve_paths.append(str(figure_path))
-			logger.info("Saved training curves: %s", figure_path)
-
-	return {
-		"start_epoch": start_epoch,
-		"epochs": epochs,
-		"best_val_loss": best_val_loss,
-		"latest_checkpoint_path": str(latest_checkpoint_path),
-		"best_checkpoint_path": str(best_checkpoint_path),
-		"training_log_path": str(training_log_path),
-		"training_curve_paths": training_curve_paths,
-		"final_epoch_summary": final_epoch_summary,
-		"test_results": test_results,
-	}
+	return train_model_from_config(config)
 
 
 def evaluate_model_on_test_set(

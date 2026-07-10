@@ -113,7 +113,7 @@ class ConvLSTMUNet(nn.Module):
 		return y_pred
 
 
-def build_model_from_config(config, input_channels: int):
+def build_convlstm_unet_from_config(config, input_channels: int):
 	"""Build a ``ConvLSTMUNet`` from a configuration dictionary."""
 
 	model_config = config.get("model", config)
@@ -132,6 +132,14 @@ def build_model_from_config(config, input_channels: int):
 		dropout=float(model_config.get("dropout", 0.0)),
 		output_activation=output_activation,
 	)
+
+
+def build_model_from_config(config, input_channels: int):
+	"""Backward-compatible generic model builder entry point."""
+
+	from src.models.model_factory import build_model_from_config as _build_model_from_config
+
+	return _build_model_from_config(config, input_channels=input_channels)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,71 @@
+"""Train the ST-Mamba-Lite wildfire model."""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+try:
+	import torch  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - environment-specific fallback
+	torch = None
+
+from src.config import load_config
+from src.models.model_factory import build_model_from_config
+from src.training.train import _ensure_config_path, train_model_from_config
+
+
+def _st_mamba_config(config_path: str | Path) -> dict:
+	config = _ensure_config_path(load_config(config_path), config_path)
+	model_config = dict(config.get("model", {}))
+	model_config["architecture"] = "st_mamba_lite"
+	model_config["name"] = "st_mamba_lite"
+	config["model"] = model_config
+
+	checkpoint_config = dict(config.get("checkpoint", {}))
+	checkpoint_config["path"] = "./artifacts/checkpoints/st_mamba_lite/latest_model.pt"
+	checkpoint_config["best_path"] = "./artifacts/checkpoints/st_mamba_lite/best_model.pt"
+	config["checkpoint"] = checkpoint_config
+
+	logging_config = dict(config.get("logging", {}))
+	logging_config["training_log_path"] = "./artifacts/logs/st_mamba_lite_training_log.csv"
+	config["logging"] = logging_config
+	return config
+
+
+def build_argument_parser() -> argparse.ArgumentParser:
+	parser = argparse.ArgumentParser(description="Train the ST-Mamba-Lite wildfire model.")
+	parser.add_argument("--config", default="configs/default.yaml", help="Path to the YAML configuration file.")
+	return parser
+
+
+def _print_model_summary(config: dict) -> None:
+	if torch is None:
+		return
+	input_channels = int(config.get("model", {}).get("input_channels", config.get("input_channel_count", 129)))
+	model = build_model_from_config(config, input_channels=input_channels)
+	parameter_count = sum(parameter.numel() for parameter in model.parameters())
+	section = config.get("st_mamba_lite", {})
+	sequence_length = int(section.get("input_sequence_length", config.get("input_sequence_length", 6)))
+	patch_size = int(section.get("patch_size", config.get("patch_size", 64)))
+	output_channels = int(config.get("model", {}).get("output_channels", 4))
+	print(f"architecture: st_mamba_lite")
+	print(f"parameter_count: {parameter_count}")
+	print(f"mamba_backend: {section.get('mamba_backend', 'auto')}")
+	print(f"mamba_backend_used: {getattr(model, 'mamba_backend_used', 'unknown')}")
+	print(f"scan_mode: {section.get('scan_mode', 'route_pair')}")
+	print(f"scan_routes: {section.get('scan_routes', ['HVT', 'TVH'])}")
+	print(f"patch_size: {patch_size}")
+	print(f"input_shape: (B, {sequence_length}, {input_channels}, {patch_size}, {patch_size})")
+	print(f"output_shape: (B, {output_channels}, {patch_size}, {patch_size})")
+
+
+def main() -> None:
+	args = build_argument_parser().parse_args()
+	config = _st_mamba_config(args.config)
+	_print_model_summary(config)
+	train_model_from_config(config)
+
+
+if __name__ == "__main__":
+	main()
