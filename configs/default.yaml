@@ -613,8 +613,9 @@ model:
   # - earthformer_lite
   # - st_mamba_lite
   # - weatherformer_lite
-  architecture: convlstm_unet
-  name: convlstm_unet
+  # - cawfe_latte_lite
+  architecture: cawfe_latte_lite
+  name: cawfe_latte_lite
 
   # Total input channels after all enabled engineered features are appended.
   # Options: any positive integer matching the actual dataset tensor width after engineering.
@@ -744,6 +745,105 @@ weatherformer_lite:
   norm_type: layernorm
   gradient_checkpointing: false
   required_patch_divisibility: 16
+
+cawfe_latte_lite:
+  input_sequence_length: 6
+  patch_size: 64
+
+  # Main dimensions.
+  embed_dim: 64
+  atm_embed_dim: 48
+  fire_embed_dim: 48
+  fused_dim: 96
+  backbone_dim: 96
+
+  # Raw CAWFE channel layout.
+  atmosphere_start_channel: 0
+  atmosphere_num_levels: 8
+  atmosphere_vars_per_level: 10
+  atmosphere_num_channels: 80
+  flux_channels: [80, 81, 82, 83]
+  fuel_channels: [84, 85]
+  engineered_start_channel: 86
+  engineered_end_channel: 128
+
+  # Ablation toggles.
+  use_vertical_atmosphere_encoder: true
+  vertical_encoder_type: attention
+  use_fire_fuel_encoder: true
+  use_fire_front_gate: true
+
+  # Hybrid backbone. Options: transformer_only, mamba_only, hybrid_transformer_mamba, conv_only.
+  backbone_type: hybrid_transformer_mamba
+  use_transformer_backbone: true
+  use_mamba_backbone: true
+  use_hybrid_backbone: true
+  num_backbone_stages: 2
+  backbone_depths: [2, 2]
+  num_heads: [4, 6]
+  window_size: 8
+  shifted_window: true
+
+  # Mamba backend. Options: auto, mamba_ssm, fallback.
+  mamba_backend: auto
+  mamba_d_state: 16
+  mamba_d_conv: 4
+  mamba_expand: 2
+  mamba_scan_mode: tri_axis
+
+  # Fire-front gate.
+  fire_gate_channels:
+    flux: true
+    fuel: true
+    engineered: true
+  fire_gate_hidden_dim: 32
+  fire_gate_strength: 1.0
+  fire_gate_mode: multiplicative
+
+  # Temporal readout. Options: last, mean, attention_pool.
+  temporal_readout: attention_pool
+
+  # Decoder.
+  decoder_type: unet
+  decoder_channels: [128, 64]
+  decoder_task_heads: separate
+  use_skip_connections: true
+  upsample_mode: bilinear
+
+  # Physical output constraints.
+  use_physical_output_constraints: true
+  constrain_consumed_nonnegative: true
+  constrain_energy_nonnegative: true
+  mask_output_is_logits: true
+
+  # Regularization.
+  dropout: 0.0
+  attention_dropout: 0.0
+  drop_path: 0.1
+  mlp_ratio: 4.0
+  norm_type: layernorm
+
+  # Future full CAWFE-Latte placeholder.
+  use_neural_operator_bottleneck: false
+
+  # Efficiency.
+  gradient_checkpointing: false
+  required_patch_divisibility: 16
+
+architectures:
+  available:
+    - convlstm_unet
+    - earthformer_lite
+    - cawfe_st_mamba
+    - weatherformer_lite
+    - cawfe_latte_lite
+    - current_frame_unet
+    - temporal_3d_unet
+    - convgru_unet
+    - attention_convlstm_unet
+    - swin_unet
+    - fno_2d
+    - ufno
 
 normalization:
   # Saved normalization-stats file.

@@ -20,6 +20,8 @@ class ArchitectureSpec:
 	expected_output_shape: str
 	supports_patch_cache: bool = True
 	supports_tiled_inference: bool = True
+	custom_architecture: bool = False
+	ablation_ready: bool = False
 
 
 ARCHITECTURE_REGISTRY: dict[str, ArchitectureSpec] = {
@@ -66,6 +68,20 @@ ARCHITECTURE_REGISTRY: dict[str, ArchitectureSpec] = {
 		expected_output_shape="(B, 4, H, W)",
 		supports_patch_cache=True,
 		supports_tiled_inference=True,
+	),
+	"cawfe_latte_lite": ArchitectureSpec(
+		name="cawfe_latte_lite",
+		requires_fixed_patch_size=True,
+		patch_divisibility=16,
+		input_type="sequence",
+		supports_sequence=True,
+		output_type="final_step_map",
+		expected_input_shape="(B, T, C, H, W)",
+		expected_output_shape="(B, 4, H, W)",
+		supports_patch_cache=True,
+		supports_tiled_inference=True,
+		custom_architecture=True,
+		ablation_ready=True,
 	),
 }
 

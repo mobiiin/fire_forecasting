@@ -165,6 +165,27 @@ Notes:
 - the shifted-window path currently uses cyclic shifts without a masking scheme
 - channel `2` remains mask logits; the model does not apply sigmoid internally
 
+## Running CAWFE-Latte-Lite
+`cawfe_latte_lite` is the custom paper architecture. It explicitly encodes CAWFE vertical atmospheric levels, fire/fuel state variables, fire-front attention, and a hybrid Transformer + Mamba backbone.
+
+Recommended workflow:
+
+```bash
+python scripts/inspect_patch_cache.py --config configs/default.yaml
+python scripts/compute_normalization.py --config configs/default.yaml --from_cache
+python scripts/smoke_test_cawfe_latte_lite.py --config configs/default.yaml
+python scripts/train_cawfe_latte_lite.py --config configs/default.yaml
+python scripts/test_cawfe_latte_lite.py --config configs/default.yaml --checkpoint artifacts/checkpoints/cawfe_latte_lite/best_model.pt --split test
+python scripts/ablate_cawfe_latte_lite.py --base_config configs/default.yaml --output_dir configs/ablations/cawfe_latte_lite/
+python scripts/evaluate_all_baselines.py --config configs/default.yaml --split test --include_model --checkpoint artifacts/checkpoints/cawfe_latte_lite/best_model.pt --model_architecture cawfe_latte_lite
+```
+
+Notes:
+- canonical CAWFE-Latte-Lite patch input is `(B, 6, 129, 64, 64)`
+- canonical output is `(B, 4, 64, 64)`
+- channel `2` remains mask logits; the model does not apply sigmoid internally
+- detailed architecture documentation is in `cawfe_latte.md`
+
 ## Rebuilding The Sliding-Window Patch Cache
 Train, validation, and test now all use sliding-window patchification with `patch_size=64` and `stride=60`.
 

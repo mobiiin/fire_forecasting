@@ -52,11 +52,11 @@ class IdentitySequenceInputAdapter(nn.Module):
 def adapt_input_for_architecture(x: torch.Tensor, architecture: str) -> torch.Tensor:
 	"""Apply any architecture-specific input adaptation.
 
-	The canonical dataset shape already matches ``st_mamba_lite`` and
-	``weatherformer_lite``, so those paths return ``x`` unchanged.
+	The canonical dataset shape already matches the sequence architectures, so
+	those paths return ``x`` unchanged.
 	"""
 
 	architecture_name = str(architecture).lower()
-	if architecture_name in {"st_mamba_lite", "weatherformer_lite"}:
+	if architecture_name in {"st_mamba_lite", "weatherformer_lite", "cawfe_latte_lite"}:
 		return x
 	return x

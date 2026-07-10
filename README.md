@@ -564,3 +564,14 @@ Use `--help` on any Python script for the full CLI:
 ```bash
 python scripts/visualize_predictions.py --help
 ```
+
+## CAWFE-Latte-Lite
+`cawfe_latte_lite` is the custom CAWFE-specific architecture for this project. It separately encodes vertical atmospheric structure and fire/fuel state variables, applies fire-front attention, and uses a hybrid Transformer + Mamba backbone to predict the four dense multitask maps.
+
+Detailed architecture notes are in [cawfe_latte.md](cawfe_latte.md).
+
+```bash
+python scripts/smoke_test_cawfe_latte_lite.py --config configs/default.yaml
+python scripts/train_cawfe_latte_lite.py --config configs/default.yaml
+python scripts/test_cawfe_latte_lite.py --config configs/default.yaml --checkpoint artifacts/checkpoints/cawfe_latte_lite/best_model.pt --split test
+```

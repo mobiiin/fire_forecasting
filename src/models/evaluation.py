@@ -63,6 +63,8 @@ def evaluate_checkpoint_on_split(
 			config["st_mamba_lite"] = {**dict(config["st_mamba_lite"]), **dict(config_override["st_mamba_lite"])}  # type: ignore[index]
 		if isinstance(config.get("weatherformer_lite"), Mapping) and isinstance(config_override.get("weatherformer_lite"), Mapping):  # type: ignore[union-attr]
 			config["weatherformer_lite"] = {**dict(config["weatherformer_lite"]), **dict(config_override["weatherformer_lite"])}  # type: ignore[index]
+		if isinstance(config.get("cawfe_latte_lite"), Mapping) and isinstance(config_override.get("cawfe_latte_lite"), Mapping):  # type: ignore[union-attr]
+			config["cawfe_latte_lite"] = {**dict(config["cawfe_latte_lite"]), **dict(config_override["cawfe_latte_lite"])}  # type: ignore[index]
 		if isinstance(config.get("checkpoint"), Mapping) and isinstance(config_override.get("checkpoint"), Mapping):  # type: ignore[union-attr]
 			config["checkpoint"] = {**dict(config["checkpoint"]), **dict(config_override["checkpoint"])}  # type: ignore[index]
 	config["return_metadata"] = True
