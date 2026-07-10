@@ -594,6 +594,7 @@ model:
   # - convlstm_unet
   # - earthformer_lite
   # - st_mamba_lite
+  # - weatherformer_lite
   architecture: convlstm_unet
   name: convlstm_unet
 
@@ -688,6 +689,41 @@ st_mamba_lite:
   mlp_ratio: 4.0
   use_adaln_conditioning: false
   use_fire_static_embedding: false
+  gradient_checkpointing: false
+  required_patch_divisibility: 16
+
+weatherformer_lite:
+  input_sequence_length: 6
+  patch_size: 64
+  embed_dim: 64
+  encoder_channels: [64, 128]
+  decoder_channels: [128, 64]
+  depths: [2, 2]
+  num_heads: [4, 8]
+  mlp_ratio: 4.0
+  use_channel_scaler: true
+  use_feature_gate: true
+  scaler_init: 1.0
+  use_time_pos_embed: true
+  use_2d_space_pos_embed: true
+  use_fourier_space_encoding: true
+  attention_type: factorized
+  temporal_attention: true
+  spatial_attention: window
+  window_size: 8
+  shifted_window: true
+  use_global_tokens: true
+  num_global_tokens: 4
+  downsample_stages: 2
+  patch_merge_factor: 2
+  temporal_readout: attention_pool
+  use_unet_decoder: true
+  use_skip_connections: true
+  upsample_mode: bilinear
+  dropout: 0.0
+  attention_dropout: 0.0
+  drop_path: 0.1
+  norm_type: layernorm
   gradient_checkpointing: false
   required_patch_divisibility: 16
 

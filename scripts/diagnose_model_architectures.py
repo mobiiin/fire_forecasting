@@ -26,6 +26,11 @@ def _build_config_for_architecture(base_config: dict, architecture: str) -> dict
 		checkpoint_config["path"] = "./artifacts/checkpoints/st_mamba_lite/latest_model.pt"
 		checkpoint_config["best_path"] = "./artifacts/checkpoints/st_mamba_lite/best_model.pt"
 		config["checkpoint"] = checkpoint_config
+	elif architecture == "weatherformer_lite":
+		checkpoint_config = dict(config.get("checkpoint", {}))
+		checkpoint_config["path"] = "./artifacts/checkpoints/weatherformer_lite/latest_model.pt"
+		checkpoint_config["best_path"] = "./artifacts/checkpoints/weatherformer_lite/best_model.pt"
+		config["checkpoint"] = checkpoint_config
 	elif architecture == "earthformer_lite":
 		checkpoint_config = dict(config.get("checkpoint", {}))
 		checkpoint_config["path"] = "./artifacts/checkpoints/earthformer_lite/latest_model.pt"
@@ -70,7 +75,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
 def main() -> None:
 	args = build_argument_parser().parse_args()
 	base_config = _ensure_config_path(load_config(args.config), args.config)
-	for architecture in ("convlstm_unet", "earthformer_lite", "st_mamba_lite"):
+	for architecture in ("convlstm_unet", "earthformer_lite", "st_mamba_lite", "weatherformer_lite"):
 		config = _build_config_for_architecture(base_config, architecture)
 		spec = get_architecture_spec(architecture)
 		result = _smoke_forward(config, architecture)

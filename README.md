@@ -310,6 +310,54 @@ OOM troubleshooting:
 - increase `training.gradient_accumulation_steps`
 - keep `training.mixed_precision: true`
 
+## WeatherFormer-lite Architecture
+This project also includes `weatherformer_lite`, an in-project WeatherFormer-inspired factorized transformer tailored to CAWFE wildfire forecasting. It is not the official WeatherFormer implementation.
+
+Canonical patch-cache input/output:
+- input: `(B, 6, 129, 64, 64)`
+- output: `(B, 4, 64, 64)`
+
+Output channels:
+- surface consumed fuel
+- canopy consumed fuel
+- fire/perimeter mask logits
+- `log1p` energy release map
+
+The model uses:
+- learnable channel scaling and feature gating over the CAWFE input channels
+- a per-timestep CNN stem
+- temporal attention at each spatial cell
+- local spatial window attention with optional cyclic shifted windows
+- temporal readout to final 2D maps
+- a U-Net-style decoder for dense prediction
+
+Commands:
+
+Smoke test:
+```bash
+python scripts/smoke_test_weatherformer_lite.py --config configs/default.yaml
+```
+
+Train:
+```bash
+python scripts/train_weatherformer_lite.py --config configs/default.yaml
+```
+
+Test:
+```bash
+python scripts/test_weatherformer_lite.py --config configs/default.yaml --checkpoint artifacts/checkpoints/weatherformer_lite/best_model.pt --split test
+```
+
+Compare with baselines:
+```bash
+python scripts/evaluate_all_baselines.py --config configs/default.yaml --split test --include_model --checkpoint artifacts/checkpoints/weatherformer_lite/best_model.pt --model_architecture weatherformer_lite
+```
+
+Notes:
+- this is a CAWFE-specific WeatherFormer-lite adaptation, not an official reproduction
+- the shifted-window path currently uses cyclic shifts without a masking scheme
+- channel `2` remains logits; the model does not apply sigmoid internally
+
 ## ST-Mamba-Lite Baseline
 This project is also being extended with `st_mamba_lite`, a CAWFE-tailored spatial-temporal Mamba baseline for dense wildfire forecasting. It should not be described as an official reproduction of any prior Mamba paper.
 

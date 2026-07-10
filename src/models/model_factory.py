@@ -8,6 +8,7 @@ from src.models.architecture_registry import get_architecture_spec, resolve_mode
 from src.models.convlstm_unet import ConvLSTMUNet, build_convlstm_unet_from_config
 from src.models.earthformer_lite import EarthformerLite
 from src.models.st_mamba_lite import STMamba
+from src.models.weatherformer_lite import WeatherFormerLite
 
 
 def build_model_from_config(config: Mapping[str, Any], input_channels: int):
@@ -88,6 +89,57 @@ def build_model_from_config(config: Mapping[str, Any], input_channels: int):
 			upsample_mode=str(section.get("upsample_mode", "bilinear")),
 			use_adaln_conditioning=bool(section.get("use_adaln_conditioning", False)),
 			use_fire_static_embedding=bool(section.get("use_fire_static_embedding", False)),
+			required_patch_divisibility=int(section.get("required_patch_divisibility", 16)),
+		)
+	if architecture == "weatherformer_lite":
+		section = config.get("weatherformer_lite", {})
+		if not isinstance(section, Mapping):
+			section = {}
+		attention_type = str(section.get("attention_type", "factorized")).lower()
+		if attention_type != "factorized":
+			raise ValueError(
+				"weatherformer_lite currently supports only attention_type='factorized'. "
+				f"Got {attention_type!r}."
+			)
+		if not bool(section.get("temporal_attention", True)):
+			raise ValueError("weatherformer_lite currently requires temporal_attention=true.")
+		spatial_attention = str(section.get("spatial_attention", "window")).lower()
+		if spatial_attention != "window":
+			raise ValueError(
+				"weatherformer_lite currently supports only spatial_attention='window'. "
+				f"Got {spatial_attention!r}."
+			)
+		return WeatherFormerLite(
+			input_channels=int(input_channels),
+			output_channels=int(model_config.get("output_channels", 4)),
+			input_sequence_length=int(section.get("input_sequence_length", config.get("input_sequence_length", 1))),
+			patch_size=int(section.get("patch_size", config.get("patch_size", 64))),
+			embed_dim=int(section.get("embed_dim", 64)),
+			encoder_channels=section.get("encoder_channels", [64, 128]),
+			decoder_channels=section.get("decoder_channels", [128, 64]),
+			depths=section.get("depths", [2, 2]),
+			num_heads=section.get("num_heads", [4, 8]),
+			mlp_ratio=float(section.get("mlp_ratio", 4.0)),
+			use_channel_scaler=bool(section.get("use_channel_scaler", True)),
+			use_feature_gate=bool(section.get("use_feature_gate", True)),
+			scaler_init=float(section.get("scaler_init", 1.0)),
+			use_time_pos_embed=bool(section.get("use_time_pos_embed", True)),
+			use_2d_space_pos_embed=bool(section.get("use_2d_space_pos_embed", True)),
+			use_fourier_space_encoding=bool(section.get("use_fourier_space_encoding", True)),
+			window_size=int(section.get("window_size", 8)),
+			shifted_window=bool(section.get("shifted_window", True)),
+			use_global_tokens=bool(section.get("use_global_tokens", True)),
+			num_global_tokens=int(section.get("num_global_tokens", 4)),
+			temporal_readout=str(section.get("temporal_readout", "attention_pool")),
+			dropout=float(section.get("dropout", 0.0)),
+			attention_dropout=float(section.get("attention_dropout", 0.0)),
+			drop_path=float(section.get("drop_path", 0.1)),
+			gradient_checkpointing=bool(section.get("gradient_checkpointing", False)),
+			use_unet_decoder=bool(section.get("use_unet_decoder", True)),
+			use_skip_connections=bool(section.get("use_skip_connections", True)),
+			upsample_mode=str(section.get("upsample_mode", "bilinear")),
+			downsample_stages=int(section.get("downsample_stages", 2)),
+			patch_merge_factor=int(section.get("patch_merge_factor", 2)),
 			required_patch_divisibility=int(section.get("required_patch_divisibility", 16)),
 		)
 	raise ValueError(f"Unsupported model architecture: {architecture!r}.")

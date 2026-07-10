@@ -55,6 +55,18 @@ ARCHITECTURE_REGISTRY: dict[str, ArchitectureSpec] = {
 		supports_patch_cache=True,
 		supports_tiled_inference=True,
 	),
+	"weatherformer_lite": ArchitectureSpec(
+		name="weatherformer_lite",
+		requires_fixed_patch_size=True,
+		patch_divisibility=16,
+		input_type="sequence",
+		supports_sequence=True,
+		output_type="final_step_map",
+		expected_input_shape="(B, T, C, H, W)",
+		expected_output_shape="(B, 4, H, W)",
+		supports_patch_cache=True,
+		supports_tiled_inference=True,
+	),
 }
 
 

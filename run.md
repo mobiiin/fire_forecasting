@@ -143,3 +143,24 @@ Notes:
 - channel `2` remains mask logits; the model does not apply sigmoid internally
 - for real comparisons, install `mamba-ssm` and set `st_mamba_lite.mamba_backend: mamba_ssm`
 - if `st_mamba_lite.mamba_backend: auto` and `mamba-ssm` is missing, the fallback backend is intended for smoke/debug use only
+
+## Running WeatherFormer-lite
+`weatherformer_lite` is the CAWFE-tailored factorized transformer in this repo. It is inspired by WeatherFormer, but it is not an official WeatherFormer implementation.
+
+Recommended workflow:
+
+```bash
+python scripts/inspect_patch_cache.py --config configs/default.yaml
+python scripts/compute_normalization.py --config configs/default.yaml --from_cache
+python scripts/smoke_test_weatherformer_lite.py --config configs/default.yaml
+python scripts/train_weatherformer_lite.py --config configs/default.yaml
+python scripts/test_weatherformer_lite.py --config configs/default.yaml --checkpoint artifacts/checkpoints/weatherformer_lite/best_model.pt --split test
+python scripts/evaluate_all_baselines.py --config configs/default.yaml --split test --include_model --checkpoint artifacts/checkpoints/weatherformer_lite/best_model.pt --model_architecture weatherformer_lite
+```
+
+Notes:
+- canonical WeatherFormer-lite patch input is `(B, 6, 129, 64, 64)`
+- canonical output is `(B, 4, 64, 64)`
+- it uses factorized temporal attention and local spatial window attention
+- the shifted-window path currently uses cyclic shifts without a masking scheme
+- channel `2` remains mask logits; the model does not apply sigmoid internally
