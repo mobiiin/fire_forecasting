@@ -43,6 +43,13 @@ Use these checks to confirm:
 - target channels are correct
 - energy-release geometry is sane
 
+Non-neural baselines:
+```bash
+python scripts/run_persistence_baseline.py --config configs/default.yaml --split test
+python scripts/run_linear_extrapolation_baseline.py --config configs/default.yaml --split test
+python scripts/evaluate_all_baselines.py --config configs/default.yaml --splits train val test
+```
+
 Train the model:
 
 ```bash

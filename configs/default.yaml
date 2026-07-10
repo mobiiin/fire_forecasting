@@ -560,6 +560,14 @@ energy_release:
   predict_sensible: false
   predict_latent: false
 
+baselines:
+  persistence:
+    mask_mode: zero
+
+  linear_extrapolation:
+    mask_source: predicted_consumed
+    consumed_threshold: 0.001
+
 geometry:
   require_geom_file: true
   earth_radius_m: 6371000.0
