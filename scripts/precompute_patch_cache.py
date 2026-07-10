@@ -60,6 +60,191 @@ def _selected_splits(split: str) -> list[str]:
 	return [split]
 
 
+def _atomic_write_text(path: Path, content: str) -> None:
+	temporary_path = path.with_name(f".{path.name}.tmp")
+	with temporary_path.open("w", encoding="utf-8") as handle:
+		handle.write(content)
+	temporary_path.replace(path)
+
+
+def _shard_artifacts(split_dir: Path, shard_index: int, shard_format: str) -> tuple[Path, Path]:
+	extension = ".pt" if str(shard_format).lower() == "pt" else ".npz"
+	shard_path = split_dir / f"shard_{shard_index:06d}{extension}"
+	metadata_path = split_dir / f"shard_{shard_index:06d}.metadata.jsonl"
+	return shard_path, metadata_path
+
+
+def _shard_index_from_path(path: Path) -> int:
+	name = path.stem
+	if not name.startswith("shard_"):
+		raise ValueError(f"Unexpected shard filename: {path}")
+	try:
+		return int(name.split("_", 1)[1])
+	except (IndexError, ValueError) as exc:
+		raise ValueError(f"Unexpected shard filename: {path}") from exc
+
+
+def _read_metadata_rows(path: Path) -> list[dict[str, Any]]:
+	rows: list[dict[str, Any]] = []
+	with path.open("r", encoding="utf-8") as handle:
+		for line_number, line in enumerate(handle, start=1):
+			line = line.strip()
+			if not line:
+				continue
+			try:
+				value = json.loads(line)
+			except json.JSONDecodeError as exc:
+				raise ValueError(f"Invalid JSON in metadata file {path} on line {line_number}.") from exc
+			if not isinstance(value, dict):
+				raise ValueError(f"Metadata rows must be JSON objects. Got {type(value)!r} in {path}:{line_number}.")
+			rows.append(value)
+	return rows
+
+
+def _read_shard_num_samples(shard_path: Path, shard_format: str) -> int:
+	if str(shard_format).lower() == "pt":
+		if torch is None:
+			raise ImportError("PyTorch is required to resume cache.shard_format=pt shards.")
+		shard = torch.load(shard_path, map_location="cpu")
+		if "X" not in shard or "y" not in shard:
+			raise ValueError(f"Shard is missing required X/y tensors: {shard_path}")
+		return int(shard["X"].shape[0])
+	with np.load(shard_path, allow_pickle=False) as shard:
+		if "X" not in shard.files or "y" not in shard.files:
+			raise ValueError(f"Shard is missing required X/y arrays: {shard_path}")
+		return int(shard["X"].shape[0])
+
+
+def _materialize_legacy_shard_metadata(split_dir: Path, split: str, shard_format: str) -> None:
+	"""Create per-shard metadata files from a legacy split-level metadata.jsonl."""
+
+	aggregate_metadata_path = split_dir / "metadata.jsonl"
+	if not aggregate_metadata_path.exists():
+		return
+	aggregate_rows = _read_metadata_rows(aggregate_metadata_path)
+	row_offset = 0
+	shard_index = 0
+	while True:
+		shard_path, metadata_path = _shard_artifacts(split_dir, shard_index, shard_format)
+		if not shard_path.exists():
+			break
+		num_samples = _read_shard_num_samples(shard_path, shard_format)
+		if metadata_path.exists():
+			row_offset += num_samples
+			shard_index += 1
+			continue
+		if row_offset + num_samples > len(aggregate_rows):
+			break
+		shard_rows = []
+		for local_index, row in enumerate(aggregate_rows[row_offset : row_offset + num_samples]):
+			item = dict(row)
+			item["shard"] = f"{split}/{shard_path.name}"
+			item["local_index"] = int(local_index)
+			shard_rows.append(item)
+		_atomic_write_text(
+			metadata_path,
+			"".join(json.dumps(row, sort_keys=True) + "\n" for row in shard_rows),
+		)
+		row_offset += num_samples
+		shard_index += 1
+
+
+def _discover_completed_shards(split_dir: Path, shard_format: str) -> list[dict[str, Any]]:
+	completed: list[dict[str, Any]] = []
+	if not split_dir.exists():
+		return completed
+	shard_index = 0
+	while True:
+		shard_path, metadata_path = _shard_artifacts(split_dir, shard_index, shard_format)
+		if not shard_path.exists() or not metadata_path.exists():
+			break
+		metadata_rows = _read_metadata_rows(metadata_path)
+		if not metadata_rows:
+			break
+		num_samples = _read_shard_num_samples(shard_path, shard_format)
+		if num_samples != len(metadata_rows):
+			raise ValueError(
+				f"Shard metadata length mismatch for {shard_path}: shard samples={num_samples}, metadata rows={len(metadata_rows)}."
+			)
+		completed.append(
+			{
+				"index": shard_index,
+				"path": shard_path,
+				"metadata_path": metadata_path,
+				"num_samples": num_samples,
+				"metadata_rows": metadata_rows,
+			}
+		)
+		shard_index += 1
+	return completed
+
+
+def _cleanup_incomplete_shard_artifacts(split_dir: Path, start_index: int, shard_format: str) -> None:
+	if not split_dir.exists():
+		return
+	for path in split_dir.glob("shard_*"):
+		if not path.is_file():
+			continue
+		if path.suffix.lower() not in {".npz", ".pt", ".jsonl"}:
+			continue
+		if not path.name.startswith("shard_"):
+			continue
+		if path.suffix.lower() == ".jsonl":
+			prefix = path.name.split(".metadata", 1)[0]
+			try:
+				shard_index = int(prefix.split("_", 1)[1])
+			except (IndexError, ValueError):
+				continue
+		else:
+			if path.suffix.lower() != (".pt" if str(shard_format).lower() == "pt" else ".npz"):
+				continue
+			shard_index = _shard_index_from_path(path)
+		if shard_index >= start_index:
+			path.unlink(missing_ok=True)
+
+
+def _rebuild_split_metadata_jsonl(split_dir: Path) -> int:
+	rows: list[dict[str, Any]] = []
+	for metadata_path in sorted(split_dir.glob("shard_*.metadata.jsonl")):
+		rows.extend(_read_metadata_rows(metadata_path))
+	output_path = split_dir / "metadata.jsonl"
+	with output_path.open("w", encoding="utf-8") as handle:
+		for row in rows:
+			handle.write(json.dumps(row, sort_keys=True) + "\n")
+	return len(rows)
+
+
+def _checkpoint_path(split_dir: Path) -> Path:
+	return split_dir / "resume_checkpoint.json"
+
+
+def _load_resume_checkpoint(split_dir: Path) -> dict[str, Any] | None:
+	path = _checkpoint_path(split_dir)
+	if not path.exists():
+		return None
+	with path.open("r", encoding="utf-8") as handle:
+		checkpoint = json.load(handle)
+	if not isinstance(checkpoint, dict):
+		raise ValueError(f"Resume checkpoint must contain a JSON object: {path}")
+	return checkpoint
+
+
+def _save_resume_checkpoint(split_dir: Path, split: str, next_episode: int, next_shard_index: int, total_samples: int) -> None:
+	path = _checkpoint_path(split_dir)
+	temporary_path = path.with_name(f".{path.name}.tmp")
+	payload = {
+		"split": split,
+		"next_episode": int(next_episode),
+		"next_shard_index": int(next_shard_index),
+		"total_samples": int(total_samples),
+		"updated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+	}
+	with temporary_path.open("w", encoding="utf-8") as handle:
+		json.dump(payload, handle, indent=2, sort_keys=True)
+		handle.write("\n")
+	temporary_path.replace(path)
+
+
 def _build_split_refs(
 	config: Mapping[str, Any],
 	dataset_records: Sequence[Mapping[str, Any]],
@@ -334,13 +519,12 @@ def _write_shard(
 	y_items: list[np.ndarray],
 	metadata_items: list[dict[str, Any]],
 	cache_config: Mapping[str, Any],
-	metadata_handle,
 ) -> dict[str, Any]:
 	shard_format = str(cache_config.get("shard_format", "npz")).lower()
 	compressed = bool(cache_config.get("compressed", False))
-	extension = ".pt" if shard_format == "pt" else ".npz"
-	shard_name = f"shard_{shard_index:06d}{extension}"
-	shard_path = split_dir / shard_name
+	shard_path, metadata_path = _shard_artifacts(split_dir, shard_index, shard_format)
+	temporary_shard_path = shard_path.with_name(f".{shard_path.name}.tmp")
+	temporary_metadata_path = metadata_path.with_name(f".{metadata_path.name}.tmp")
 	x_array = np.stack(x_items, axis=0).astype(np.float32, copy=False)
 	y_array = np.stack(y_items, axis=0).astype(np.float32, copy=False)
 	sample_ids = np.asarray([str(item["sample_id"]) for item in metadata_items])
@@ -351,39 +535,46 @@ def _write_shard(
 
 	if shard_format == "npz":
 		save_fn = np.savez_compressed if compressed else np.savez
-		save_fn(
-			shard_path,
-			X=x_array,
-			y=y_array,
-			sample_ids=sample_ids,
-			dataset_ids=dataset_ids,
-			patch_y0=patch_y0,
-			patch_x0=patch_x0,
-			sample_indices=sample_indices,
-		)
+		with temporary_shard_path.open("wb") as handle:
+			save_fn(
+				handle,
+				X=x_array,
+				y=y_array,
+				sample_ids=sample_ids,
+				dataset_ids=dataset_ids,
+				patch_y0=patch_y0,
+				patch_x0=patch_x0,
+				sample_indices=sample_indices,
+			)
 	elif shard_format == "pt":
 		if torch is None:
 			raise ImportError("PyTorch is required to write cache.shard_format=pt shards.")
-		torch.save(
-			{
-				"X": torch.from_numpy(x_array),
-				"y": torch.from_numpy(y_array),
-				"sample_ids": sample_ids.tolist(),
-				"dataset_ids": torch.from_numpy(dataset_ids),
-				"patch_y0": torch.from_numpy(patch_y0),
-				"patch_x0": torch.from_numpy(patch_x0),
-				"sample_indices": torch.from_numpy(sample_indices),
-			},
-			shard_path,
-		)
+		with temporary_shard_path.open("wb") as handle:
+			torch.save(
+				{
+					"X": torch.from_numpy(x_array),
+					"y": torch.from_numpy(y_array),
+					"sample_ids": sample_ids.tolist(),
+					"dataset_ids": torch.from_numpy(dataset_ids),
+					"patch_y0": torch.from_numpy(patch_y0),
+					"patch_x0": torch.from_numpy(patch_x0),
+					"sample_indices": torch.from_numpy(sample_indices),
+				},
+				handle,
+			)
 	else:
 		raise ValueError(f"Unsupported cache.shard_format={shard_format!r}. Expected 'npz' or 'pt'.")
 
+	metadata_lines: list[str] = []
+	shard_name = shard_path.name
 	for local_index, item in enumerate(metadata_items):
 		item = dict(item)
 		item["shard"] = f"{split}/{shard_name}"
 		item["local_index"] = int(local_index)
-		metadata_handle.write(json.dumps(item, sort_keys=True) + "\n")
+		metadata_lines.append(json.dumps(item, sort_keys=True))
+	_atomic_write_text(temporary_metadata_path, "\n".join(metadata_lines) + "\n")
+	temporary_shard_path.replace(shard_path)
+	temporary_metadata_path.replace(metadata_path)
 
 	return {
 		"path": f"{split}/{shard_name}",
@@ -449,6 +640,7 @@ def _precompute_split(
 	split: str,
 	cache_dir: Path,
 	manifest: dict[str, Any],
+	resume_from_episode: int | None = None,
 ) -> None:
 	cache_config = _get_section(config, "cache")
 	samples_per_shard = int(cache_config.get("samples_per_shard", 512))
@@ -456,22 +648,88 @@ def _precompute_split(
 		raise ValueError(f"cache.samples_per_shard must be positive, got {samples_per_shard}.")
 	split_dir = cache_dir / split
 	split_dir.mkdir(parents=True, exist_ok=True)
-	metadata_path = split_dir / "metadata.jsonl"
 	preview_enabled = bool(cache_config.get("save_preview_images", True))
 	max_previews = int(cache_config.get("num_preview_images", 50))
 	save_metadata = bool(cache_config.get("save_metadata", True))
+	preview_dir = cache_dir / "previews" / split
+	shard_format = str(cache_config.get("shard_format", "npz")).lower()
+	if save_metadata:
+		_materialize_legacy_shard_metadata(split_dir, split, shard_format)
+	existing_shards = _discover_completed_shards(split_dir, shard_format)
+	existing_manifest_shards = [
+		{
+			"path": f"{split}/{Path(str(item['path'])).name}",
+			"num_samples": int(item["num_samples"]),
+		}
+		for item in existing_shards
+	]
+	resume_index = len(existing_shards)
+	resume_sample_index = int(sum(int(item["num_samples"]) for item in existing_shards))
+	if resume_sample_index > len(dataset):
+		raise RuntimeError(
+			f"{split}: found {resume_sample_index} cached patch(es), but the current dataset only has "
+			f"{len(dataset)} patch(es). Pass --overwrite if the split definition changed."
+		)
+	checkpoint = _load_resume_checkpoint(split_dir)
+	checkpoint_episode = None
+	if checkpoint is not None:
+		checkpoint_split = str(checkpoint.get("split", split))
+		if checkpoint_split != split:
+			print(f"{split}: ignoring resume checkpoint for split={checkpoint_split!r}.")
+			checkpoint = None
+		else:
+			checkpoint_shard_index = int(checkpoint.get("next_shard_index", resume_index))
+			if checkpoint_shard_index != resume_index:
+				print(
+					f"{split}: checkpoint next_shard_index={checkpoint_shard_index} differs from "
+					f"complete shard count={resume_index}; using complete shards as the resume point."
+				)
+	if checkpoint is not None:
+		checkpoint_episode = int(checkpoint.get("next_episode", 0))
+	if resume_from_episode is not None:
+		if resume_from_episode < 0:
+			raise ValueError(f"resume_from_episode must be non-negative, got {resume_from_episode}.")
+		if int(resume_from_episode) > resume_sample_index:
+			raise RuntimeError(
+				f"{split}: --resume-from-episode={resume_from_episode} is ahead of the last complete "
+				f"cached patch index {resume_sample_index}. Reprocessing from {resume_sample_index} "
+				"keeps the cache contiguous; lower the requested index or pass --overwrite to rebuild."
+			)
+		start_episode = resume_sample_index
+		if int(resume_from_episode) < resume_sample_index:
+			print(
+				f"{split}: requested resume episode/sample index {resume_from_episode}; "
+				f"complete shards already cover {resume_sample_index} patch(es)."
+			)
+		else:
+			print(f"{split}: starting from requested episode/sample index {start_episode}.")
+	elif checkpoint_episode is not None:
+		start_episode = resume_sample_index
+		if checkpoint_episode != resume_sample_index:
+			print(
+				f"{split}: checkpoint next_episode={checkpoint_episode} differs from "
+				f"{resume_sample_index} complete cached patch(es); using complete shards as the resume point."
+			)
+		else:
+			print(f"{split}: resuming from checkpoint episode/sample index {start_episode}.")
+	else:
+		start_episode = resume_sample_index
+	if resume_index > 0:
+		_cleanup_incomplete_shard_artifacts(split_dir, resume_index, shard_format)
+		print(f"{split}: resuming from shard {resume_index:06d} after {resume_sample_index} cached patch(es).")
+	if start_episode > resume_sample_index:
+		print(f"{split}: skipping ahead to episode/sample index {start_episode}.")
 
 	shards: list[dict[str, Any]] = []
 	x_buffer: list[np.ndarray] = []
 	y_buffer: list[np.ndarray] = []
 	metadata_buffer: list[dict[str, Any]] = []
-	preview_count = 0
-	shard_index = 0
-	total_samples = 0
+	preview_count = len(list(preview_dir.glob("preview_*.png"))) if preview_enabled else 0
+	shard_index = resume_index
+	total_samples = start_episode
 	warned_large_shard = False
-	metadata_handle = metadata_path.open("w", encoding="utf-8") if save_metadata else open(Path("/dev/null"), "w", encoding="utf-8")
-	try:
-		for item_index in range(len(dataset)):
+	if total_samples < len(dataset):
+		for item_index in range(total_samples, len(dataset)):
 			x_tensor, y_tensor, metadata = dataset[item_index]
 			x_array = x_tensor.detach().cpu().numpy().astype(np.float32, copy=False)
 			y_array = y_tensor.detach().cpu().numpy().astype(np.float32, copy=False)
@@ -496,18 +754,40 @@ def _precompute_split(
 				preview_count += 1
 
 			if len(x_buffer) >= samples_per_shard:
-				shards.append(_write_shard(split_dir, split, shard_index, x_buffer, y_buffer, metadata_buffer, cache_config, metadata_handle))
+				shards.append(_write_shard(split_dir, split, shard_index, x_buffer, y_buffer, metadata_buffer, cache_config))
 				shard_index += 1
 				x_buffer.clear()
 				y_buffer.clear()
 				metadata_buffer.clear()
+				_save_resume_checkpoint(split_dir, split, total_samples, shard_index, total_samples)
 			if total_samples % 100 == 0:
-				print(f"{split}: cached {total_samples}/{len(dataset)} patches")
+				print(f"{split}: cached {total_samples}/{len(dataset)} patches (next episode {total_samples})")
 
 		if x_buffer:
-			shards.append(_write_shard(split_dir, split, shard_index, x_buffer, y_buffer, metadata_buffer, cache_config, metadata_handle))
-	finally:
-		metadata_handle.close()
+			shards.append(_write_shard(split_dir, split, shard_index, x_buffer, y_buffer, metadata_buffer, cache_config))
+			shard_index += 1
+			x_buffer.clear()
+			y_buffer.clear()
+			metadata_buffer.clear()
+			_save_resume_checkpoint(split_dir, split, total_samples, shard_index, total_samples)
+
+	shards = existing_manifest_shards + shards
+	shard_sample_count = int(sum(int(item["num_samples"]) for item in shards))
+	if shard_sample_count != total_samples:
+		raise RuntimeError(
+			f"{split}: internal resume mismatch: manifest would report {total_samples} patch(es), "
+			f"but complete shards contain {shard_sample_count} patch(es)."
+		)
+	if save_metadata:
+		metadata_rows = _rebuild_split_metadata_jsonl(split_dir)
+		if metadata_rows != total_samples:
+			raise RuntimeError(
+				f"{split}: metadata row count mismatch after resume: rows={metadata_rows}, "
+				f"cached patches={total_samples}."
+			)
+	else:
+		(split_dir / "metadata.jsonl").unlink(missing_ok=True)
+	_save_resume_checkpoint(split_dir, split, total_samples, shard_index, total_samples)
 
 	manifest["shards"][split] = shards
 	manifest[f"num_{split}_patches"] = int(total_samples)
@@ -518,6 +798,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 	parser = argparse.ArgumentParser(description="Precompute wildfire ConvLSTM patch-cache shards.")
 	parser.add_argument("--config", default="configs/default.yaml", help="Path to the YAML configuration file.")
 	parser.add_argument("--split", default="all", choices=["train", "val", "test", "all"], help="Split to precompute.")
+	parser.add_argument(
+		"--resume-from-episode",
+		type=int,
+		default=None,
+		help="Resume at or after this episode/sample index within the selected split.",
+	)
 	parser.add_argument("--overwrite", action="store_true", help="Overwrite existing shard files for the selected split(s).")
 	return parser
 
@@ -537,12 +823,7 @@ def main() -> None:
 
 	for split in selected:
 		split_dir = cache_dir / split
-		if split_dir.exists() and any(split_dir.glob("shard_*")):
-			if not overwrite:
-				raise FileExistsError(
-					f"Patch-cache split directory already contains shards: {split_dir}. "
-					"Set cache.overwrite_existing=true or pass --overwrite to replace it."
-				)
+		if overwrite and split_dir.exists():
 			shutil.rmtree(split_dir)
 
 	save_normalized_inputs = bool(cache_config.get("save_normalized_inputs", False))
@@ -621,7 +902,14 @@ def main() -> None:
 			split=split,
 			normalization_stats=normalization_stats,
 		)
-		_precompute_split(config, dataset, split, cache_dir, manifest)
+		_precompute_split(
+			config,
+			dataset,
+			split,
+			cache_dir,
+			manifest,
+			resume_from_episode=args.resume_from_episode,
+		)
 	print("Cache patch mode:")
 	for split in ("train", "val", "test"):
 		print(f"  {split}: {resolve_split_patch_mode(config, split)} stride={resolve_split_patch_stride(config, split)}")
