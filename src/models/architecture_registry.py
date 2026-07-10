@@ -22,6 +22,7 @@ class ArchitectureSpec:
 	supports_tiled_inference: bool = True
 	custom_architecture: bool = False
 	ablation_ready: bool = False
+	paper_main_model: bool = False
 
 
 ARCHITECTURE_REGISTRY: dict[str, ArchitectureSpec] = {
@@ -82,6 +83,21 @@ ARCHITECTURE_REGISTRY: dict[str, ArchitectureSpec] = {
 		supports_tiled_inference=True,
 		custom_architecture=True,
 		ablation_ready=True,
+	),
+	"cawfe_latte": ArchitectureSpec(
+		name="cawfe_latte",
+		requires_fixed_patch_size=True,
+		patch_divisibility=16,
+		input_type="sequence",
+		supports_sequence=True,
+		output_type="final_step_map",
+		expected_input_shape="(B, T, C, H, W)",
+		expected_output_shape="(B, 4, H, W)",
+		supports_patch_cache=True,
+		supports_tiled_inference=True,
+		custom_architecture=True,
+		ablation_ready=True,
+		paper_main_model=True,
 	),
 }
 

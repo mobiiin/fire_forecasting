@@ -89,6 +89,109 @@ Test:
 python scripts/test_cawfe_latte_lite.py --config configs/default.yaml --checkpoint artifacts/checkpoints/cawfe_latte_lite/best_model.pt --split test
 ```
 
-## Future Full CAWFE-Latte
+## Full CAWFE-Latte
 
-The full CAWFE-Latte version will add a neural-operator bottleneck, stronger wind-guided directional modules, and potentially a multi-step sequence decoder. CAWFE-Latte-Lite keeps those hooks out of the main path for now while preserving the ablation surface needed for paper experiments.
+`cawfe_latte` is the full paper architecture: CAWFE-Latte: Layer-Aware Temporal Transformer Neural Operator for Energy Release and Fire Spread Forecasting.
+
+CAWFE-Latte is a fire-aware spatiotemporal neural operator that explicitly separates atmospheric drivers from fire/fuel state variables, encodes vertical atmospheric structure, uses wind-guided and fire-front-guided feature modulation, combines local attention with long-range Mamba-style transport, and applies neural-operator bottleneck mixing for field-to-field prediction of fuel consumption, fire perimeter, and energy release.
+
+CAWFE-Latte-Lite implements the core modular architecture. Full CAWFE-Latte adds two physical inductive biases:
+
+- wind-guided directional modulation for wind-driven spread
+- AFNO-style neural-operator bottleneck mixing for global field-to-field coupling
+
+Architecture flow:
+
+```text
+CAWFE sequence
+↓
+Vertical Atmospheric Token Encoder
+↓
+Fire/Fuel State Encoder
+↓
+Wind-Guided Directional Module
+↓
+Fire-Front Attention Gate
+↓
+Hybrid Transformer + Mamba Backbone
+↓
+Neural Operator Bottleneck
+↓
+Multi-Task Fire Decoder
+↓
+Physical Output Constraints
+```
+
+The Wind-Guided Directional Module extracts low-level `U/V` wind from raw atmospheric channels when engineered wind channels are not configured. It computes wind speed, `cos`, and `sin`, then modulates fused feature maps according to wind-driven spread tendency.
+
+The Neural Operator Bottleneck treats CAWFE prediction as a field-operator learning problem. The first implementation uses AFNO-style spectral mixing: bottleneck feature maps are transformed with FFTs, mixed in Fourier space, shrunk for sparsity, inverted, and passed through a pointwise MLP. This adds global coupling beyond local convolution and attention.
+
+The decoder predicts the same four dense maps as Latte-Lite:
+
+- surface fuel consumption
+- canopy fuel consumption
+- fire/perimeter mask logits
+- `log1p` energy release map
+
+Optional physical constraints apply `softplus` to consumed fuel and energy release while preserving mask logits.
+
+## CAWFE-Latte vs CAWFE-Latte-Lite
+
+| Module | Latte-Lite | Full Latte |
+| --- | --- | --- |
+| vertical atmosphere encoder | yes | yes |
+| fire/fuel encoder | yes | yes |
+| fire-front gate | yes | yes |
+| hybrid transformer + mamba | yes | yes |
+| wind-guided directional module | no | yes |
+| neural operator bottleneck | no | yes |
+| physical constraints | optional | optional |
+
+## Full Model Ablation Plan
+
+Full CAWFE-Latte comparisons:
+
+- ConvLSTM U-Net
+- Earthformer-lite
+- WeatherFormer-lite
+- CAWFE-ST-Mamba
+- CAWFE-Latte-Lite
+- CAWFE-Latte full
+- full without wind guidance
+- full without neural operator
+- full without fire-front gate
+- full without vertical encoder
+- full transformer-only
+- full mamba-only
+
+Generate full-model ablation configs:
+
+```bash
+python scripts/ablate_cawfe_latte.py --base_config configs/default.yaml --output_dir configs/ablations/cawfe_latte/
+```
+
+## Full Model Commands
+
+Smoke test:
+
+```bash
+python scripts/smoke_test_cawfe_latte.py --config configs/default.yaml
+```
+
+Train:
+
+```bash
+python scripts/train_cawfe_latte.py --config configs/default.yaml
+```
+
+Test:
+
+```bash
+python scripts/test_cawfe_latte.py --config configs/default.yaml --checkpoint artifacts/checkpoints/cawfe_latte/best_model.pt --split test
+```
+
+Aux visualization:
+
+```bash
+python scripts/visualize_cawfe_latte_aux.py --config configs/default.yaml --checkpoint artifacts/checkpoints/cawfe_latte/best_model.pt --split test --num_samples 5
+```

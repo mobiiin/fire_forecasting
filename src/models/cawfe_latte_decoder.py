@@ -33,8 +33,8 @@ class MultiTaskFireDecoder(nn.Module):
 		self.stage1_channels = int(stage1_channels)
 		self.stage2_channels = int(stage2_channels)
 		self.decoder_channels = [int(value) for value in decoder_channels]
-		if len(self.decoder_channels) != 2:
-			raise ValueError(f"decoder_channels must contain exactly 2 values, got {decoder_channels!r}.")
+		if len(self.decoder_channels) < 2:
+			raise ValueError(f"decoder_channels must contain at least 2 values, got {decoder_channels!r}.")
 		self.output_channels = int(output_channels)
 		self.use_skip_connections = bool(use_skip_connections)
 		self.upsample_mode = str(upsample_mode).lower()
@@ -52,25 +52,30 @@ class MultiTaskFireDecoder(nn.Module):
 			self.low_res_project = nn.Conv2d(self.stage2_channels, self.decoder_channels[0], kernel_size=1)
 
 		decoder_input_channels = self.decoder_channels[0] + (self.stage1_channels if self.use_skip_connections else 0)
-		self.decoder = nn.Sequential(
-			nn.Conv2d(decoder_input_channels, self.decoder_channels[1], kernel_size=3, padding=1),
-			_make_group_norm(self.decoder_channels[1]),
-			nn.GELU(),
-			nn.Conv2d(self.decoder_channels[1], self.decoder_channels[1], kernel_size=3, padding=1),
-			_make_group_norm(self.decoder_channels[1]),
-			nn.GELU(),
-		)
+		decoder_layers: list[nn.Module] = []
+		in_channels = decoder_input_channels
+		for out_channels in self.decoder_channels[1:]:
+			decoder_layers.extend(
+				[
+					nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+					_make_group_norm(out_channels),
+					nn.GELU(),
+				]
+			)
+			in_channels = out_channels
+		self.decoder = nn.Sequential(*decoder_layers)
+		head_channels = self.decoder_channels[-1]
 		self.shared = nn.Sequential(
-			nn.Conv2d(self.decoder_channels[1], self.decoder_channels[1], kernel_size=3, padding=1),
+			nn.Conv2d(head_channels, head_channels, kernel_size=3, padding=1),
 			nn.GELU(),
 		)
 		if self.decoder_task_heads == "shared":
-			self.output_head = nn.Conv2d(self.decoder_channels[1], self.output_channels, kernel_size=1)
+			self.output_head = nn.Conv2d(head_channels, self.output_channels, kernel_size=1)
 		else:
-			self.surface_head = nn.Conv2d(self.decoder_channels[1], 1, kernel_size=1)
-			self.canopy_head = nn.Conv2d(self.decoder_channels[1], 1, kernel_size=1)
-			self.mask_head = nn.Conv2d(self.decoder_channels[1], 1, kernel_size=1)
-			self.energy_head = nn.Conv2d(self.decoder_channels[1], 1, kernel_size=1)
+			self.surface_head = nn.Conv2d(head_channels, 1, kernel_size=1)
+			self.canopy_head = nn.Conv2d(head_channels, 1, kernel_size=1)
+			self.mask_head = nn.Conv2d(head_channels, 1, kernel_size=1)
+			self.energy_head = nn.Conv2d(head_channels, 1, kernel_size=1)
 
 	def _upsample_bottleneck(self, z2: torch.Tensor, target_size: tuple[int, int]) -> torch.Tensor:
 		if self.upsample is not None:

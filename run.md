@@ -186,6 +186,29 @@ Notes:
 - channel `2` remains mask logits; the model does not apply sigmoid internally
 - detailed architecture documentation is in `cawfe_latte.md`
 
+## Running Full CAWFE-Latte
+`cawfe_latte` is the main custom paper model. It extends CAWFE-Latte-Lite with wind-guided directional modulation and an AFNO-style neural-operator bottleneck.
+
+Recommended workflow:
+
+```bash
+python scripts/inspect_patch_cache.py --config configs/default.yaml
+python scripts/compute_normalization.py --config configs/default.yaml --from_cache
+python scripts/smoke_test_cawfe_latte.py --config configs/default.yaml
+python scripts/train_cawfe_latte.py --config configs/default.yaml
+python scripts/test_cawfe_latte.py --config configs/default.yaml --checkpoint artifacts/checkpoints/cawfe_latte/best_model.pt --split test
+python scripts/visualize_cawfe_latte_aux.py --config configs/default.yaml --checkpoint artifacts/checkpoints/cawfe_latte/best_model.pt --split test --num_samples 5
+python scripts/ablate_cawfe_latte.py --base_config configs/default.yaml --output_dir configs/ablations/cawfe_latte/
+python scripts/evaluate_all_baselines.py --config configs/default.yaml --split test --include_model --checkpoint artifacts/checkpoints/cawfe_latte/best_model.pt --model_architecture cawfe_latte
+```
+
+Notes:
+- canonical full CAWFE-Latte patch input is `(B, 6, 129, 64, 64)`
+- canonical output is `(B, 4, 64, 64)`
+- channel `2` remains mask logits; the model does not apply sigmoid internally
+- if `mamba-ssm` is not installed, `mamba_backend: auto` uses the fallback gated SSM for smoke/debug runs
+- set `neural_operator_type: none` or reduce `neural_operator_depth` if memory is tight
+
 ## Rebuilding The Sliding-Window Patch Cache
 Train, validation, and test now all use sliding-window patchification with `patch_size=64` and `stride=60`.
 

@@ -57,6 +57,6 @@ def adapt_input_for_architecture(x: torch.Tensor, architecture: str) -> torch.Te
 	"""
 
 	architecture_name = str(architecture).lower()
-	if architecture_name in {"st_mamba_lite", "weatherformer_lite", "cawfe_latte_lite"}:
+	if architecture_name in {"st_mamba_lite", "weatherformer_lite", "cawfe_latte_lite", "cawfe_latte"}:
 		return x
 	return x

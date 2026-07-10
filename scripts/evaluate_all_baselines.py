@@ -72,6 +72,11 @@ def _model_config_override(architecture: str) -> dict[str, Any]:
 			"path": "./artifacts/checkpoints/cawfe_latte_lite/latest_model.pt",
 			"best_path": "./artifacts/checkpoints/cawfe_latte_lite/best_model.pt",
 		}
+	if architecture_name == "cawfe_latte":
+		override["checkpoint"] = {
+			"path": "./artifacts/checkpoints/cawfe_latte/latest_model.pt",
+			"best_path": "./artifacts/checkpoints/cawfe_latte/best_model.pt",
+		}
 	return override
 
 

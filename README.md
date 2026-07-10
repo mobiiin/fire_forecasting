@@ -575,3 +575,13 @@ python scripts/smoke_test_cawfe_latte_lite.py --config configs/default.yaml
 python scripts/train_cawfe_latte_lite.py --config configs/default.yaml
 python scripts/test_cawfe_latte_lite.py --config configs/default.yaml --checkpoint artifacts/checkpoints/cawfe_latte_lite/best_model.pt --split test
 ```
+
+## Full CAWFE-Latte
+`cawfe_latte` extends CAWFE-Latte-Lite with wind-guided directional feature modulation and an AFNO-style neural-operator bottleneck. This is the main custom paper architecture. Detailed documentation is in [cawfe_latte.md](cawfe_latte.md).
+
+```bash
+python scripts/smoke_test_cawfe_latte.py --config configs/default.yaml
+python scripts/train_cawfe_latte.py --config configs/default.yaml
+python scripts/test_cawfe_latte.py --config configs/default.yaml --checkpoint artifacts/checkpoints/cawfe_latte/best_model.pt --split test
+python scripts/visualize_cawfe_latte_aux.py --config configs/default.yaml --checkpoint artifacts/checkpoints/cawfe_latte/best_model.pt --split test --num_samples 5
+```
