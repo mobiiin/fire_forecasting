@@ -115,41 +115,182 @@ def _read_shard_num_samples(shard_path: Path, shard_format: str) -> int:
 		return int(shard["X"].shape[0])
 
 
-def _materialize_legacy_shard_metadata(split_dir: Path, split: str, shard_format: str) -> None:
+def _group_metadata_rows_by_shard(rows: Sequence[Mapping[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+	grouped: dict[str, list[dict[str, Any]]] = {}
+	for row in rows:
+		shard_value = row.get("shard")
+		if shard_value in (None, "", "null"):
+			continue
+		shard_name = Path(str(shard_value)).name
+		grouped.setdefault(shard_name, []).append(dict(row))
+	return grouped
+
+
+def _normalized_shard_metadata_rows(
+	rows: Sequence[Mapping[str, Any]],
+	split: str,
+	shard_name: str,
+) -> list[dict[str, Any]]:
+	normalized: list[dict[str, Any]] = []
+	for local_index, row in enumerate(rows):
+		item = dict(row)
+		item["shard"] = f"{split}/{shard_name}"
+		item["local_index"] = int(local_index)
+		normalized.append(item)
+	return normalized
+
+
+def _parse_sample_id(sample_id: str) -> tuple[str, int | None, int | None, int | None]:
+	parts = str(sample_id).split(":")
+	if len(parts) < 5:
+		return "", None, None, None
+	fire_name = ":".join(parts[1:-3])
+	try:
+		sample_index = int(parts[-3])
+	except ValueError:
+		sample_index = None
+	try:
+		patch_y0 = int(parts[-2])
+	except ValueError:
+		patch_y0 = None
+	try:
+		patch_x0 = int(parts[-1])
+	except ValueError:
+		patch_x0 = None
+	return fire_name, sample_index, patch_y0, patch_x0
+
+
+def _complete_metadata_rows_from_npz_shard(
+	shard_path: Path,
+	split: str,
+	existing_rows: Sequence[Mapping[str, Any]],
+	config: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+	with np.load(shard_path, allow_pickle=False) as shard:
+		if "X" not in shard.files or "y" not in shard.files:
+			raise ValueError(f"Shard is missing required X/y arrays: {shard_path}")
+		x_shape = tuple(int(value) for value in shard["X"].shape)
+		y_shape = tuple(int(value) for value in shard["y"].shape)
+		num_samples = int(x_shape[0])
+		sample_ids = [str(value) for value in shard["sample_ids"]] if "sample_ids" in shard.files else None
+		dataset_ids = [int(value) for value in shard["dataset_ids"]] if "dataset_ids" in shard.files else None
+		patch_y0_values = [int(value) for value in shard["patch_y0"]] if "patch_y0" in shard.files else None
+		patch_x0_values = [int(value) for value in shard["patch_x0"]] if "patch_x0" in shard.files else None
+		sample_indices = [int(value) for value in shard["sample_indices"]] if "sample_indices" in shard.files else None
+
+	rows_by_local_index = {
+		int(row.get("local_index", offset)): dict(row)
+		for offset, row in enumerate(existing_rows)
+	}
+	shard_name = shard_path.name
+	input_sequence_length = int(config["input_sequence_length"])
+	prediction_horizon = int(config["prediction_horizon"])
+	completed: list[dict[str, Any]] = []
+	for local_index in range(num_samples):
+		if local_index in rows_by_local_index:
+			item = dict(rows_by_local_index[local_index])
+			item["shard"] = f"{split}/{shard_name}"
+			item["local_index"] = int(local_index)
+			completed.append(item)
+			continue
+
+		sample_id = sample_ids[local_index] if sample_ids is not None else ""
+		fire_name, parsed_sample_index, parsed_y0, parsed_x0 = _parse_sample_id(sample_id)
+		sample_index = sample_indices[local_index] if sample_indices is not None else parsed_sample_index
+		patch_y0 = patch_y0_values[local_index] if patch_y0_values is not None else parsed_y0
+		patch_x0 = patch_x0_values[local_index] if patch_x0_values is not None else parsed_x0
+		if sample_index is None or patch_y0 is None or patch_x0 is None:
+			raise ValueError(f"Cannot reconstruct metadata for {shard_path} local_index={local_index}.")
+		current_idx = int(sample_index) + input_sequence_length - 1
+		future_idx = current_idx + prediction_horizon
+		patch_h = int(y_shape[-2])
+		patch_w = int(y_shape[-1])
+		completed.append(
+			{
+				"split": split,
+				"fire_name": fire_name,
+				"dataset_id": int(dataset_ids[local_index]) if dataset_ids is not None else -1,
+				"sample_index": int(sample_index),
+				"current_idx": int(current_idx),
+				"future_idx": int(future_idx),
+				"patch": {
+					"y0": int(patch_y0),
+					"y1": int(patch_y0) + patch_h,
+					"x0": int(patch_x0),
+					"x1": int(patch_x0) + patch_w,
+				},
+				"patch_type": "reconstructed",
+				"x_shape": [int(value) for value in x_shape[1:]],
+				"y_shape": [int(value) for value in y_shape[1:]],
+				"sample_id": sample_id or f"{split}:{fire_name}:{sample_index}:{patch_y0}:{patch_x0}",
+				"shard": f"{split}/{shard_name}",
+				"local_index": int(local_index),
+			}
+		)
+	return completed
+
+
+def _complete_metadata_rows_from_shard(
+	shard_path: Path,
+	shard_format: str,
+	split: str,
+	existing_rows: Sequence[Mapping[str, Any]],
+	config: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+	if str(shard_format).lower() != "npz":
+		return _normalized_shard_metadata_rows(existing_rows, split, shard_path.name)
+	return _complete_metadata_rows_from_npz_shard(shard_path, split, existing_rows, config)
+
+
+def _materialize_legacy_shard_metadata(
+	split_dir: Path,
+	split: str,
+	shard_format: str,
+	config: Mapping[str, Any],
+) -> None:
 	"""Create per-shard metadata files from a legacy split-level metadata.jsonl."""
 
 	aggregate_metadata_path = split_dir / "metadata.jsonl"
 	if not aggregate_metadata_path.exists():
 		return
 	aggregate_rows = _read_metadata_rows(aggregate_metadata_path)
-	row_offset = 0
+	rows_by_shard = _group_metadata_rows_by_shard(aggregate_rows)
+	samples_per_shard = int(_get_section(config, "cache").get("samples_per_shard", 512))
 	shard_index = 0
 	while True:
 		shard_path, metadata_path = _shard_artifacts(split_dir, shard_index, shard_format)
 		if not shard_path.exists():
 			break
-		num_samples = _read_shard_num_samples(shard_path, shard_format)
 		if metadata_path.exists():
-			row_offset += num_samples
 			shard_index += 1
 			continue
-		if row_offset + num_samples > len(aggregate_rows):
+		shard_rows = rows_by_shard.get(shard_path.name, [])
+		if not shard_rows:
 			break
-		shard_rows = []
-		for local_index, row in enumerate(aggregate_rows[row_offset : row_offset + num_samples]):
-			item = dict(row)
-			item["shard"] = f"{split}/{shard_path.name}"
-			item["local_index"] = int(local_index)
-			shard_rows.append(item)
+		if len(shard_rows) >= samples_per_shard:
+			completed_rows = _normalized_shard_metadata_rows(
+				shard_rows[:samples_per_shard],
+				split,
+				shard_path.name,
+			)
+		else:
+			completed_rows = _complete_metadata_rows_from_shard(
+				shard_path,
+				shard_format,
+				split,
+				shard_rows,
+				config,
+			)
+			if len(completed_rows) <= len(shard_rows):
+				break
 		_atomic_write_text(
 			metadata_path,
-			"".join(json.dumps(row, sort_keys=True) + "\n" for row in shard_rows),
+			"".join(json.dumps(row, sort_keys=True) + "\n" for row in completed_rows),
 		)
-		row_offset += num_samples
 		shard_index += 1
 
 
-def _discover_completed_shards(split_dir: Path, shard_format: str) -> list[dict[str, Any]]:
+def _discover_completed_shards(split_dir: Path, shard_format: str, *, validate_shard_shapes: bool = False) -> list[dict[str, Any]]:
 	completed: list[dict[str, Any]] = []
 	if not split_dir.exists():
 		return completed
@@ -161,11 +302,13 @@ def _discover_completed_shards(split_dir: Path, shard_format: str) -> list[dict[
 		metadata_rows = _read_metadata_rows(metadata_path)
 		if not metadata_rows:
 			break
-		num_samples = _read_shard_num_samples(shard_path, shard_format)
-		if num_samples != len(metadata_rows):
-			raise ValueError(
-				f"Shard metadata length mismatch for {shard_path}: shard samples={num_samples}, metadata rows={len(metadata_rows)}."
-			)
+		num_samples = int(len(metadata_rows))
+		if validate_shard_shapes:
+			shard_samples = _read_shard_num_samples(shard_path, shard_format)
+			if shard_samples != num_samples:
+				raise ValueError(
+					f"Shard metadata length mismatch for {shard_path}: shard samples={shard_samples}, metadata rows={num_samples}."
+				)
 		completed.append(
 			{
 				"index": shard_index,
@@ -654,7 +797,7 @@ def _precompute_split(
 	preview_dir = cache_dir / "previews" / split
 	shard_format = str(cache_config.get("shard_format", "npz")).lower()
 	if save_metadata:
-		_materialize_legacy_shard_metadata(split_dir, split, shard_format)
+		_materialize_legacy_shard_metadata(split_dir, split, shard_format, config)
 	existing_shards = _discover_completed_shards(split_dir, shard_format)
 	existing_manifest_shards = [
 		{
