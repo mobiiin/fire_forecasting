@@ -1,4 +1,4 @@
-"""Tests for manual multi-fire splits and deterministic eval patch refs."""
+"""Tests for manual multi-fire splits and deterministic patch refs."""
 
 from __future__ import annotations
 
@@ -7,7 +7,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from src.data.splits import build_eval_patch_refs, manual_fire_holdout_splits
+from src.data.patching import build_sliding_window_patches
+from src.data.splits import build_eval_patch_refs, build_sliding_patch_refs_for_split, manual_fire_holdout_splits
 
 
 class MultiFireSplitTests(unittest.TestCase):
@@ -146,6 +147,52 @@ class MultiFireSplitTests(unittest.TestCase):
 		first_patch = patch_refs[0]["patch"]
 		self.assertEqual(first_patch, {"y0": 0, "y1": 4, "x0": 0, "x1": 4})
 		self.assertTrue(all(ref["dataset_name"] == "FIRE_A" for ref in patch_refs))
+
+	def test_stride_60_border_coverage_reaches_domain_edge(self) -> None:
+		patches = build_sliding_window_patches(
+			height=144,
+			width=144,
+			patch_h=64,
+			patch_w=64,
+			stride_h=60,
+			stride_w=60,
+			include_border_patches=True,
+		)
+		y_starts = sorted({patch["y0"] for patch in patches})
+		x_starts = sorted({patch["x0"] for patch in patches})
+		self.assertEqual(y_starts, [0, 60, 80])
+		self.assertEqual(x_starts, [0, 60, 80])
+		self.assertEqual(max(patch["y1"] for patch in patches), 144)
+		self.assertEqual(max(patch["x1"] for patch in patches), 144)
+
+	def test_build_sliding_patch_refs_for_train_expands_temporal_refs(self) -> None:
+		config = {
+			"patching": {
+				"enabled": True,
+				"patch_height": 4,
+				"patch_width": 4,
+				"train_patch_mode": "sliding_window",
+				"train_stride": 2,
+				"include_border_patches": True,
+			},
+			"cache": {
+				"train_patch_mode": "sliding_window",
+				"train_stride": 2,
+			},
+		}
+		sample_refs = [
+			{"dataset_id": 0, "dataset_name": "FIRE_A", "sample_index": 0, "fire_split_group": "train"},
+			{"dataset_id": 0, "dataset_name": "FIRE_A", "sample_index": 1, "fire_split_group": "train"},
+		]
+		patch_refs = build_sliding_patch_refs_for_split(
+			dataset_records=self.dataset_records,
+			sample_refs=sample_refs,
+			split="train",
+			config=config,
+		)
+		self.assertEqual(len(patch_refs), 8)
+		self.assertTrue(all(ref["patch_mode"] == "sliding_window" for ref in patch_refs))
+		self.assertTrue(all(ref["split"] == "train" for ref in patch_refs))
 
 
 if __name__ == "__main__":

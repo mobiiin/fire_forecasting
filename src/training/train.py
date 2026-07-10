@@ -698,6 +698,11 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 			gradient_clip_norm=gradient_clip_norm,
 			mixed_precision=use_mixed_precision,
 			gradient_accumulation_steps=gradient_accumulation_steps,
+			max_batches=(
+				max(1, int(training_config.get("max_train_batches_per_epoch")))
+				if training_config.get("max_train_batches_per_epoch", None) not in (None, "", "null")
+				else None
+			),
 			logger=logger,
 			epoch_number=epoch_number,
 		)

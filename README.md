@@ -358,6 +358,42 @@ Notes:
 - the shifted-window path currently uses cyclic shifts without a masking scheme
 - channel `2` remains logits; the model does not apply sigmoid internally
 
+## Sliding-Window Patch Cache
+The project now supports deterministic sliding-window patchification for train, validation, and test. The current default is:
+- `patch_size = 64`
+- `stride = 60`
+
+This gives nearly non-overlapping patches with a 4-pixel overlap while still covering the full fire domain, including border-aligned patches. Compared with the earlier sampled-train / sliding-eval behavior, it keeps training and evaluation patchification consistent.
+
+Commands:
+
+Rebuild the sliding-window patch cache:
+```bash
+python scripts/precompute_patch_cache.py --config configs/default.yaml --split all
+```
+
+Inspect the cache:
+```bash
+python scripts/inspect_patch_cache.py --config configs/default.yaml
+```
+
+Compute normalization from the rebuilt cache:
+```bash
+python scripts/compute_normalization.py --config configs/default.yaml --from_cache
+```
+
+Train:
+```bash
+python scripts/train_convlstm_unet.py --config configs/default.yaml
+```
+
+Notes:
+- train, validation, and test now all use sliding-window patchification
+- the train cache is much larger than the older sampled-train cache, so one epoch can be substantially longer
+- if needed, reduce epochs or set `training.max_train_batches_per_epoch`
+- after changing patch stride or patch mode, rebuild the scratch cache or bump `cache.cache_version`
+- old sampled or stride-32 caches are incompatible with the current config
+
 ## ST-Mamba-Lite Baseline
 This project is also being extended with `st_mamba_lite`, a CAWFE-tailored spatial-temporal Mamba baseline for dense wildfire forecasting. It should not be described as an official reproduction of any prior Mamba paper.
 

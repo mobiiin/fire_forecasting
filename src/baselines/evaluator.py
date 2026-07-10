@@ -28,9 +28,9 @@ from src.data.cached_patch_dataset import CachedPatchDataset
 from src.data.cache import get_patch_cache_dir
 from src.data.dataset import MultiFirePatchSequenceDataset, metadata_batch_to_list
 from src.data.discovery import discover_multiple_datasets
-from src.data.patching import resolve_patching_config
+from src.data.patching import resolve_patching_config, resolve_split_patch_mode
 from src.data.preprocessing import load_normalization_stats
-from src.data.splits import build_eval_patch_refs, manual_fire_holdout_splits, multi_fire_chronological_splits
+from src.data.splits import build_sliding_patch_refs_for_split, manual_fire_holdout_splits, multi_fire_chronological_splits
 from src.training.losses import get_loss_function
 from src.training.metrics import compute_metrics
 from src.training.train import _coerce_loss_result, _denormalize_target_tensors_for_metrics
@@ -155,15 +155,16 @@ def _build_dynamic_split_loader(
 	selected_refs = list(sample_refs[split])
 	patching = resolve_patching_config(config)
 	use_patches = False
+	split_patch_mode = resolve_split_patch_mode(config, split, prefer_cache=False)
 	if mode == "patch":
-		if split == "train":
-			use_patches = bool(patching["enabled"])
-		elif bool(patching["enabled"]) and str(patching["eval_mode"]) == "sliding_window":
-			selected_refs = build_eval_patch_refs(dataset_records=dataset_records, sample_refs=selected_refs, config=config, split_name=split)
+		if split_patch_mode == "sliding_window":
+			selected_refs = build_sliding_patch_refs_for_split(dataset_records=dataset_records, sample_refs=selected_refs, split=split, config=config)
 			use_patches = True
+		elif split == "train":
+			use_patches = bool(patching["enabled"])
 	elif mode == "full_domain_tiled":
-		if bool(patching["enabled"]) and str(patching["eval_mode"]) == "sliding_window":
-			selected_refs = build_eval_patch_refs(dataset_records=dataset_records, sample_refs=selected_refs, config=config, split_name=split)
+		if split_patch_mode == "sliding_window":
+			selected_refs = build_sliding_patch_refs_for_split(dataset_records=dataset_records, sample_refs=selected_refs, split=split, config=config)
 			use_patches = True
 	else:
 		raise ValueError(f"Unsupported baseline evaluation mode: {mode!r}.")

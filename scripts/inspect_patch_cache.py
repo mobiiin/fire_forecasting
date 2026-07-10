@@ -112,10 +112,14 @@ def main() -> None:
 	print(f"input: T={manifest.get('input_sequence_length')} C={manifest.get('input_channels')}")
 	print(f"target channels: {manifest.get('output_channels')}")
 	print(f"patch: {manifest.get('patch_height')}x{manifest.get('patch_width')}")
+	print(f"include_border_patches: {manifest.get('include_border_patches')}")
+	print(f"patch_modes: {manifest.get('patch_modes')}")
+	print(f"strides: {manifest.get('strides')}")
 	print(f"save_normalized_inputs: {manifest.get('save_normalized_inputs')}")
 	for split, split_summary in summary["splits"].items():
 		print(
-			f"{split}: samples={split_summary['num_samples']} shards={split_summary['num_shards']} "
+			f"{split}: patch_mode={split_summary['patch_mode']} stride={split_summary['stride']} "
+			f"samples={split_summary['num_samples']} shards={split_summary['num_shards']} "
 			f"first_X={split_summary['x_shape']} first_y={split_summary['y_shape']}"
 		)
 

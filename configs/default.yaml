@@ -142,12 +142,18 @@ cache:
   enabled: true
   scratch_root: /scratch/mhabibp/
   cache_dir: /scratch/mhabibp/fire_forecasting_patch_cache/
-  cache_version: v1
+  cache_version: v2_sliding_stride60
   use_precomputed_patches: true
   allow_dynamic_fallback: false
   validate_cache_before_training: true
   overwrite_existing: false
   allow_config_hash_mismatch: false
+  train_patch_mode: sliding_window
+  val_patch_mode: sliding_window
+  test_patch_mode: sliding_window
+  train_stride: 60
+  val_stride: 60
+  test_stride: 60
   shard_format: npz
   samples_per_shard: 512
   compressed: false
@@ -164,9 +170,15 @@ patching:
   patch_width: 64
   allow_padding_small_domains: false
   pad_value_normalized: 0.0
-  train_sampling_mode: mixed_active_random
-  active_patch_probability: 0.4
-  random_patch_probability: 0.6
+  train_patch_mode: sliding_window
+  val_patch_mode: sliding_window
+  test_patch_mode: sliding_window
+  train_stride: 60
+  val_stride: 60
+  test_stride: 60
+  train_sampling_mode: sliding_window
+  active_patch_probability: 0.0
+  random_patch_probability: 1.0
   active_source: combined_target
   consumed_active_threshold: 0.001
   energy_active_threshold_MW: 0.001
@@ -176,8 +188,14 @@ patching:
   max_center_jitter_pixels: 16
   eval_mode: sliding_window
   eval_patch_size: 64
-  eval_stride: 32
+  eval_stride: 60
   include_border_patches: true
+  tiled_inference:
+    enabled: true
+    tile_size: 64
+    tile_stride: 60
+    blend_mode: average
+    return_full_domain_maps: true
   require_patch_divisible_by: 16
   auto_pad_to_divisible: false
 
@@ -831,6 +849,10 @@ training:
   # Reduce validation cost on normal epochs.
   # Options: null for full validation every epoch, or positive integer batch cap.
   max_val_batches_per_epoch: 200
+
+  # Optional train-batch cap per epoch for very large sliding-window caches.
+  # Options: null for a full train epoch, or positive integer batch cap.
+  max_train_batches_per_epoch: null
 
   # Run full validation every N epochs when max_val_batches_per_epoch is set.
   # Options: positive integer; 5 means epochs 5, 10, 15, ...

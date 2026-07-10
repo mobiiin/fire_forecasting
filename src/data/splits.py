@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence
 
-from src.data.patching import build_sliding_window_patches, resolve_patching_config
+from src.data.patching import build_sliding_window_patches, resolve_patching_config, resolve_split_patch_mode, resolve_split_patch_stride
 
 
 def _validate_nonnegative_fraction(name: str, fraction: float) -> None:
@@ -309,6 +309,37 @@ def _print_manual_split_summary(
 	)
 
 
+def _patch_grid_for_record(record: Mapping[str, Any], config: Mapping[str, Any], split_name: str) -> list[dict[str, int]]:
+	"""Build the deterministic sliding-window patch grid for one dataset/split."""
+
+	patching = resolve_patching_config(config)
+	patching_section = config.get("patching", {}) if isinstance(config.get("patching"), Mapping) else {}
+	if str(split_name).lower() in {"val", "test"} and "eval_patch_size" in patching_section:
+		patch_h = int(patching_section.get("eval_patch_size", patching["patch_height"]))
+		patch_w = int(patching_section.get("eval_patch_size", patching["patch_width"]))
+	else:
+		patch_h = int(patching["patch_height"])
+		patch_w = int(patching["patch_width"])
+	record_height, record_width = tuple(int(value) for value in record["raw_shape"][:2])
+	if patch_h > record_height or patch_w > record_width:
+		if bool(patching["allow_padding_small_domains"]):
+			raise NotImplementedError("Padding small domains for sliding-window patch refs is not implemented.")
+		raise ValueError(
+			"Patch size exceeds the fire domain and allow_padding_small_domains=false. "
+			f"dataset={record['dataset_name']} raw_shape={record['raw_shape']} "
+			f"patch_height={patch_h} patch_width={patch_w}"
+		)
+	return build_sliding_window_patches(
+		height=record_height,
+		width=record_width,
+		patch_h=patch_h,
+		patch_w=patch_w,
+		stride_h=resolve_split_patch_stride(config, split_name),
+		stride_w=resolve_split_patch_stride(config, split_name),
+		include_border_patches=bool(patching["include_border_patches"]),
+	)
+
+
 def _maybe_warn_manual_fraction_drift(
 	config: Mapping[str, Any],
 	train_count: int,
@@ -444,18 +475,8 @@ def manual_fire_holdout_splits(
 				}
 			)
 		height, width = (int(value) for value in record["raw_shape"][:2])
-		if patching["enabled"] and patching["eval_mode"] == "sliding_window":
-			patches_per_sample = len(
-				build_sliding_window_patches(
-					height=height,
-					width=width,
-					patch_h=int(patching["eval_patch_size"]),
-					patch_w=int(patching["eval_patch_size"]),
-					stride_h=int(patching["eval_stride"]),
-					stride_w=int(patching["eval_stride"]),
-					include_border_patches=bool(patching["include_border_patches"]),
-				)
-			)
+		if patching["enabled"] and resolve_split_patch_mode(config, split_name) == "sliding_window":
+			patches_per_sample = len(_patch_grid_for_record(record, config, split_name))
 		else:
 			patches_per_sample = 0
 		rows.append(
@@ -495,56 +516,75 @@ def manual_fire_holdout_splits(
 	return split_refs
 
 
+def build_sliding_patch_refs_for_split(
+	dataset_records: Sequence[Mapping[str, Any]],
+	sample_refs: Sequence[Mapping[str, Any]],
+	split: str,
+	config: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+	"""Expand temporal sample refs into deterministic sliding-window patch refs."""
+
+	split_name = str(split).lower()
+	patch_mode = resolve_split_patch_mode(config, split_name)
+	if patch_mode != "sliding_window":
+		return [dict(ref) for ref in sample_refs]
+	records_by_id = {int(record["dataset_id"]): record for record in dataset_records}
+	expanded: list[dict[str, Any]] = []
+	summary_rows: dict[str, dict[str, Any]] = {}
+
+	for ref in sample_refs:
+		dataset_id = int(ref["dataset_id"])
+		record = records_by_id[dataset_id]
+		patches = _patch_grid_for_record(record, config, split_name)
+		dataset_name = str(ref.get("dataset_name", record["dataset_name"]))
+		if dataset_name not in summary_rows:
+			height, width = (int(value) for value in record["raw_shape"][:2])
+			summary_rows[dataset_name] = {
+				"height": height,
+				"width": width,
+				"temporal_samples": 0,
+				"patches_per_sample": len(patches),
+			}
+		summary_rows[dataset_name]["temporal_samples"] += 1
+		for patch in patches:
+			expanded.append(
+				{
+					"dataset_id": dataset_id,
+					"dataset_name": dataset_name,
+					"sample_index": int(ref["sample_index"]),
+					"patch": dict(patch),
+					"patch_mode": "sliding_window",
+					"split": split_name,
+					"fire_split_group": str(ref.get("fire_split_group", split_name)),
+				}
+			)
+
+	print("Split | Fire name | HxW | temporal samples | patch mode | stride | patches/sample | total patch samples")
+	stride = resolve_split_patch_stride(config, split_name)
+	for dataset_name, row in sorted(summary_rows.items()):
+		total_patch_samples = int(row["temporal_samples"] * row["patches_per_sample"])
+		print(
+			f"{split_name.upper():<5} | {dataset_name:<20} | {row['height']}x{row['width']:<7} | "
+			f"{row['temporal_samples']:<16} | {'sliding_window':<14} | {stride:<6} | "
+			f"{row['patches_per_sample']:<14} | {total_patch_samples}"
+		)
+	return expanded
+
+
 def build_eval_patch_refs(
 	dataset_records: Sequence[Mapping[str, Any]],
 	sample_refs: Sequence[Mapping[str, Any]],
 	config: Mapping[str, Any],
 	split_name: str | None = None,
 ) -> list[dict[str, Any]]:
-	"""Expand temporal sample refs into deterministic patch refs."""
+	"""Backward-compatible wrapper for deterministic sliding-window patch refs."""
 
-	patching = resolve_patching_config(config)
-	patch_size = int(patching["eval_patch_size"])
-	stride = int(patching["eval_stride"])
-	records_by_id = {int(record["dataset_id"]): record for record in dataset_records}
-	expanded: list[dict[str, Any]] = []
-	summary_counts: dict[tuple[str, str], tuple[int, int]] = {}
-
-	for ref in sample_refs:
-		dataset_id = int(ref["dataset_id"])
-		record = records_by_id[dataset_id]
-		height, width = (int(value) for value in record["raw_shape"][:2])
-		patches = build_sliding_window_patches(
-			height=height,
-			width=width,
-			patch_h=patch_size,
-			patch_w=patch_size,
-			stride_h=stride,
-			stride_w=stride,
-			include_border_patches=bool(patching["include_border_patches"]),
-		)
-		key = (str(record["dataset_name"]), str(split_name or ref.get("fire_split_group", "")))
-		summary_counts[key] = (summary_counts.get(key, (0, len(patches)))[0] + 1, len(patches))
-		for patch in patches:
-			expanded.append(
-				{
-					"dataset_id": dataset_id,
-					"dataset_name": str(ref.get("dataset_name", record["dataset_name"])),
-					"sample_index": int(ref["sample_index"]),
-					"patch": dict(patch),
-					"fire_split_group": str(ref.get("fire_split_group", split_name or "")),
-				}
-			)
-
-	print("Split | Fire name | temporal samples | patches/sample | total patch samples")
-	for (dataset_name, resolved_split_name), (temporal_samples, patches_per_sample) in sorted(summary_counts.items()):
-		split_text = str(resolved_split_name or split_name or "").upper()
-		total_patch_samples = int(temporal_samples * patches_per_sample)
-		print(
-			f"{split_text:<5} | {dataset_name:<20} | {temporal_samples:<16} | "
-			f"{patches_per_sample:<14} | {total_patch_samples}"
-		)
-	return expanded
+	return build_sliding_patch_refs_for_split(
+		dataset_records=dataset_records,
+		sample_refs=sample_refs,
+		split=str(split_name or "val").lower(),
+		config=config,
+	)
 
 
 def chronological_split_indices(

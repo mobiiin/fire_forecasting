@@ -9,7 +9,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from src.data.patching import resolve_patching_config
+from src.data.patching import resolve_patching_config, resolve_split_patch_mode, resolve_split_patch_stride
 
 
 DEFAULT_CACHE_DIR = Path("/scratch/mhabibp/fire_forecasting_patch_cache")
@@ -171,6 +171,21 @@ def _cache_missing_message(cache_dir: Path, split_text: str | None = None) -> st
 	)
 
 
+def _patch_settings_mismatch_message(cache_dir: Path, manifest: Mapping[str, Any], config: Mapping[str, Any]) -> str:
+	manifest_modes = manifest.get("patch_modes", {})
+	manifest_strides = manifest.get("strides", {})
+	expected_modes = {split: resolve_split_patch_mode(config, split) for split in ("train", "val", "test")}
+	expected_strides = {split: resolve_split_patch_stride(config, split) for split in ("train", "val", "test")}
+	return (
+		"Patch cache was built with different patch settings.\n"
+		f"Manifest patch_modes={manifest_modes} strides={manifest_strides}\n"
+		f"Expected patch_modes={expected_modes} strides={expected_strides}\n"
+		"Expected train/val/test patch_mode=sliding_window and stride=60.\n"
+		"Please rerun:\n"
+		"python scripts/precompute_patch_cache.py --config configs/default.yaml --split all"
+	)
+
+
 def validate_patch_cache(config: Mapping[str, Any], split: str | Sequence[str] | None = None) -> dict[str, Any]:
 	"""Validate a precomputed patch cache and return a compact summary."""
 
@@ -214,12 +229,22 @@ def validate_patch_cache(config: Mapping[str, Any], split: str | Sequence[str] |
 			f"manifest=({manifest.get('patch_height')}, {manifest.get('patch_width')}) "
 			f"config=({expected_h}, {expected_w})."
 		)
+	manifest_patch_modes = manifest.get("patch_modes", {})
+	manifest_strides = manifest.get("strides", {})
+	if not isinstance(manifest_patch_modes, Mapping) or not isinstance(manifest_strides, Mapping):
+		raise RuntimeError(_patch_settings_mismatch_message(cache_dir, manifest, config))
 
 	shards_by_split = manifest.get("shards")
 	if not isinstance(shards_by_split, Mapping):
 		raise RuntimeError(f"Patch-cache manifest is missing a 'shards' mapping: {manifest_path}")
 	summaries: dict[str, dict[str, Any]] = {}
 	for split_name in requested_splits:
+		expected_patch_mode = resolve_split_patch_mode(config, split_name)
+		expected_stride = resolve_split_patch_stride(config, split_name)
+		actual_patch_mode = str(manifest_patch_modes.get(split_name, ""))
+		actual_stride = int(manifest_strides.get(split_name, -1))
+		if actual_patch_mode != expected_patch_mode or actual_stride != expected_stride:
+			raise RuntimeError(_patch_settings_mismatch_message(cache_dir, manifest, config))
 		split_dir = cache_dir / split_name
 		if not split_dir.exists():
 			raise RuntimeError(_cache_missing_message(cache_dir, split_name))
@@ -256,6 +281,8 @@ def validate_patch_cache(config: Mapping[str, Any], split: str | Sequence[str] |
 			"first_shard": str(shard_paths[0]),
 			"x_shape": first_shape_x,
 			"y_shape": first_shape_y,
+			"patch_mode": actual_patch_mode,
+			"stride": actual_stride,
 		}
 
 	return {

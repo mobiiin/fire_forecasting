@@ -32,13 +32,14 @@ from src.data.geometry import load_fire_geometry
 from src.data.patching import (
 	extract_patch_array,
 	resolve_patching_config,
+	resolve_split_patch_mode,
 	sample_active_patch,
 	sample_random_patch,
 	validate_patch_dict,
 )
 from src.data.preprocessing import load_normalization_stats, normalize_channel_map, normalize_tensor
 from src.data.splits import (
-	build_eval_patch_refs,
+	build_sliding_patch_refs_for_split,
 	chronological_split_indices,
 	chronological_train_val_split_indices,
 	manual_fire_holdout_splits,
@@ -1946,26 +1947,33 @@ def create_dataloaders(config):
 			"return_metadata": return_metadata_for_multi,
 			"config": config,
 		}
+		train_refs = sample_refs["train"]
 		val_refs = sample_refs["val"]
 		test_refs = sample_refs["test"]
-		if use_eval_patches:
-			val_refs = build_eval_patch_refs(dataset_records=dataset_records, sample_refs=val_refs, config=config, split_name="val")
-			test_refs = build_eval_patch_refs(dataset_records=dataset_records, sample_refs=test_refs, config=config, split_name="test")
+		train_patch_mode = resolve_split_patch_mode(config, "train", prefer_cache=False)
+		val_patch_mode = resolve_split_patch_mode(config, "val", prefer_cache=False)
+		test_patch_mode = resolve_split_patch_mode(config, "test", prefer_cache=False)
+		if train_patch_mode == "sliding_window":
+			train_refs = build_sliding_patch_refs_for_split(dataset_records=dataset_records, sample_refs=train_refs, split="train", config=config)
+		if val_patch_mode == "sliding_window":
+			val_refs = build_sliding_patch_refs_for_split(dataset_records=dataset_records, sample_refs=val_refs, split="val", config=config)
+		if test_patch_mode == "sliding_window":
+			test_refs = build_sliding_patch_refs_for_split(dataset_records=dataset_records, sample_refs=test_refs, split="test", config=config)
 		train_dataset = MultiFirePatchSequenceDataset(
-			sample_refs=sample_refs["train"],
+			sample_refs=train_refs,
 			use_patches=use_train_patches,
 			split="train",
 			**common_multi_kwargs,
 		)
 		val_dataset = MultiFirePatchSequenceDataset(
 			sample_refs=val_refs,
-			use_patches=use_eval_patches,
+			use_patches=bool(val_patch_mode == "sliding_window"),
 			split="val",
 			**common_multi_kwargs,
 		)
 		test_dataset = MultiFirePatchSequenceDataset(
 			sample_refs=test_refs,
-			use_patches=use_eval_patches,
+			use_patches=bool(test_patch_mode == "sliding_window"),
 			split="test",
 			**common_multi_kwargs,
 		)

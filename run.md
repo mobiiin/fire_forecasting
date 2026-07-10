@@ -164,3 +164,21 @@ Notes:
 - it uses factorized temporal attention and local spatial window attention
 - the shifted-window path currently uses cyclic shifts without a masking scheme
 - channel `2` remains mask logits; the model does not apply sigmoid internally
+
+## Rebuilding The Sliding-Window Patch Cache
+Train, validation, and test now all use sliding-window patchification with `patch_size=64` and `stride=60`.
+
+Recommended workflow:
+
+```bash
+python scripts/precompute_patch_cache.py --config configs/default.yaml --split all
+python scripts/inspect_patch_cache.py --config configs/default.yaml
+python scripts/compute_normalization.py --config configs/default.yaml --from_cache
+python scripts/sanity_check_project.py --config configs/default.yaml
+python scripts/train_convlstm_unet.py --config configs/default.yaml
+```
+
+Notes:
+- all three splits now use deterministic sliding-window patch refs
+- border patches are included so the full domain is covered
+- if cache validation fails, rerun `python scripts/precompute_patch_cache.py --config configs/default.yaml --split all`

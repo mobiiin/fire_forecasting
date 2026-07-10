@@ -17,12 +17,26 @@ def resolve_patching_config(config: Mapping[str, Any] | None) -> dict[str, Any]:
 	patch_size = int(section.get("patch_size", config.get("patch_size", 64) if isinstance(config, Mapping) else 64))
 	patch_height = int(section.get("patch_height", patch_size))
 	patch_width = int(section.get("patch_width", patch_size))
+	eval_mode = str(section.get("eval_mode", "sliding_window")).lower()
+	eval_stride = int(section.get("eval_stride", max(1, patch_size // 2)))
+	train_sampling_mode = str(section.get("train_sampling_mode", "mixed_active_random")).lower()
+	train_patch_mode = str(section.get("train_patch_mode", "sliding_window" if train_sampling_mode == "sliding_window" else "single_sampled")).lower()
+	val_patch_mode = str(section.get("val_patch_mode", "sliding_window" if eval_mode == "sliding_window" else "single_sampled")).lower()
+	test_patch_mode = str(section.get("test_patch_mode", "sliding_window" if eval_mode == "sliding_window" else "single_sampled")).lower()
+	tiled_inference_section = section.get("tiled_inference", {})
+	tiled_inference = dict(tiled_inference_section) if isinstance(tiled_inference_section, Mapping) else {}
 	return {
 		"enabled": bool(section.get("enabled", config.get("use_patches", False) if isinstance(config, Mapping) else False)),
 		"patch_size": int(patch_size),
 		"patch_height": int(patch_height),
 		"patch_width": int(patch_width),
-		"train_sampling_mode": str(section.get("train_sampling_mode", "mixed_active_random")).lower(),
+		"train_sampling_mode": train_sampling_mode,
+		"train_patch_mode": train_patch_mode,
+		"val_patch_mode": val_patch_mode,
+		"test_patch_mode": test_patch_mode,
+		"train_stride": int(section.get("train_stride", eval_stride)),
+		"val_stride": int(section.get("val_stride", eval_stride)),
+		"test_stride": int(section.get("test_stride", eval_stride)),
 		"active_patch_probability": float(section.get("active_patch_probability", config.get("active_patch_probability", 0.7) if isinstance(config, Mapping) else 0.7)),
 		"random_patch_probability": float(section.get("random_patch_probability", 0.3)),
 		"active_source": str(section.get("active_source", "combined_target")).lower(),
@@ -32,16 +46,66 @@ def resolve_patching_config(config: Mapping[str, Any] | None) -> dict[str, Any]:
 		"center_on_active_pixel": bool(section.get("center_on_active_pixel", True)),
 		"jitter_active_center": bool(section.get("jitter_active_center", True)),
 		"max_center_jitter_pixels": int(section.get("max_center_jitter_pixels", 16)),
-		"eval_mode": str(section.get("eval_mode", "sliding_window")).lower(),
+		"eval_mode": eval_mode,
 		"eval_patch_size": int(section.get("eval_patch_size", patch_size)),
-		"eval_stride": int(section.get("eval_stride", max(1, patch_size // 2))),
+		"eval_stride": eval_stride,
 		"include_border_patches": bool(section.get("include_border_patches", True)),
 		"allow_padding_small_domains": bool(section.get("allow_padding_small_domains", False)),
 		"pad_value_normalized": float(section.get("pad_value_normalized", 0.0)),
 		"require_patch_divisible_by": int(section.get("require_patch_divisible_by", 1)),
 		"auto_pad_to_divisible": bool(section.get("auto_pad_to_divisible", False)),
 		"eval_use_patches": bool(section.get("enabled", config.get("use_patches_for_eval", False) if isinstance(config, Mapping) else False)),
+		"tiled_inference": {
+			"enabled": bool(tiled_inference.get("enabled", False)),
+			"tile_size": int(tiled_inference.get("tile_size", patch_size)),
+			"tile_stride": int(tiled_inference.get("tile_stride", eval_stride)),
+			"blend_mode": str(tiled_inference.get("blend_mode", "average")).lower(),
+			"return_full_domain_maps": bool(tiled_inference.get("return_full_domain_maps", True)),
+		},
 	}
+
+
+def normalize_patch_mode(mode: str | None, *, default: str = "single_sampled") -> str:
+	"""Normalize patch mode names to the project's canonical values."""
+
+	if mode in (None, "", "null"):
+		return str(default).lower()
+	value = str(mode).lower()
+	if value in {"sliding_window", "single_sampled", "multi_sampled"}:
+		return value
+	if value in {"mixed_active_random", "active_random", "random", "sampled"}:
+		return "single_sampled"
+	raise ValueError(f"Unsupported patch mode: {mode!r}.")
+
+
+def resolve_split_patch_mode(config: Mapping[str, Any] | None, split: str, *, prefer_cache: bool = True) -> str:
+	"""Resolve the configured patch mode for one split."""
+
+	split_name = str(split).lower()
+	if split_name not in {"train", "val", "test"}:
+		raise ValueError(f"split must be train, val, or test. Got {split!r}.")
+	patching = resolve_patching_config(config)
+	cache_section = config.get("cache", {}) if isinstance(config, Mapping) and isinstance(config.get("cache"), Mapping) else {}
+	if prefer_cache:
+		cache_value = cache_section.get(f"{split_name}_patch_mode")
+		if cache_value not in (None, "", "null"):
+			return normalize_patch_mode(str(cache_value))
+	return normalize_patch_mode(str(patching[f"{split_name}_patch_mode"]))
+
+
+def resolve_split_patch_stride(config: Mapping[str, Any] | None, split: str, *, prefer_cache: bool = True) -> int:
+	"""Resolve the configured sliding-window stride for one split."""
+
+	split_name = str(split).lower()
+	if split_name not in {"train", "val", "test"}:
+		raise ValueError(f"split must be train, val, or test. Got {split!r}.")
+	patching = resolve_patching_config(config)
+	cache_section = config.get("cache", {}) if isinstance(config, Mapping) and isinstance(config.get("cache"), Mapping) else {}
+	if prefer_cache:
+		cache_value = cache_section.get(f"{split_name}_stride")
+		if cache_value not in (None, "", "null"):
+			return int(cache_value)
+	return int(patching[f"{split_name}_stride"])
 
 
 def validate_patch_dict(patch: Mapping[str, int]) -> Patch:
@@ -181,6 +245,11 @@ def build_sliding_window_patches(
 ) -> list[Patch]:
 	"""Build deterministic sliding-window patches covering a full domain."""
 
+	if patch_h > int(height) or patch_w > int(width):
+		raise ValueError(
+			"Patch dimensions must fit inside the spatial domain when allow_padding_small_domains=false. "
+			f"Got H={height}, W={width}, patch_h={patch_h}, patch_w={patch_w}."
+		)
 	y_positions = _positions_for_axis(height, patch_h, stride_h, include_border_patches)
 	x_positions = _positions_for_axis(width, patch_w, stride_w, include_border_patches)
 	patches: list[Patch] = []

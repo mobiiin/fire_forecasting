@@ -22,8 +22,8 @@ from src.data.cache import MANIFEST_FILENAME, compute_cache_config_hash, get_pat
 from src.data.dataset import MultiFirePatchSequenceDataset
 from src.data.discovery import discover_multiple_datasets
 from src.data.energy_release import resolve_energy_output_channel_names, resolve_energy_release_config
-from src.data.patching import resolve_patching_config
-from src.data.splits import build_eval_patch_refs, manual_fire_holdout_splits, multi_fire_chronological_splits
+from src.data.patching import resolve_patching_config, resolve_split_patch_mode, resolve_split_patch_stride
+from src.data.splits import build_sliding_patch_refs_for_split, manual_fire_holdout_splits, multi_fire_chronological_splits
 
 
 def _get_pyplot():
@@ -94,11 +94,17 @@ def _build_split_refs(
 		)
 
 	patching = resolve_patching_config(config)
-	if bool(patching["enabled"]) and str(patching["eval_mode"]) == "sliding_window":
+	if bool(patching["enabled"]):
 		sample_refs = {
-			"train": list(sample_refs["train"]),
-			"val": build_eval_patch_refs(dataset_records=dataset_records, sample_refs=sample_refs["val"], config=config, split_name="val"),
-			"test": build_eval_patch_refs(dataset_records=dataset_records, sample_refs=sample_refs["test"], config=config, split_name="test"),
+			split_name: build_sliding_patch_refs_for_split(
+				dataset_records=dataset_records,
+				sample_refs=sample_refs[split_name],
+				split=split_name,
+				config=config,
+			)
+			if resolve_split_patch_mode(config, split_name) == "sliding_window"
+			else list(sample_refs[split_name])
+			for split_name in ("train", "val", "test")
 		}
 	return sample_refs
 
@@ -161,6 +167,17 @@ def _base_manifest(
 		"output_channels": int(_get_section(config, "model").get("output_channels", 1)),
 		"patch_height": int(patching["patch_height"]),
 		"patch_width": int(patching["patch_width"]),
+		"include_border_patches": bool(patching["include_border_patches"]),
+		"patch_modes": {
+			"train": resolve_split_patch_mode(config, "train"),
+			"val": resolve_split_patch_mode(config, "val"),
+			"test": resolve_split_patch_mode(config, "test"),
+		},
+		"strides": {
+			"train": resolve_split_patch_stride(config, "train"),
+			"val": resolve_split_patch_stride(config, "val"),
+			"test": resolve_split_patch_stride(config, "test"),
+		},
 		"energy_release_enabled": bool(energy_release["enabled"]),
 		"energy_release_channel": 3 if energy_names else None,
 		"energy_output_channel_names": list(energy_names),
@@ -552,6 +569,7 @@ def main() -> None:
 	)
 	manifest_path = cache_dir / MANIFEST_FILENAME
 	rebuilding_all_splits = set(selected) == {"train", "val", "test"}
+	base_manifest = _base_manifest(config, dataset_records, split_refs, first_dataset)
 	if manifest_path.exists() and (not overwrite or not rebuilding_all_splits):
 		manifest = load_cache_manifest(cache_dir)
 		current_hash = compute_cache_config_hash(config)
@@ -560,8 +578,40 @@ def main() -> None:
 				f"Existing manifest config hash differs from current config under {cache_dir}. "
 				"Pass --overwrite if you intend to rebuild the cache."
 			)
+		for key in (
+			"cache_version",
+			"split_mode",
+			"manual_fire_split",
+			"input_sequence_length",
+			"prediction_horizon",
+			"input_channels",
+			"base_input_channel_count",
+			"fuel_flux_engineered_channel_count",
+			"atmospheric_engineered_channel_count",
+			"energy_history_channel_count",
+			"engineered_channel_count",
+			"output_channels",
+			"patch_height",
+			"patch_width",
+			"include_border_patches",
+			"patch_modes",
+			"strides",
+			"energy_release_enabled",
+			"energy_release_channel",
+			"energy_output_channel_names",
+			"target_transform",
+			"target_normalization_enabled",
+			"save_normalized_inputs",
+			"shard_format",
+			"compressed",
+			"samples_per_shard",
+			"fires_by_split",
+			"dataset_records",
+		):
+			manifest[key] = base_manifest[key]
+		manifest.setdefault("shards", {"train": [], "val": [], "test": []})
 	else:
-		manifest = _base_manifest(config, dataset_records, split_refs, first_dataset)
+		manifest = base_manifest
 
 	for split in selected:
 		dataset = first_dataset if split == selected[0] else _build_dataset(
@@ -572,6 +622,9 @@ def main() -> None:
 			normalization_stats=normalization_stats,
 		)
 		_precompute_split(config, dataset, split, cache_dir, manifest)
+	print("Cache patch mode:")
+	for split in ("train", "val", "test"):
+		print(f"  {split}: {resolve_split_patch_mode(config, split)} stride={resolve_split_patch_stride(config, split)}")
 
 	manifest["created_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 	manifest["config_hash"] = compute_cache_config_hash(config)
