@@ -15,6 +15,9 @@ from src.models.model_factory import build_model_from_config
 from src.training.train import _ensure_config_path, train_model_from_config
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
 def _cawfe_latte_config(config_path: str | Path) -> dict:
 	config = _ensure_config_path(load_config(config_path), config_path)
 	model_config = dict(config.get("model", {}))
@@ -22,11 +25,12 @@ def _cawfe_latte_config(config_path: str | Path) -> dict:
 	model_config["name"] = "cawfe_latte"
 	config["model"] = model_config
 	checkpoint_config = dict(config.get("checkpoint", {}))
-	checkpoint_config["path"] = "./artifacts/checkpoints/cawfe_latte/latest_model.pt"
-	checkpoint_config["best_path"] = "./artifacts/checkpoints/cawfe_latte/best_model.pt"
+	checkpoint_config["path"] = str(REPO_ROOT / "artifacts" / "checkpoints" / "cawfe_latte" / "latest_model.pt")
+	checkpoint_config["best_path"] = str(REPO_ROOT / "artifacts" / "checkpoints" / "cawfe_latte" / "best_model.pt")
 	config["checkpoint"] = checkpoint_config
 	logging_config = dict(config.get("logging", {}))
-	logging_config["training_log_path"] = "./artifacts/logs/cawfe_latte_training_log.csv"
+	logging_config["training_log_path"] = str(REPO_ROOT / "artifacts" / "logs" / "cawfe_latte_training_log.csv")
+	logging_config["timing_log_path"] = str(REPO_ROOT / "artifacts" / "logs" / "cawfe_latte_timing_log.csv")
 	config["logging"] = logging_config
 	return config
 

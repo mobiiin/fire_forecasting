@@ -237,6 +237,32 @@ Notes:
 - if `mamba-ssm` is not installed, `mamba_backend: auto` uses the fallback gated SSM for smoke/debug runs
 - set `neural_operator_type: none` or reduce `neural_operator_depth` if memory is tight
 
+## CAWFE-Latte Tuned Training Pipeline
+
+This workflow tunes only `cawfe_latte`; all other architectures use their default configs.
+
+```bash
+cd /home/mhabibp/fire_forecasting
+
+sbatch scripts/slurm_tune_cawfe_latte_a10080.sh
+squeue -u mhabibp
+tail -f artifacts/logs/slurm_tune_cawfe_latte_<JOBID>.out
+```
+
+After tuning finishes:
+
+```bash
+cat artifacts/hparam/cawfe_latte/best_params.json
+sbatch scripts/slurm_train_cawfe_latte_tuned_a10080.sh
+sbatch scripts/slurm_ablate_cawfe_latte_a10080.sh
+```
+
+Or submit the dependent sequence in one step:
+
+```bash
+bash scripts/submit_cawfe_latte_pipeline.sh
+```
+
 ## Rebuilding The Sliding-Window Patch Cache
 Train, validation, and test now all use sliding-window patchification with `patch_size=64` and `stride=60`.
 

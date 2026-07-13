@@ -1257,6 +1257,53 @@ training:
   # - huber_delta: float > 0
   # - task_type: regression | segmentation | multitask
 
+hparam_tuning:
+  # Focused tuning is intentionally restricted to the main paper model.
+  enabled: false
+  architecture: cawfe_latte
+  method: random
+  # Options: random, grid, optuna
+
+  num_trials: 12
+  seed: 42
+
+  output_dir: artifacts/hparam/cawfe_latte
+
+  selection_metric: val_multitask_loss
+  selection_mode: min
+
+  trial_max_epochs: 10
+  trial_early_stopping_patience: 3
+
+  trial_overrides:
+    training:
+      performance:
+        max_train_batches_per_epoch: 1000
+        max_val_batches_per_epoch: 200
+        full_validation_every_n_epochs: 5
+        auto_batch_size: true
+        precision: auto
+        prefer_bf16_on_ampere_or_newer: true
+        allow_tf32: true
+
+  search_space:
+    training.learning_rate: [0.0001, 0.0003, 0.0005]
+    training.weight_decay: [0.00001, 0.0001]
+
+    cawfe_latte.backbone_dim: [64, 96, 128]
+    cawfe_latte.backbone_depths:
+      - [1, 1]
+      - [2, 2]
+    cawfe_latte.fire_gate_strength: [0.5, 1.0, 1.5]
+    cawfe_latte.neural_operator_depth: [1, 2]
+    cawfe_latte.neural_operator_type: [afno]
+    cawfe_latte.drop_path: [0.0, 0.1]
+
+    training.loss.surface_consumed_weight: [1.0]
+    training.loss.canopy_consumed_weight: [1.0]
+    training.loss.mask_weight: [1.0, 2.0]
+    training.loss.energy_weight: [1.0, 2.0]
+
 logging:
   # Logging level.
   # Supported/common options: DEBUG, INFO, WARNING, ERROR, CRITICAL

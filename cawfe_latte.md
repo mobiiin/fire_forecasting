@@ -170,6 +170,22 @@ Generate full-model ablation configs:
 python scripts/ablate_cawfe_latte.py --base_config configs/default.yaml --output_dir configs/ablations/cawfe_latte/
 ```
 
+## Tuned CAWFE-Latte Workflow
+
+Hyperparameter tuning is focused on the full `cawfe_latte` model only. The tuner uses short validation-only trials, saves `artifacts/hparam/cawfe_latte/best_params.json`, and writes a directly trainable `artifacts/hparam/cawfe_latte/best_config.yaml`.
+
+```bash
+sbatch scripts/slurm_tune_cawfe_latte_a10080.sh
+sbatch scripts/slurm_train_cawfe_latte_tuned_a10080.sh
+sbatch scripts/slurm_ablate_cawfe_latte_a10080.sh
+```
+
+The tuned ablation base preserves the selected learning rate, loss weights, backbone dimensions, and other tuned parameters unless that ablation explicitly disables a module:
+
+```bash
+python scripts/ablate_cawfe_latte.py --base_config artifacts/hparam/cawfe_latte/best_config.yaml --output_dir configs/ablations/cawfe_latte_tuned
+```
+
 ## Full Model Commands
 
 Smoke test:

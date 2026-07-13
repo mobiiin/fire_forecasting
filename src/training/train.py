@@ -1262,6 +1262,10 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 	gradient_clip_norm_value = training_config.get("gradient_clip_norm", config.get("gradient_clip_norm", None))
 	gradient_clip_norm = None if gradient_clip_norm_value in (None, "", 0, 0.0) else float(gradient_clip_norm_value)
 	gradient_accumulation_steps = max(1, int(training_config.get("gradient_accumulation_steps", 1)))
+	early_stopping_patience_value = training_config.get("early_stopping_patience", None)
+	early_stopping_patience = None
+	if early_stopping_patience_value not in (None, "", "null", 0, 0.0):
+		early_stopping_patience = max(1, int(early_stopping_patience_value))
 	max_runtime_hours = _optional_positive_float(training_config.get("max_runtime_hours", None))
 	runtime_safety_margin_seconds = max(
 		0.0,
@@ -1340,6 +1344,7 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 	)
 
 	final_epoch_summary: dict[str, Any] = dict(history_rows[-1]) if history_rows else {}
+	epochs_without_validation_improvement = 0
 	for epoch_index in range(start_epoch, epochs):
 		if runtime_deadline_time is not None and time.perf_counter() >= runtime_deadline_time:
 			logger.warning("Stopping before epoch %s because the configured runtime budget is nearly exhausted.", epoch_index + 1)
@@ -1370,7 +1375,7 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 		)
 		train_stopped_by_time_limit = bool(train_results.get("train_stopped_by_time_limit", 0.0))
 		max_val_batches = _resolve_max_batches(config, "val")
-		full_validation_every_n_epochs = int(training_config.get("full_validation_every_n_epochs", 1) or 0)
+		full_validation_every_n_epochs = int(performance_config.get("full_validation_every_n_epochs", training_config.get("full_validation_every_n_epochs", 1)) or 0)
 		run_full_validation = max_val_batches is None or (
 			full_validation_every_n_epochs > 0 and epoch_number % full_validation_every_n_epochs == 0
 		)
@@ -1492,6 +1497,18 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 		if train_stopped_by_time_limit or bool(val_results.get("val_stopped_by_time_limit", 0.0)):
 			logger.warning("Stopping training after epoch %s because the configured runtime budget is nearly exhausted.", epoch_number)
 			break
+		if early_stopping_patience is not None and math.isfinite(val_loss):
+			if is_best_epoch:
+				epochs_without_validation_improvement = 0
+			else:
+				epochs_without_validation_improvement += 1
+			if epochs_without_validation_improvement >= early_stopping_patience:
+				logger.info(
+					"Early stopping after epoch %s: validation loss did not improve for %s epoch(s).",
+					epoch_number,
+					early_stopping_patience,
+				)
+				break
 
 	test_results: dict[str, float] = {}
 	test_plot_results: dict[str, float] = {}
@@ -1562,6 +1579,7 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 		"run_artifact_paths": run_artifact_paths,
 		"training_curve_paths": training_curve_paths,
 		"final_epoch_summary": final_epoch_summary,
+		"history_rows": history_rows,
 		"test_results": test_results,
 	}
 
