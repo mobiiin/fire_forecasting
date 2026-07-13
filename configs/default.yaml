@@ -1128,11 +1128,6 @@ training:
     max_train_batches_per_epoch: null
     max_val_batches_per_epoch: 200
 
-  # Stop cleanly before interactive/OnDemand walltime expires.
-  # Options: null/0 to disable, or positive hours.
-  max_runtime_hours: 11.5
-  runtime_safety_margin_minutes: 20
-
   # Optimizer choice.
   # Supported options:
   # - adam

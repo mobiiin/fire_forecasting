@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=ff_latte
+#SBATCH --job-name=ff_earthformer
 #SBATCH --account=cuuser_fafghah_trajectory_planning_in_unmanned_aerial_veh
 #SBATCH --partition=work1
 #SBATCH --nodes=1
@@ -8,10 +8,10 @@
 #SBATCH --mem=160gb
 #SBATCH --gpus=a100:1
 #SBATCH --constraint=gpu_a100_80gb
-#SBATCH --time=48:00:00
+#SBATCH --time=72:00:00
 #SBATCH --chdir=/home/mhabibp/fire_forecasting
-#SBATCH --output=artifacts/logs/slurm_train_cawfe_latte_%j.out
-#SBATCH --error=artifacts/logs/slurm_train_cawfe_latte_%j.err
+#SBATCH --output=artifacts/logs/slurm_train_earthformer_lite_%j.out
+#SBATCH --error=artifacts/logs/slurm_train_earthformer_lite_%j.err
 
 set -euo pipefail
 
@@ -39,6 +39,6 @@ echo "CUDA visible devices: ${CUDA_VISIBLE_DEVICES:-unset}"
 echo "========== GPU =========="
 nvidia-smi
 
-echo "========== Training CAWFE-Latte =========="
-srun --ntasks=1 python scripts/train_cawfe_latte.py \
+echo "========== Training Earthformer-lite =========="
+srun --ntasks=1 python scripts/train_earthformer_lite.py \
   --config configs/default.yaml

@@ -216,13 +216,6 @@ def _make_grad_scaler(enabled: bool):
 	return None
 
 
-def _optional_positive_float(value: Any) -> float | None:
-	if value in (None, "", "null", 0, 0.0):
-		return None
-	result = float(value)
-	return result if result > 0.0 else None
-
-
 def _auto_hardware_tuning_enabled(training_config: Mapping[str, Any]) -> tuple[bool, Mapping[str, Any]]:
 	auto_config = training_config.get("auto_hardware_tuning", {})
 	if isinstance(auto_config, Mapping):
@@ -539,7 +532,6 @@ def _run_epoch(
 	max_batches: int | None = None,
 	logger=None,
 	epoch_number: int | None = None,
-	deadline_time: float | None = None,
 	timing_csv_path: Path | None = None,
 ) -> dict[str, float]:
 	"""Execute one train or validation epoch and return averaged losses/metrics."""
@@ -576,7 +568,6 @@ def _run_epoch(
 	progress_bar = tqdm(range(total_batches), desc=desc, total=total_batches, leave=False) if tqdm is not None else range(total_batches)
 	iterator_source = CUDAPrefetcher(loader, device, non_blocking=non_blocking_transfer) if use_cuda_prefetcher else loader
 	iterator = iter(iterator_source)
-	stopped_by_time_limit = False
 	input_normalizer = _build_input_normalizer(loader, device, input_channels)
 
 	def _sync_if_timing() -> None:
@@ -584,11 +575,6 @@ def _run_epoch(
 			torch.cuda.synchronize(device)
 
 	for batch_offset in progress_bar:
-		if deadline_time is not None and time.perf_counter() >= float(deadline_time):
-			stopped_by_time_limit = True
-			if logger is not None:
-				logger.warning("Stopping %s epoch early because the configured runtime budget is nearly exhausted.", desc)
-			break
 		batch_number = int(batch_offset) + 1
 		fetch_start_time = time.perf_counter()
 		try:
@@ -771,7 +757,6 @@ def _run_epoch(
 		results[f"{desc}_{metric_name}"] = total_value / max(metric_samples, 1)
 	results[f"{desc}_samples"] = float(total_samples)
 	results[f"{desc}_batches"] = float(batch_number)
-	results[f"{desc}_stopped_by_time_limit"] = float(stopped_by_time_limit)
 	completed_batches = max(1, int(batch_number))
 	epoch_wall_time = time.perf_counter() - epoch_start_time
 	for timing_name, timing_total in timing_totals.items():
@@ -1266,19 +1251,6 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 	early_stopping_patience = None
 	if early_stopping_patience_value not in (None, "", "null", 0, 0.0):
 		early_stopping_patience = max(1, int(early_stopping_patience_value))
-	max_runtime_hours = _optional_positive_float(training_config.get("max_runtime_hours", None))
-	runtime_safety_margin_seconds = max(
-		0.0,
-		float(training_config.get("runtime_safety_margin_minutes", 15.0)) * 60.0,
-	)
-	runtime_deadline_time = None
-	if max_runtime_hours is not None:
-		runtime_deadline_time = time.perf_counter() + max_runtime_hours * 3600.0 - runtime_safety_margin_seconds
-		logger.info(
-			"Runtime budget enabled | max_runtime_hours=%.2f | safety_margin_minutes=%.1f",
-			max_runtime_hours,
-			runtime_safety_margin_seconds / 60.0,
-		)
 
 	latest_checkpoint_path, best_checkpoint_path = _resolve_training_paths(config)
 	resume_enabled = bool(checkpoint_config.get("resume", True))
@@ -1346,9 +1318,6 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 	final_epoch_summary: dict[str, Any] = dict(history_rows[-1]) if history_rows else {}
 	epochs_without_validation_improvement = 0
 	for epoch_index in range(start_epoch, epochs):
-		if runtime_deadline_time is not None and time.perf_counter() >= runtime_deadline_time:
-			logger.warning("Stopping before epoch %s because the configured runtime budget is nearly exhausted.", epoch_index + 1)
-			break
 		epoch_number = epoch_index + 1
 		logger.info("Epoch %s/%s", epoch_number, epochs)
 
@@ -1370,10 +1339,8 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 			max_batches=_resolve_max_batches(config, "train"),
 			logger=logger,
 			epoch_number=epoch_number,
-			deadline_time=runtime_deadline_time,
 			timing_csv_path=timing_log_path,
 		)
-		train_stopped_by_time_limit = bool(train_results.get("train_stopped_by_time_limit", 0.0))
 		max_val_batches = _resolve_max_batches(config, "val")
 		full_validation_every_n_epochs = int(performance_config.get("full_validation_every_n_epochs", training_config.get("full_validation_every_n_epochs", 1)) or 0)
 		run_full_validation = max_val_batches is None or (
@@ -1387,32 +1354,22 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 				epoch_number,
 				full_validation_every_n_epochs,
 			)
-		if train_stopped_by_time_limit:
-			logger.warning("Skipping validation for epoch %s because training stopped at the runtime budget.", epoch_number)
-			val_results = {
-				"val_loss": math.nan,
-				"val_samples": 0.0,
-				"val_batches": 0.0,
-				"val_skipped_by_time_limit": 1.0,
-			}
-		else:
-			val_results = _run_epoch(
-				model=model,
-				loader=val_loader,
-				criterion=criterion,
-				config=config,
-				device=device,
-				input_sequence_length=input_sequence_length,
-				input_channels=input_channels,
-				output_channels=output_channels,
-				train=False,
-				max_batches=val_max_batches,
-				logger=logger,
-				epoch_number=epoch_number,
-				deadline_time=runtime_deadline_time,
-				amp_dtype=amp_dtype,
-				timing_csv_path=timing_log_path,
-			)
+		val_results = _run_epoch(
+			model=model,
+			loader=val_loader,
+			criterion=criterion,
+			config=config,
+			device=device,
+			input_sequence_length=input_sequence_length,
+			input_channels=input_channels,
+			output_channels=output_channels,
+			train=False,
+			max_batches=val_max_batches,
+			logger=logger,
+			epoch_number=epoch_number,
+			amp_dtype=amp_dtype,
+			timing_csv_path=timing_log_path,
+		)
 
 		val_loss = float(val_results["val_loss"])
 		if math.isfinite(val_loss):
@@ -1444,7 +1401,7 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 		history_rows.append(row)
 		is_best_epoch = val_loss < best_val_loss
 		should_save_latest = save_latest_checkpoint and (
-			epoch_number % save_every_n_epochs == 0 or epoch_number == epochs or train_stopped_by_time_limit
+			epoch_number % save_every_n_epochs == 0 or epoch_number == epochs
 		)
 		if is_best_epoch and save_best_checkpoint:
 			best_val_loss = val_loss
@@ -1494,9 +1451,6 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 			val_results["val_loss"],
 			best_val_loss,
 		)
-		if train_stopped_by_time_limit or bool(val_results.get("val_stopped_by_time_limit", 0.0)):
-			logger.warning("Stopping training after epoch %s because the configured runtime budget is nearly exhausted.", epoch_number)
-			break
 		if early_stopping_patience is not None and math.isfinite(val_loss):
 			if is_best_epoch:
 				epochs_without_validation_improvement = 0
