@@ -4,7 +4,7 @@ set -e
 CONFIG="${1:-configs/default.yaml}"
 
 echo "========================================"
-echo "Train ConvLSTM U-Net"
+echo "Train forecasting model"
 echo "Config: ${CONFIG}"
 echo "========================================"
 
@@ -13,4 +13,4 @@ python scripts/compute_normalization.py --config "$CONFIG" --from_cache
 python scripts/precompute_patch_cache.py --config "$CONFIG" --split val
 python scripts/precompute_patch_cache.py --config "$CONFIG" --split test
 python scripts/inspect_patch_cache.py --config "$CONFIG" --split all
-python scripts/train_convlstm_unet.py --config "$CONFIG"
+python scripts/train_forecasting_model.py --config "$CONFIG"

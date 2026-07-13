@@ -37,7 +37,12 @@ from src.data.patching import (
 	sample_random_patch,
 	validate_patch_dict,
 )
-from src.data.preprocessing import load_normalization_stats, normalize_channel_map, normalize_tensor
+from src.data.preprocessing import (
+	input_normalization_runs_on_device,
+	load_normalization_stats,
+	normalize_channel_map,
+	normalize_tensor,
+)
 from src.data.splits import (
 	build_sliding_patch_refs_for_split,
 	chronological_split_indices,
@@ -46,6 +51,7 @@ from src.data.splits import (
 	multi_dataset_chronological_splits,
 	multi_fire_chronological_splits,
 )
+from src.training.hardware import cap_num_workers_by_slurm, get_performance_config
 
 
 def _extract_numeric_suffix(name: str) -> int | None:
@@ -962,6 +968,12 @@ class FireSequenceDataset(Dataset):
 			)
 
 		self.normalization_stats = self._coerce_normalization_stats(normalization_stats)
+		self.input_normalization_on_device = bool(
+			self.normalization_stats is not None and input_normalization_runs_on_device(self.config)
+		)
+		self.inputs_are_normalized = bool(
+			self.normalization_stats is not None and not self.input_normalization_on_device
+		)
 		self.target_mean, self.target_std = self._resolve_target_normalization_stats()
 		self.initial_fuel_map = _load_initial_fuel_map(self.file_paths, self.config) if self.task_type == "multitask" or _resolve_engineered_features_config(self.config)["enabled"] else None
 		self.energy_geometry = None
@@ -1083,7 +1095,7 @@ class FireSequenceDataset(Dataset):
 	def _normalize_inputs(self, stacked_inputs: np.ndarray) -> np.ndarray:
 		"""Normalize input channels using post-engineering statistics."""
 
-		if self.normalization_stats is None:
+		if self.normalization_stats is None or self.input_normalization_on_device:
 			return stacked_inputs
 
 		stats_mean = np.asarray(self.normalization_stats["mean"], dtype=np.float32)
@@ -1437,6 +1449,12 @@ class MultiFireSequenceDataset(FireSequenceDataset):
 					)
 
 		self.normalization_stats = FireSequenceDataset._coerce_normalization_stats(self, normalization_stats)
+		self.input_normalization_on_device = bool(
+			self.normalization_stats is not None and input_normalization_runs_on_device(self.config)
+		)
+		self.inputs_are_normalized = bool(
+			self.normalization_stats is not None and not self.input_normalization_on_device
+		)
 		self.target_mean, self.target_std = FireSequenceDataset._resolve_target_normalization_stats(self)
 		self.initial_fuel_maps = {
 			int(record["dataset_id"]): _load_initial_fuel_map(record["file_paths"], self.config)
@@ -1722,22 +1740,72 @@ class MultiFirePatchSequenceDataset(MultiFireSequenceDataset):
 	"""Backward-compatible explicit name for the multi-fire patch-aware dataset."""
 
 
-def _resolve_dataloader_options(config: Mapping[str, Any]) -> dict[str, Any]:
-	"""Resolve DataLoader performance options from training config with top-level fallbacks."""
+def _resolve_dataloader_options(config: Mapping[str, Any], split: str) -> dict[str, Any]:
+	"""Resolve split-specific DataLoader options with legacy fallbacks."""
 
 	training_config = _get_section(config, "training")
-	batch_size = int(training_config.get("batch_size", config.get("batch_size", 4)))
-	num_workers = int(training_config.get("num_workers", config.get("num_workers", 0)))
+	performance_config = get_performance_config(config)
+	data_loader_config = _get_section(config, "data_loader")
+	split_key = str(split).lower()
+	split_config = data_loader_config.get(split_key, {})
+	if not isinstance(split_config, Mapping):
+		split_config = {}
+	if split_key == "test":
+		val_config = data_loader_config.get("val", {})
+		if isinstance(val_config, Mapping):
+			merged_split_config = dict(val_config)
+			merged_split_config.update(dict(split_config))
+			split_config = merged_split_config
+
+	batch_size = int(
+		split_config.get(
+			"batch_size",
+			data_loader_config.get("batch_size", training_config.get("batch_size", config.get("batch_size", 4))),
+		)
+	)
+	raw_num_workers = split_config.get(
+		"num_workers",
+		data_loader_config.get("num_workers", training_config.get("num_workers", config.get("num_workers", 0))),
+	)
+	num_workers = cap_num_workers_by_slurm(config, raw_num_workers)
+	pin_memory_default = bool(torch.cuda.is_available()) if torch is not None else False
+	pin_memory = bool(
+		split_config.get(
+			"pin_memory",
+			data_loader_config.get("pin_memory", training_config.get("pin_memory", pin_memory_default)),
+		)
+	)
+	drop_last_default = False
+	drop_last = bool(split_config.get("drop_last", data_loader_config.get("drop_last", drop_last_default)))
 	options: dict[str, Any] = {
-		"batch_size": batch_size,
+		"batch_size": max(1, batch_size),
 		"num_workers": num_workers,
-		"pin_memory": bool(training_config.get("pin_memory", torch.cuda.is_available())),
-		"drop_last": False,
+		"pin_memory": pin_memory,
+		"drop_last": drop_last,
 	}
 	if num_workers > 0:
-		options["persistent_workers"] = bool(training_config.get("persistent_workers", False))
-		if "prefetch_factor" in training_config:
-			options["prefetch_factor"] = int(training_config["prefetch_factor"])
+		options["persistent_workers"] = bool(
+			split_config.get(
+				"persistent_workers",
+				data_loader_config.get("persistent_workers", training_config.get("persistent_workers", False)),
+			)
+		)
+		prefetch_factor = split_config.get(
+			"prefetch_factor",
+			data_loader_config.get("prefetch_factor", training_config.get("prefetch_factor", None)),
+		)
+		if prefetch_factor not in (None, "", "null"):
+			options["prefetch_factor"] = max(1, int(prefetch_factor))
+		multiprocessing_context = split_config.get(
+			"multiprocessing_context",
+			data_loader_config.get("multiprocessing_context", training_config.get("multiprocessing_context", None)),
+		)
+		if multiprocessing_context not in (None, "", "null"):
+			options["multiprocessing_context"] = str(multiprocessing_context)
+	else:
+		options["persistent_workers"] = False
+	if not bool(performance_config.get("non_blocking_transfer", True)):
+		options["pin_memory"] = False
 	return options
 
 
@@ -1764,7 +1832,7 @@ def _build_cached_dataloaders(
 	"""Build DataLoaders backed by precomputed patch-cache shards."""
 
 	from src.data.cache import get_patch_cache_dir, validate_patch_cache
-	from src.data.cached_patch_dataset import CachedPatchDataset
+	from src.data.cached_patch_dataset import CachedPatchDataset, CachedShardBatchSampler
 
 	cache_config = _get_section(config, "cache")
 	cache_dir = get_patch_cache_dir(config)
@@ -1806,7 +1874,9 @@ def _build_cached_dataloaders(
 		return_metadata=return_metadata,
 	)
 
-	dataloader_options = _resolve_dataloader_options(config)
+	train_dataloader_options = _resolve_dataloader_options(config, "train")
+	val_dataloader_options = _resolve_dataloader_options(config, "val")
+	test_dataloader_options = _resolve_dataloader_options(config, "test")
 	sampler = None
 	dataset_sampling = _get_section(config, "dataset_sampling")
 	if bool(dataset_sampling.get("enabled", False)):
@@ -1829,21 +1899,47 @@ def _build_cached_dataloaders(
 				f"falling back to normal shuffle: {sampling_mode!r}"
 			)
 
-	train_loader = DataLoader(
-		train_dataset,
-		shuffle=sampler is None,
-		sampler=sampler,
-		**dataloader_options,
-	)
+	train_batch_sampler_mode = str(cache_config.get("train_batch_sampler", "weighted_random")).lower()
+	if train_batch_sampler_mode in {"shard_local", "shard_local_shuffle", "shard_local_random"}:
+		if sampler is not None:
+			print(
+				"Using cached shard-local train batching; dataset_sampling weighted sampler is disabled "
+				"for this cached loader so batches stay local to cache shards."
+			)
+		batch_size = int(train_dataloader_options["batch_size"])
+		drop_last = bool(train_dataloader_options.get("drop_last", False))
+		loader_options = dict(train_dataloader_options)
+		loader_options.pop("batch_size", None)
+		loader_options.pop("drop_last", None)
+		train_batch_sampler = CachedShardBatchSampler(
+			train_dataset,
+			batch_size=batch_size,
+			drop_last=drop_last,
+			shuffle_shards=train_batch_sampler_mode != "shard_local",
+			shuffle_within_shard=train_batch_sampler_mode != "shard_local",
+			seed=int(_get_section(config, "training").get("seed", config.get("seed", 42))),
+		)
+		train_loader = DataLoader(
+			train_dataset,
+			batch_sampler=train_batch_sampler,
+			**loader_options,
+		)
+	else:
+		train_loader = DataLoader(
+			train_dataset,
+			shuffle=sampler is None,
+			sampler=sampler,
+			**train_dataloader_options,
+		)
 	val_loader = DataLoader(
 		val_dataset,
 		shuffle=False,
-		**dataloader_options,
+		**val_dataloader_options,
 	)
 	test_loader = DataLoader(
 		test_dataset,
 		shuffle=False,
-		**dataloader_options,
+		**test_dataloader_options,
 	)
 	print(
 		"Using precomputed patch cache | "
@@ -1978,7 +2074,9 @@ def create_dataloaders(config):
 			**common_multi_kwargs,
 		)
 
-		dataloader_options = _resolve_dataloader_options(config)
+		train_dataloader_options = _resolve_dataloader_options(config, "train")
+		val_dataloader_options = _resolve_dataloader_options(config, "val")
+		test_dataloader_options = _resolve_dataloader_options(config, "test")
 		sampler = None
 		dataset_sampling = _get_section(config, "dataset_sampling")
 		if bool(dataset_sampling.get("enabled", False)):
@@ -2008,17 +2106,17 @@ def create_dataloaders(config):
 			train_dataset,
 			shuffle=sampler is None,
 			sampler=sampler,
-			**dataloader_options,
+			**train_dataloader_options,
 		)
 		val_loader = DataLoader(
 			val_dataset,
 			shuffle=False,
-			**dataloader_options,
+			**val_dataloader_options,
 		)
 		test_loader = DataLoader(
 			test_dataset,
 			shuffle=False,
-			**dataloader_options,
+			**test_dataloader_options,
 		)
 		return train_loader, val_loader, test_loader
 
@@ -2088,23 +2186,25 @@ def create_dataloaders(config):
 	else:
 		test_dataset = FireSequenceDataset(sample_indices=split_indices["test"], use_patches=use_eval_patches, **dataset_kwargs)
 
-	dataloader_options = _resolve_dataloader_options(config)
+	train_dataloader_options = _resolve_dataloader_options(config, "train")
+	val_dataloader_options = _resolve_dataloader_options(config, "val")
+	test_dataloader_options = _resolve_dataloader_options(config, "test")
 	train_loader = DataLoader(
 		train_dataset,
 		shuffle=True,
-		**dataloader_options,
+		**train_dataloader_options,
 	)
 	val_loader = DataLoader(
 		val_dataset,
 		shuffle=False,
-		**dataloader_options,
+		**val_dataloader_options,
 	)
 	test_loader = None
 	if test_dataset is not None:
 		test_loader = DataLoader(
 			test_dataset,
 			shuffle=False,
-			**dataloader_options,
+			**test_dataloader_options,
 		)
 	return train_loader, val_loader, test_loader
 

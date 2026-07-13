@@ -10,6 +10,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from src.data.patching import resolve_patching_config, resolve_split_patch_mode, resolve_split_patch_stride
+from src.data.stored_npz import stored_npz_array_info
 
 
 DEFAULT_CACHE_DIR = Path("/scratch/mhabibp/fire_forecasting_patch_cache")
@@ -145,10 +146,13 @@ def _shard_path(cache_dir: Path, shard_entry: Mapping[str, Any] | str) -> Path:
 
 def _read_shard_shapes(path: Path) -> tuple[tuple[int, ...], tuple[int, ...]]:
 	if path.suffix.lower() == ".npz":
-		with np.load(path, allow_pickle=False) as shard:
-			if "X" not in shard.files or "y" not in shard.files:
-				raise ValueError(f"Shard is missing required X/y arrays: {path}")
-			return tuple(int(value) for value in shard["X"].shape), tuple(int(value) for value in shard["y"].shape)
+		try:
+			return stored_npz_array_info(path, "X").shape, stored_npz_array_info(path, "y").shape
+		except (KeyError, ValueError):
+			with np.load(path, allow_pickle=False) as shard:
+				if "X" not in shard.files or "y" not in shard.files:
+					raise ValueError(f"Shard is missing required X/y arrays: {path}")
+				return tuple(int(value) for value in shard["X"].shape), tuple(int(value) for value in shard["y"].shape)
 	if path.suffix.lower() == ".pt":
 		try:
 			import torch  # type: ignore[import-not-found]

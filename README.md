@@ -135,7 +135,7 @@ python scripts/compute_normalization.py --config configs/default.yaml --from_cac
 python scripts/precompute_patch_cache.py --config configs/default.yaml --split val
 python scripts/precompute_patch_cache.py --config configs/default.yaml --split test
 python scripts/inspect_patch_cache.py --config configs/default.yaml --split all
-python scripts/train_convlstm_unet.py --config configs/default.yaml
+python scripts/train_forecasting_model.py --config configs/default.yaml
 ```
 
 Choose training fires to cover a range of fire sizes, durations, energy-release regimes, and spatial extents. Hold out validation/test fires as unseen events when you want a scientifically cleaner cross-fire generalization result.
@@ -151,10 +151,32 @@ python scripts/compute_normalization.py --config configs/default.yaml --from_cac
 python scripts/precompute_patch_cache.py --config configs/default.yaml --split val
 python scripts/precompute_patch_cache.py --config configs/default.yaml --split test
 python scripts/inspect_patch_cache.py --config configs/default.yaml --split all
-python scripts/train_convlstm_unet.py --config configs/default.yaml
+python scripts/train_forecasting_model.py --config configs/default.yaml
 ```
 
 If `/scratch` purges the cache, training raises a clear error and asks you to rerun precompute unless `cache.allow_dynamic_fallback: true` is set.
+
+## Training Performance Optimization
+All model-specific training scripts now route through the shared optimized training path in `src/training/train.py`. The shared path supports GPU-aware batch sizing, BF16/FP16 AMP, TF32, GPU-side input normalization, shard-local cache batching, Slurm-aware DataLoader worker caps, timing CSV logs, optional CUDA prefetching, and optional `torch.compile`.
+
+Useful commands:
+
+```bash
+python scripts/diagnose_training_pipeline.py \
+  --config configs/default.yaml \
+  --model_architecture cawfe_latte \
+  --num_batches 50
+
+python scripts/benchmark_patch_cache_io.py \
+  --config configs/default.yaml \
+  --split train \
+  --num_batches 100
+
+python scripts/train_forecasting_model.py \
+  --config configs/default.yaml
+```
+
+On Palmetto, request enough CPUs for the DataLoader, keep the patch cache on `/scratch/mhabibp/`, and prefer BF16 on A100/H100 GPUs. If GPU utilization is low and timing logs show high `data_wait`, tune workers or cache locality first. If VRAM is underused and `data_wait` is low, increase batch size or enable `training.performance.auto_batch_size`.
 
 ## Atmospheric Engineered Features
 From the raw atmospheric `U`, `V`, and `W` channels, the dataset can append three atmospheric feature groups for every input timestep.
@@ -384,7 +406,7 @@ python scripts/compute_normalization.py --config configs/default.yaml --from_cac
 
 Train:
 ```bash
-python scripts/train_convlstm_unet.py --config configs/default.yaml
+python scripts/train_forecasting_model.py --config configs/default.yaml
 ```
 
 Notes:
@@ -499,7 +521,7 @@ All commands below assume the Conda environment above is already active.
 - Run lightweight smoke checks:
   `python scripts/smoke_checks.py --config configs/default.yaml`
 - Train the model:
-  `python scripts/train_convlstm_unet.py --config configs/default.yaml`
+  `python scripts/train_forecasting_model.py --config configs/default.yaml`
 - Evaluate the saved checkpoint on the configured test split:
   `python scripts/test_model.py --config configs/default.yaml --checkpoint-kind best`
 - Probe model support for native and alternate spatial sizes without loading dataset files:

@@ -169,6 +169,22 @@ def test_neural_operator_bottleneck_accepts_low_precision_input() -> None:
 	assert y.dtype == x.dtype
 
 
+def test_neural_operator_bottleneck_accepts_bfloat16_autocast() -> None:
+	if not torch.cuda.is_available():
+		pytest.skip("CUDA autocast regression only runs when CUDA is available.")
+	operator = NeuralOperatorBottleneck(
+		channels=16,
+		operator_type="afno",
+		depth=1,
+		num_blocks=4,
+		force_float32_fft=True,
+	).cuda()
+	x = torch.randn(1, 2, 16, 8, 8, device="cuda")
+	with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+		y = operator(x)
+	assert tuple(y.shape) == tuple(x.shape)
+
+
 def test_cawfe_latte_forward_return_aux() -> None:
 	model = build_model_from_config(_config(), input_channels=129)
 	x = torch.randn(2, 6, 129, 64, 64)

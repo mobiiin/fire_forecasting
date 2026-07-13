@@ -34,8 +34,8 @@ echo "[6/8] Project sanity check"
 python scripts/sanity_check_project.py --config "$CONFIG"
 
 echo
-echo "[7/8] Train ConvLSTM U-Net"
-python scripts/train_convlstm_unet.py --config "$CONFIG"
+echo "[7/8] Train forecasting model"
+python scripts/train_forecasting_model.py --config "$CONFIG"
 
 echo
 echo "[8/8] Visualize predictions"

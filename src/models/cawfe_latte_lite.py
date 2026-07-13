@@ -81,6 +81,7 @@ class CAWFELatteLite(nn.Module):
 		mlp_ratio: float = 4.0,
 		gradient_checkpointing: bool = False,
 		required_patch_divisibility: int = 16,
+		vertical_attention_chunk_size: int = 8192,
 	) -> None:
 		super().__init__()
 		self.input_channels = int(input_channels)
@@ -120,6 +121,7 @@ class CAWFELatteLite(nn.Module):
 				num_layers=1,
 				dropout=float(dropout),
 				pool_mode="attention_pool",
+				attention_chunk_size=int(vertical_attention_chunk_size),
 			)
 		else:
 			self.atmosphere_encoder = FlatAtmosphereFallback(self.atmosphere_num_channels, self.atm_embed_dim)

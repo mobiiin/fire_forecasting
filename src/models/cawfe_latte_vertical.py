@@ -27,6 +27,7 @@ class VerticalAtmosphereEncoder(nn.Module):
 		num_layers: int = 1,
 		dropout: float = 0.0,
 		pool_mode: str = "attention_pool",
+		attention_chunk_size: int = 8192,
 	) -> None:
 		super().__init__()
 		self.num_levels = int(num_levels)
@@ -34,6 +35,7 @@ class VerticalAtmosphereEncoder(nn.Module):
 		self.atm_embed_dim = int(atm_embed_dim)
 		self.encoder_type = str(encoder_type).lower()
 		self.pool_mode = str(pool_mode).lower()
+		self.attention_chunk_size = int(attention_chunk_size)
 		self.input_channels = self.num_levels * self.vars_per_level
 		if self.num_levels <= 0 or self.vars_per_level <= 0 or self.atm_embed_dim <= 0:
 			raise ValueError("num_levels, vars_per_level, and atm_embed_dim must be positive.")
@@ -71,6 +73,18 @@ class VerticalAtmosphereEncoder(nn.Module):
 			)
 			self.level_pool = nn.Linear(self.atm_embed_dim, 1)
 
+	def _apply_vertical_transformer(self, tokens: torch.Tensor) -> torch.Tensor:
+		chunk_size = int(self.attention_chunk_size)
+		if chunk_size <= 0 or int(tokens.shape[0]) <= chunk_size:
+			return self.vertical_transformer(tokens)
+		return torch.cat(
+			[
+				self.vertical_transformer(tokens[start : start + chunk_size])
+				for start in range(0, int(tokens.shape[0]), chunk_size)
+			],
+			dim=0,
+		)
+
 	def forward(self, x_atm_raw: torch.Tensor) -> torch.Tensor:
 		if x_atm_raw.ndim != 5:
 			raise ValueError(f"VerticalAtmosphereEncoder expects (B, T, C, H, W), got {tuple(x_atm_raw.shape)}.")
@@ -84,7 +98,7 @@ class VerticalAtmosphereEncoder(nn.Module):
 		tokens = x_levels.permute(0, 1, 4, 5, 2, 3).reshape(batch_size * time_steps * height * width, self.num_levels, self.vars_per_level)
 		if self.encoder_type == "attention":
 			tokens = self.var_projection(tokens) + self.vertical_pos_embed
-			tokens = self.vertical_transformer(tokens)
+			tokens = self._apply_vertical_transformer(tokens)
 			if self.pool_mode == "attention_pool":
 				weights = torch.softmax(self.level_pool(tokens), dim=1)
 				pooled = torch.sum(tokens * weights, dim=1)

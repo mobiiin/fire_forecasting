@@ -3,9 +3,51 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
+
+
+def resolve_input_normalization_device(config: Mapping[str, Any] | None) -> str:
+	"""Resolve where input normalization should run.
+
+	Returns one of:
+	- ``"cpu"``: normalize in the Dataset/DataLoader worker process.
+	- ``"device"``: return raw inputs from the Dataset and normalize after the
+	  batch is moved to the training device.
+	- ``"none"``: do not normalize inputs.
+	"""
+
+	if not isinstance(config, Mapping):
+		return "cpu"
+	training = config.get("training", {})
+	if not isinstance(training, Mapping):
+		training = {}
+	normalization = config.get("normalization", {})
+	if not isinstance(normalization, Mapping):
+		normalization = {}
+
+	value = training.get("input_normalization_device", normalization.get("input_normalization_device", "cpu"))
+	if isinstance(value, bool):
+		return "device" if value else "cpu"
+	normalized = str(value).strip().lower()
+	if normalized in {"", "cpu", "dataset", "dataloader", "loader", "worker"}:
+		return "cpu"
+	if normalized in {"auto", "cuda", "gpu", "device", "training_device", "on_device"}:
+		return "device"
+	if normalized in {"none", "off", "false", "disabled", "disable"}:
+		return "none"
+	raise ValueError(
+		"Unsupported input normalization device. "
+		"Expected cpu, device/cuda/gpu, or none; got "
+		f"{value!r}."
+	)
+
+
+def input_normalization_runs_on_device(config: Mapping[str, Any] | None) -> bool:
+	"""Return whether input normalization should run on the training device."""
+
+	return resolve_input_normalization_device(config) == "device"
 
 
 def compute_channel_stats(
@@ -98,14 +140,14 @@ def normalize_tensor(
 	mean: np.ndarray,
 	std: np.ndarray,
 ) -> np.ndarray:
-	"""Normalize a tensor shaped ``(H, W, C)`` or ``(T, H, W, C)`` channel-wise."""
+	"""Normalize a channel-last tensor such as ``(H, W, C)`` or ``(B, T, H, W, C)``."""
 
 	array = np.asarray(x)
 	mean_array = np.asarray(mean)
 	std_array = np.asarray(std)
 
-	if array.ndim not in (3, 4):
-		raise ValueError(f"normalize_tensor expects a 3D or 4D tensor, got shape {array.shape}.")
+	if array.ndim < 3:
+		raise ValueError(f"normalize_tensor expects a tensor with at least 3 dimensions, got shape {array.shape}.")
 	if array.shape[-1] != mean_array.shape[0] or mean_array.shape != std_array.shape:
 		raise ValueError(
 			"Mean/std shapes must match the channel dimension of the input tensor. "

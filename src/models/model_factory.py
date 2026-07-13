@@ -216,6 +216,7 @@ def build_model_from_config(config: Mapping[str, Any], input_channels: int):
 			mlp_ratio=float(section.get("mlp_ratio", 4.0)),
 			gradient_checkpointing=bool(section.get("gradient_checkpointing", False)),
 			required_patch_divisibility=int(section.get("required_patch_divisibility", config.get("patching", {}).get("require_patch_divisible_by", 16))),
+			vertical_attention_chunk_size=int(section.get("vertical_attention_chunk_size", 8192)),
 		)
 	if architecture == "cawfe_latte":
 		section = config.get("cawfe_latte", {})
@@ -292,5 +293,6 @@ def build_model_from_config(config: Mapping[str, Any], input_channels: int):
 			required_patch_divisibility=int(section.get("required_patch_divisibility", config.get("patching", {}).get("require_patch_divisible_by", 16))),
 			return_aux_default=bool(section.get("return_aux_default", False)),
 			save_module_maps=bool(section.get("save_module_maps", False)),
+			vertical_attention_chunk_size=int(section.get("vertical_attention_chunk_size", 8192)),
 		)
 	raise ValueError(f"Unsupported model architecture: {architecture!r}.")

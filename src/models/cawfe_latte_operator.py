@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 try:
@@ -14,6 +15,16 @@ except ImportError:  # pragma: no cover - environment-specific fallback
 	F = None
 
 from src.models.cawfe_latte_blocks import _make_group_norm
+
+
+def _disable_autocast(device_type: str):
+	if torch is None:
+		return nullcontext()
+	if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+		return torch.amp.autocast(device_type=device_type, enabled=False)
+	if device_type == "cuda" and hasattr(torch, "cuda") and hasattr(torch.cuda, "amp"):
+		return torch.cuda.amp.autocast(enabled=False)
+	return nullcontext()
 
 
 def _largest_divisor_at_most(value: int, limit: int) -> int:
@@ -54,24 +65,32 @@ class AFNO2DBlock(nn.Module):
 
 	def _spectral_mix(self, x: torch.Tensor) -> torch.Tensor:
 		original_dtype = x.dtype
-		fft_input = x.float() if self.force_float32_fft else x
-		height, width = tuple(int(value) for value in fft_input.shape[-2:])
-		coeffs = torch.fft.rfft2(fft_input, norm="ortho")
-		num_freq_w = int(coeffs.shape[-1])
-		kept_w = max(1, int(num_freq_w * self.hard_thresholding_fraction))
-		mixed = torch.zeros_like(coeffs)
-		active = coeffs[:, :, :, :kept_w]
-		active = active.reshape(active.shape[0], self.num_blocks, self.block_size, height, kept_w)
-		real = torch.einsum("nbihw,boi->nbohw", active.real, self.weight_real) - torch.einsum("nbihw,boi->nbohw", active.imag, self.weight_imag)
-		imag = torch.einsum("nbihw,boi->nbohw", active.real, self.weight_imag) + torch.einsum("nbihw,boi->nbohw", active.imag, self.weight_real)
-		updated = torch.complex(real, imag).reshape(coeffs.shape[0], self.channels, height, kept_w)
-		if self.sparsity_threshold > 0:
-			updated = torch.complex(
-				F.softshrink(updated.real, lambd=self.sparsity_threshold),
-				F.softshrink(updated.imag, lambd=self.sparsity_threshold),
-			)
-		mixed[:, :, :, :kept_w] = updated
-		out = torch.fft.irfft2(mixed, s=(height, width), norm="ortho")
+		autocast_context = _disable_autocast(x.device.type) if self.force_float32_fft else nullcontext()
+		with autocast_context:
+			fft_input = x.float() if self.force_float32_fft else x
+			height, width = tuple(int(value) for value in fft_input.shape[-2:])
+			coeffs = torch.fft.rfft2(fft_input, norm="ortho")
+			num_freq_w = int(coeffs.shape[-1])
+			kept_w = max(1, int(num_freq_w * self.hard_thresholding_fraction))
+			mixed = torch.zeros_like(coeffs)
+			active = coeffs[:, :, :, :kept_w]
+			active = active.reshape(active.shape[0], self.num_blocks, self.block_size, height, kept_w)
+			weight_real = self.weight_real.float() if self.force_float32_fft else self.weight_real
+			weight_imag = self.weight_imag.float() if self.force_float32_fft else self.weight_imag
+			real = torch.einsum("nbihw,boi->nbohw", active.real, weight_real) - torch.einsum("nbihw,boi->nbohw", active.imag, weight_imag)
+			imag = torch.einsum("nbihw,boi->nbohw", active.real, weight_imag) + torch.einsum("nbihw,boi->nbohw", active.imag, weight_real)
+			if real.dtype == torch.bfloat16:
+				real = real.float()
+			if imag.dtype == torch.bfloat16:
+				imag = imag.float()
+			updated = torch.complex(real, imag).reshape(coeffs.shape[0], self.channels, height, kept_w)
+			if self.sparsity_threshold > 0:
+				updated = torch.complex(
+					F.softshrink(updated.real, lambd=self.sparsity_threshold),
+					F.softshrink(updated.imag, lambd=self.sparsity_threshold),
+				)
+			mixed[:, :, :, :kept_w] = updated
+			out = torch.fft.irfft2(mixed, s=(height, width), norm="ortho")
 		return out.to(dtype=original_dtype)
 
 	def forward(self, x: torch.Tensor) -> torch.Tensor:

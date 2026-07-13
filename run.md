@@ -50,6 +50,34 @@ python scripts/run_linear_extrapolation_baseline.py --config configs/default.yam
 python scripts/evaluate_all_baselines.py --config configs/default.yaml --splits train val test
 ```
 
+## Optimized Training Workflow On Palmetto
+Use this sequence when checking training speed or after rebuilding the patch cache:
+
+```bash
+python scripts/inspect_patch_cache.py \
+  --config configs/default.yaml
+
+python scripts/benchmark_patch_cache_io.py \
+  --config configs/default.yaml \
+  --split train \
+  --num_batches 100
+
+python scripts/diagnose_training_pipeline.py \
+  --config configs/default.yaml \
+  --model_architecture cawfe_latte \
+  --num_batches 50
+
+python scripts/train_cawfe_latte.py \
+  --config configs/default.yaml
+```
+
+Watch these timing fields in `artifacts/logs/training_timing_<run_name>.csv` and the training log:
+- high `data_wait`: DataLoader/cache bottleneck
+- high `h2d`: host-to-device transfer bottleneck; use pinned memory, non-blocking transfer, or CUDA prefetching
+- low VRAM: increase batch size or enable auto batch size
+- high `metrics`: reduce train metric cadence
+- high `forward`/`backward`: model compute bottleneck
+
 Running Earthformer-lite:
 ```bash
 python scripts/inspect_patch_cache.py --config configs/default.yaml
@@ -73,7 +101,7 @@ python scripts/evaluate_all_baselines.py --config configs/default.yaml --split t
 Train the model:
 
 ```bash
-python scripts/train_convlstm_unet.py --config configs/default.yaml
+python scripts/train_forecasting_model.py --config configs/default.yaml
 ```
 
 Expected outputs:
@@ -107,7 +135,7 @@ Shortest end-to-end command sequence:
 ```bash
 python scripts/discover_fire_datasets.py --main_data_dir /media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/
 python scripts/compute_normalization.py --config configs/default.yaml
-python scripts/train_convlstm_unet.py --config configs/default.yaml
+python scripts/train_forecasting_model.py --config configs/default.yaml
 python scripts/test_model.py --config configs/default.yaml
 python scripts/visualize_predictions.py --config configs/default.yaml
 ```
@@ -219,7 +247,7 @@ python scripts/precompute_patch_cache.py --config configs/default.yaml --split a
 python scripts/inspect_patch_cache.py --config configs/default.yaml
 python scripts/compute_normalization.py --config configs/default.yaml --from_cache
 python scripts/sanity_check_project.py --config configs/default.yaml
-python scripts/train_convlstm_unet.py --config configs/default.yaml
+python scripts/train_forecasting_model.py --config configs/default.yaml
 ```
 
 Notes:

@@ -121,6 +121,36 @@ def test_vertical_atmosphere_encoder_shape() -> None:
 	assert tuple(y.shape) == (2, 6, 16, 16, 16)
 
 
+def test_vertical_atmosphere_attention_chunking_matches_unchunked() -> None:
+	torch.manual_seed(7)
+	full_encoder = VerticalAtmosphereEncoder(
+		num_levels=8,
+		vars_per_level=10,
+		atm_embed_dim=16,
+		encoder_type="attention",
+		num_heads=4,
+		attention_chunk_size=0,
+	)
+	chunked_encoder = VerticalAtmosphereEncoder(
+		num_levels=8,
+		vars_per_level=10,
+		atm_embed_dim=16,
+		encoder_type="attention",
+		num_heads=4,
+		attention_chunk_size=7,
+	)
+	chunked_encoder.load_state_dict(full_encoder.state_dict())
+	full_encoder.eval()
+	chunked_encoder.eval()
+	x = torch.randn(2, 3, 80, 5, 4)
+
+	with torch.no_grad():
+		full_y = full_encoder(x)
+		chunked_y = chunked_encoder(x)
+
+	assert torch.allclose(chunked_y, full_y, atol=1e-6, rtol=1e-5)
+
+
 def test_fire_fuel_state_encoder_shape() -> None:
 	encoder = FireFuelStateEncoder(
 		input_channels=129,

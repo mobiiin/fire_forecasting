@@ -154,13 +154,19 @@ cache:
   train_stride: 60
   val_stride: 60
   test_stride: 60
+  preferred_format: npz
   shard_format: npz
   samples_per_shard: 512
   compressed: false
+  benchmark_cache_on_start: false
   save_metadata: true
   save_preview_images: true
   num_preview_images: 50
   save_normalized_inputs: false
+  # Cached training batch order. shard_local_shuffle keeps all samples but
+  # forms batches from nearby samples in the same shard to reduce random reads.
+  # Options: weighted_random, shard_local_shuffle, shard_local
+  train_batch_sampler: shard_local_shuffle
   shard_memory_cache_size: 2
 
 patching:
@@ -239,7 +245,7 @@ dataset_sampling:
 
 # Batch size for DataLoaders.
 # Options: any positive integer >= 1, limited by memory.
-batch_size: 64
+batch_size: 16
 
 # Top-level learning rate fallback.
 # Options: any positive float > 0.
@@ -248,11 +254,11 @@ learning_rate: 0.0001
 
 # Total training epochs.
 # Options: any positive integer >= 1.
-epochs: 50
+epochs: 20
 
 # Number of DataLoader workers.
 # Options: any integer >= 0.
-num_workers: 8
+num_workers: 2
 
 # Device selection.
 # Supported options in code:
@@ -615,8 +621,8 @@ model:
   # - weatherformer_lite
   # - cawfe_latte_lite
   # - cawfe_latte
-  architecture: cawfe_latte
-  name: cawfe_latte
+  architecture: convlstm_unet
+  name: convlstm_unet
 
   # Total input channels after all enabled engineered features are appended.
   # Options: any positive integer matching the actual dataset tensor width after engineering.
@@ -771,6 +777,8 @@ cawfe_latte_lite:
   # Ablation toggles.
   use_vertical_atmosphere_encoder: true
   vertical_encoder_type: attention
+  # Maximum flattened vertical columns per atmospheric attention call. Use 0 to disable chunking.
+  vertical_attention_chunk_size: 8192
   use_fire_fuel_encoder: true
   use_fire_front_gate: true
 
@@ -862,6 +870,8 @@ cawfe_latte:
   # Core modules.
   use_vertical_atmosphere_encoder: true
   vertical_encoder_type: attention
+  # Maximum flattened vertical columns per atmospheric attention call. Use 0 to disable chunking.
+  vertical_attention_chunk_size: 8192
   use_fire_fuel_encoder: true
   use_fire_front_gate: true
 
@@ -987,6 +997,16 @@ normalization:
   # Options: any positive float > 0.
   epsilon: 1.0e-06
 
+  # Apply input normalization on the training device when stats are available.
+  # Options: cpu, cuda/device/gpu, none
+  input_normalization_device: cuda
+
+  # Use in-place CUDA normalization to avoid extra GPU allocations.
+  in_place_cuda_normalization: true
+
+  # Guard against applying input normalization once in the Dataset and again on CUDA.
+  apply_once_guard: true
+
   # Legacy target-normalization flag used by older scripts.
   # Options: true, false
   # Prefer target_normalization.enabled for new configs.
@@ -1006,6 +1026,36 @@ checkpoint:
   # Common/expected options: val_loss
   # Note: current training code selects best checkpoint using validation loss directly.
   monitor: val_loss
+
+checkpointing:
+  save_every_n_epochs: 1
+  save_latest: true
+  save_best: true
+  async_save: false
+
+data_loader:
+  # Split-specific DataLoader performance controls. "auto" resolves from Slurm CPU allocation.
+  train:
+    num_workers: auto
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 1
+    drop_last: false
+    multiprocessing_context: null
+  val:
+    num_workers: auto
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 1
+    drop_last: false
+    multiprocessing_context: null
+  test:
+    num_workers: auto
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 1
+    drop_last: false
+    multiprocessing_context: null
 
 visualization:
   # Output root directory for saved figures.
@@ -1027,7 +1077,61 @@ visualization:
 training:
   # Total training epochs.
   # Options: any positive integer >= 1.
-  epochs: 50
+  epochs: 20
+
+  # Automatically tune batch/accumulation from detected CUDA VRAM and architecture.
+  # ConvLSTM-U-Net is much lighter than CAWFE-LATTE and can use larger batches.
+  auto_hardware_tuning:
+    enabled: true
+    max_host_memory_fraction: 0.55
+    # Approximate extra host-memory copies from DataLoader collation, pinned-memory
+    # staging, normalization temporaries, and framework overhead.
+    host_memory_sample_multiplier: 3.0
+    architectures:
+      convlstm_unet:
+        target_effective_batch_size: 512
+        batch_size_32gb: 256
+        batch_size_40gb: 512
+        batch_size_80gb: 1024
+        fallback_batch_size: 128
+      cawfe_latte:
+        target_effective_batch_size: 96
+        batch_size_32gb: 16
+        batch_size_40gb: 24
+        batch_size_80gb: 48
+        fallback_batch_size: 8
+      cawfe_latte_lite:
+        target_effective_batch_size: 128
+        batch_size_32gb: 24
+        batch_size_40gb: 32
+        batch_size_80gb: 64
+        fallback_batch_size: 12
+
+  performance:
+    # Precision options: auto, bf16, fp16, fp32.
+    # auto chooses bf16 on Ampere/Hopper GPUs when available, otherwise fp16.
+    precision: auto
+    allow_tf32: true
+    cudnn_benchmark: true
+    torch_compile: false
+    auto_batch_size: true
+    auto_batch_probe_batch_size: 8
+    auto_batch_max_trials: 12
+    prefetch_to_cuda: false
+    non_blocking_transfer: true
+    log_timing: true
+    timing_log_every_n_batches: 50
+    synchronize_timing: false
+    compute_train_metrics_every_batch: false
+    cheap_train_metrics_every_n_batches: 100
+    compute_val_metrics: true
+    max_train_batches_per_epoch: null
+    max_val_batches_per_epoch: 200
+
+  # Stop cleanly before interactive/OnDemand walltime expires.
+  # Options: null/0 to disable, or positive hours.
+  max_runtime_hours: 11.5
+  runtime_safety_margin_minutes: 20
 
   # Optimizer choice.
   # Supported options:
@@ -1051,9 +1155,14 @@ training:
   # Only has effect on CUDA devices.
   mixed_precision: true
 
+  # Run input normalization after the batch is moved to the training device.
+  # This avoids per-sample CPU normalization in DataLoader workers.
+  # Options: cpu, cuda/device/gpu, none
+  input_normalization_device: cuda
+
   # Number of micro-batches to accumulate before each optimizer step.
   # Options: integer >= 1
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 4
 
   # Reduce validation cost on normal epochs.
   # Options: null for full validation every epoch, or positive integer batch cap.
@@ -1081,7 +1190,10 @@ training:
 
   # DataLoader worker count for train/val/test loaders.
   # Options: integer >= 0
-  num_workers: 8
+  num_workers: 2
+
+  # Cap DataLoader workers to SLURM_CPUS_PER_TASK when running in a Slurm job.
+  auto_cap_num_workers_to_slurm_cpus: true
 
   # Use pinned host memory for faster non-blocking CUDA transfers.
   # Options: true, false
@@ -1093,7 +1205,7 @@ training:
 
   # Number of batches prefetched per worker.
   # Options: positive integer; only used when num_workers > 0
-  prefetch_factor: 4
+  prefetch_factor: 1
 
   # Let cuDNN benchmark convolution algorithms for fixed patch shapes.
   # Options: true, false

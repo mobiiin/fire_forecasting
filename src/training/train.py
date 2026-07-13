@@ -1,10 +1,15 @@
-"""Full training loop for the ConvLSTM U-Net wildfire model."""
+"""Full training loop for wildfire forecasting models."""
 
 from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
+import os
+import re
+import shutil
+import subprocess
 import time
 from collections import defaultdict
 from contextlib import nullcontext
@@ -27,12 +32,12 @@ except ImportError:  # pragma: no cover - environment-specific fallback
 try:
 	import torch  # type: ignore[import-not-found]
 	import torch.nn as nn  # type: ignore[import-not-found]
-	from torch.cuda.amp import GradScaler, autocast  # type: ignore[import-not-found]
+	from torch.cuda.amp import GradScaler as CudaGradScaler, autocast as cuda_autocast  # type: ignore[import-not-found]
 except ImportError:  # pragma: no cover - environment-specific fallback
 	torch = None
 	nn = None
-	GradScaler = None
-	autocast = None
+	CudaGradScaler = None
+	cuda_autocast = None
 
 from src.config import load_config
 from src.data.dataset import create_dataloaders
@@ -45,10 +50,26 @@ from src.training.checkpoints import (
 	save_checkpoint,
 	validate_checkpoint_model_compatibility,
 )
+from src.training.cuda_prefetcher import CUDAPrefetcher
+from src.training.hardware import (
+	autocast_context,
+	cap_num_workers_by_slurm,
+	choose_amp_dtype,
+	configure_torch_backend,
+	estimate_available_vram_gb,
+	find_max_batch_size,
+	get_cuda_device_info,
+	get_performance_config,
+)
 from src.training.losses import get_loss_function
 from src.training.metrics import compute_metrics
 from src.utils.logging import setup_logging
 from src.utils.seed import set_seed
+
+try:
+	import yaml  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - dependency is already required by config.py
+	yaml = None
 
 
 def _get_section(config: Mapping[str, Any], *names: str) -> dict[str, Any]:
@@ -104,6 +125,15 @@ def _as_batch(batch: Any):
 			"Batches must be tuples/lists containing at least input and target tensors."
 		)
 	return batch[0], batch[1]
+
+
+def _tensor_on_device(tensor: torch.Tensor, device: torch.device) -> bool:
+	tensor_device = tensor.device
+	if tensor_device.type != device.type:
+		return False
+	if device.index is None:
+		return True
+	return tensor_device.index == device.index
 
 
 def _assert_batch_shapes(
@@ -163,12 +193,206 @@ def _infer_input_channels_from_loader(train_loader) -> int:
 	return int(x_batch.shape[2])
 
 
-def _maybe_autocast(enabled: bool):
-	"""Return an autocast context manager when mixed precision is enabled."""
+def _maybe_autocast(device: torch.device, amp_dtype):
+	"""Return an autocast context manager for the selected AMP dtype."""
 
-	if enabled and autocast is not None:
-		return autocast()
-	return nullcontext()
+	if amp_dtype is None:
+		return nullcontext()
+	return autocast_context(device, amp_dtype)
+
+
+def _make_grad_scaler(enabled: bool):
+	"""Create a CUDA AMP GradScaler while supporting old and new PyTorch APIs."""
+
+	if not enabled or torch is None:
+		return None
+	if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+		try:
+			return torch.amp.GradScaler("cuda", enabled=enabled)
+		except TypeError:
+			return torch.amp.GradScaler(enabled=enabled)
+	if CudaGradScaler is not None:
+		return CudaGradScaler(enabled=enabled)
+	return None
+
+
+def _optional_positive_float(value: Any) -> float | None:
+	if value in (None, "", "null", 0, 0.0):
+		return None
+	result = float(value)
+	return result if result > 0.0 else None
+
+
+def _auto_hardware_tuning_enabled(training_config: Mapping[str, Any]) -> tuple[bool, Mapping[str, Any]]:
+	auto_config = training_config.get("auto_hardware_tuning", {})
+	if isinstance(auto_config, Mapping):
+		return bool(auto_config.get("enabled", False)), auto_config
+	return bool(auto_config), {}
+
+
+def _architecture_auto_tuning_config(config: Mapping[str, Any], auto_config: Mapping[str, Any]) -> Mapping[str, Any]:
+	architecture = resolve_model_architecture(config)
+	architectures = auto_config.get("architectures", {})
+	if isinstance(architectures, Mapping):
+		architecture_config = architectures.get(architecture)
+		if isinstance(architecture_config, Mapping):
+			merged = dict(auto_config)
+			merged.update(dict(architecture_config))
+			return merged
+	return auto_config
+
+
+def _slurm_memory_limit_bytes() -> int | None:
+	for variable_name in ("SLURM_MEM_PER_NODE", "SLURM_MEM_PER_CPU"):
+		value = os.environ.get(variable_name)
+		if value not in (None, ""):
+			try:
+				return int(value) * 1024 * 1024
+			except ValueError:
+				return None
+	return None
+
+
+def _slurm_cpus_per_task() -> int | None:
+	value = os.environ.get("SLURM_CPUS_PER_TASK")
+	if value in (None, ""):
+		return None
+	try:
+		cpus = int(value)
+	except ValueError:
+		return None
+	return cpus if cpus > 0 else None
+
+
+def _apply_dataloader_worker_tuning(config: dict[str, Any], logger) -> None:
+	"""Avoid oversubscribing CPU workers inside small Slurm allocations."""
+
+	training_config = _get_section(config, "training")
+	if not bool(training_config.get("auto_cap_num_workers_to_slurm_cpus", True)):
+		return
+	allocated_cpus = _slurm_cpus_per_task()
+	if allocated_cpus is None:
+		return
+	configured_workers = training_config.get("num_workers", config.get("num_workers", 0))
+	capped_workers = cap_num_workers_by_slurm(config, configured_workers)
+	if str(configured_workers).lower() == "auto" or int(configured_workers) != capped_workers:
+		training_config["num_workers"] = capped_workers
+		config["num_workers"] = capped_workers
+		logger.info(
+			"Resolved DataLoader num_workers from %s to %s based on Slurm CPU allocation=%s.",
+			configured_workers,
+			capped_workers,
+			allocated_cpus,
+		)
+	data_loader_config = _get_section(config, "data_loader")
+	for split_name in ("train", "val", "test"):
+		split_config = data_loader_config.get(split_name)
+		if not isinstance(split_config, dict) or "num_workers" not in split_config:
+			continue
+		raw_workers = split_config["num_workers"]
+		capped_split_workers = cap_num_workers_by_slurm(config, raw_workers)
+		if str(raw_workers).lower() == "auto" or int(raw_workers) != capped_split_workers:
+			split_config["num_workers"] = capped_split_workers
+			logger.info(
+				"Resolved data_loader.%s.num_workers from %s to %s based on Slurm CPU allocation=%s.",
+				split_name,
+				raw_workers,
+				capped_split_workers,
+				allocated_cpus,
+			)
+
+
+def _estimated_sample_bytes(config: Mapping[str, Any]) -> int:
+	model_config = _get_section(config, "model")
+	patching_config = _get_section(config, "patching")
+	patch_size = int(config.get("patch_size", patching_config.get("patch_size", 64)))
+	patch_height = int(patching_config.get("patch_height", patch_size))
+	patch_width = int(patching_config.get("patch_width", patch_size))
+	time_steps = int(config.get("input_sequence_length", 1))
+	input_channels = int(model_config.get("input_channels", config.get("input_channel_count", 1)))
+	output_channels = int(model_config.get("output_channels", 1))
+	float32_bytes = 4
+	input_bytes = time_steps * input_channels * patch_height * patch_width * float32_bytes
+	target_bytes = output_channels * patch_height * patch_width * float32_bytes
+	return max(1, input_bytes + target_bytes)
+
+
+def _cap_batch_size_for_host_memory(
+	config: Mapping[str, Any],
+	batch_size: int,
+	auto_config: Mapping[str, Any],
+	logger,
+) -> int:
+	memory_limit = _slurm_memory_limit_bytes()
+	if memory_limit is None:
+		return batch_size
+	training_config = _get_section(config, "training")
+	num_workers = max(0, int(training_config.get("num_workers", config.get("num_workers", 0))))
+	prefetch_factor = max(1, int(training_config.get("prefetch_factor", 2))) if num_workers > 0 else 1
+	pin_memory = bool(training_config.get("pin_memory", torch.cuda.is_available() if torch is not None else False))
+	resident_batches = max(1, num_workers * prefetch_factor + 1 + int(pin_memory))
+	max_fraction = float(auto_config.get("max_host_memory_fraction", 0.65))
+	sample_multiplier = max(
+		1.0,
+		float(auto_config.get("host_memory_sample_multiplier", training_config.get("host_memory_sample_multiplier", 3.0))),
+	)
+	sample_bytes = _estimated_sample_bytes(config)
+	host_cap = int((memory_limit * max_fraction) / float(sample_bytes * resident_batches * sample_multiplier))
+	host_cap = max(1, host_cap)
+	if batch_size > host_cap and logger is not None:
+		logger.info(
+			"Auto hardware tuning capped batch_size from %s to %s based on SLURM memory, "
+			"resident DataLoader batches=%s, and host_memory_sample_multiplier=%.2f.",
+			batch_size,
+			host_cap,
+			resident_batches,
+			sample_multiplier,
+		)
+	return min(batch_size, host_cap)
+
+
+def _apply_auto_hardware_tuning(config: dict[str, Any], logger) -> None:
+	"""Tune memory-sensitive training knobs from detected CUDA VRAM."""
+
+	training_config = _get_section(config, "training")
+	enabled, auto_config = _auto_hardware_tuning_enabled(training_config)
+	if not enabled:
+		return
+	if torch is None or not torch.cuda.is_available():
+		logger.info("Auto hardware tuning enabled, but CUDA is unavailable; keeping configured batch settings.")
+		return
+
+	device_index = torch.cuda.current_device()
+	properties = torch.cuda.get_device_properties(device_index)
+	total_vram_gb = float(properties.total_memory) / float(1024**3)
+	architecture = resolve_model_architecture(config)
+	auto_config = _architecture_auto_tuning_config(config, auto_config)
+	if total_vram_gb >= 75.0:
+		batch_size = int(auto_config.get("batch_size_80gb", 48))
+	elif total_vram_gb >= 39.0:
+		batch_size = int(auto_config.get("batch_size_40gb", 24))
+	elif total_vram_gb >= 31.0:
+		batch_size = int(auto_config.get("batch_size_32gb", 16))
+	else:
+		batch_size = int(auto_config.get("fallback_batch_size", config.get("batch_size", 8)))
+	batch_size = max(1, batch_size)
+	batch_size = _cap_batch_size_for_host_memory(config, batch_size, auto_config, logger)
+	target_effective_batch = max(batch_size, int(auto_config.get("target_effective_batch_size", batch_size)))
+	gradient_accumulation_steps = max(1, math.ceil(target_effective_batch / batch_size))
+
+	config["batch_size"] = batch_size
+	training_config["batch_size"] = batch_size
+	training_config["gradient_accumulation_steps"] = gradient_accumulation_steps
+	logger.info(
+		"Auto hardware tuning | architecture=%s | gpu=%s | total_vram=%.1f GB | batch_size=%s | "
+		"gradient_accumulation_steps=%s | effective_batch_size=%s",
+		architecture,
+		properties.name,
+		total_vram_gb,
+		batch_size,
+		gradient_accumulation_steps,
+		batch_size * gradient_accumulation_steps,
+	)
 
 
 def _denormalize_target_tensors_for_metrics(loader, y_pred: torch.Tensor, y_true: torch.Tensor):
@@ -227,6 +451,76 @@ def _coerce_loss_result(loss_result: Any) -> tuple[torch.Tensor, dict[str, float
 	raise TypeError(f"Unsupported loss result type: {type(loss_result)!r}.")
 
 
+def _build_input_normalizer(loader, device: torch.device, input_channels: int):
+	"""Build cached device tensors for per-channel input normalization."""
+
+	dataset = getattr(loader, "dataset", None)
+	if not bool(getattr(dataset, "input_normalization_on_device", False)):
+		return None
+	stats = getattr(dataset, "normalization_stats", None)
+	if not isinstance(stats, Mapping):
+		return None
+	if "mean" not in stats or "std" not in stats:
+		raise KeyError("Device-side input normalization requires normalization stats with mean and std.")
+
+	mean_tensor = torch.as_tensor(stats["mean"], dtype=torch.float32, device=device).flatten()
+	std_tensor = torch.as_tensor(stats["std"], dtype=torch.float32, device=device).flatten()
+	if mean_tensor.numel() < input_channels or std_tensor.numel() < input_channels:
+		raise ValueError(
+			"Normalization stats channel count does not match model inputs. "
+			f"Need at least {input_channels}, got mean={mean_tensor.numel()} std={std_tensor.numel()}."
+		)
+	if mean_tensor.numel() > input_channels:
+		mean_tensor = mean_tensor[:input_channels]
+	if std_tensor.numel() > input_channels:
+		std_tensor = std_tensor[:input_channels]
+	std_tensor = torch.clamp(std_tensor, min=1.0e-6)
+	return {
+		"mean": mean_tensor.reshape(1, 1, input_channels, 1, 1),
+		"std": std_tensor.reshape(1, 1, input_channels, 1, 1),
+	}
+
+
+def _apply_input_normalizer(x_batch: torch.Tensor, normalizer) -> torch.Tensor:
+	"""Normalize a batch in-place after it has been moved to the training device."""
+
+	if normalizer is None:
+		return x_batch
+	with torch.no_grad():
+		x_batch.sub_(normalizer["mean"])
+		x_batch.div_(normalizer["std"])
+	return x_batch
+
+
+def _input_normalization_status(loader) -> str:
+	"""Return a compact user/log facing normalization status for one loader."""
+
+	dataset = getattr(loader, "dataset", None)
+	if bool(getattr(dataset, "input_normalization_on_device", False)):
+		return "device"
+	if bool(getattr(dataset, "inputs_are_normalized", False)):
+		return "dataset"
+	if getattr(dataset, "normalization_stats", None) is None:
+		return "none"
+	return "unknown"
+
+
+def _loader_summary(loader) -> dict[str, Any]:
+	batch_sampler = getattr(loader, "batch_sampler", None)
+	batch_size = getattr(loader, "batch_size", None)
+	if batch_size is None and hasattr(batch_sampler, "batch_size"):
+		batch_size = getattr(batch_sampler, "batch_size")
+	return {
+		"batch_size": batch_size,
+		"num_workers": getattr(loader, "num_workers", None),
+		"pin_memory": getattr(loader, "pin_memory", None),
+		"persistent_workers": getattr(loader, "persistent_workers", None),
+		"prefetch_factor": getattr(loader, "prefetch_factor", None),
+		"sampler": type(getattr(loader, "sampler", None)).__name__,
+		"batch_sampler": type(batch_sampler).__name__,
+	}
+
+
 def _run_epoch(
 	model: nn.Module,
 	loader,
@@ -240,11 +534,13 @@ def _run_epoch(
 	optimizer=None,
 	scaler=None,
 	gradient_clip_norm: float | None = None,
-	mixed_precision: bool = False,
+	amp_dtype=None,
 	gradient_accumulation_steps: int = 1,
 	max_batches: int | None = None,
 	logger=None,
 	epoch_number: int | None = None,
+	deadline_time: float | None = None,
+	timing_csv_path: Path | None = None,
 ) -> dict[str, float]:
 	"""Execute one train or validation epoch and return averaged losses/metrics."""
 
@@ -252,29 +548,47 @@ def _run_epoch(
 	model.train(mode=train)
 	gradient_accumulation_steps = max(1, int(gradient_accumulation_steps))
 	training_config = _get_section(config, "training")
-	log_timing = bool(training_config.get("log_timing", False))
-	timing_interval = max(1, int(training_config.get("timing_log_every_n_batches", 50)))
-	compute_train_metrics_every_batch = bool(training_config.get("compute_train_metrics_every_batch", False))
-	train_metrics_every_n_batches = max(1, int(training_config.get("train_metrics_every_n_batches", 100)))
-	compute_val_metrics = bool(training_config.get("compute_val_metrics", True))
+	performance_config = get_performance_config(config)
+	log_timing = bool(performance_config.get("log_timing", training_config.get("log_timing", False)))
+	timing_interval = max(1, int(performance_config.get("timing_log_every_n_batches", training_config.get("timing_log_every_n_batches", 50))))
+	synchronize_timing = bool(performance_config.get("synchronize_timing", False))
+	compute_train_metrics_every_batch = bool(performance_config.get("compute_train_metrics_every_batch", training_config.get("compute_train_metrics_every_batch", False)))
+	train_metrics_every_n_batches = max(
+		1,
+		int(performance_config.get("cheap_train_metrics_every_n_batches", training_config.get("train_metrics_every_n_batches", 100))),
+	)
+	compute_val_metrics = bool(performance_config.get("compute_val_metrics", training_config.get("compute_val_metrics", True)))
+	non_blocking_transfer = bool(performance_config.get("non_blocking_transfer", True))
+	use_cuda_prefetcher = bool(performance_config.get("prefetch_to_cuda", False)) and device.type == "cuda"
 
 	total_samples = 0
 	total_loss = 0.0
 	metric_samples = 0
 	metric_totals: dict[str, float] = defaultdict(float)
 	loss_component_totals: dict[str, float] = defaultdict(float)
+	timing_totals: dict[str, float] = defaultdict(float)
+	timing_rows: list[dict[str, Any]] = []
+	epoch_start_time = time.perf_counter()
 	total_loader_batches = len(loader)
 	total_batches = total_loader_batches if max_batches is None else min(total_loader_batches, int(max_batches))
 	if total_batches <= 0:
 		raise ValueError(f"The {desc} DataLoader produced no batches.")
 	progress_bar = tqdm(range(total_batches), desc=desc, total=total_batches, leave=False) if tqdm is not None else range(total_batches)
-	iterator = iter(loader)
+	iterator_source = CUDAPrefetcher(loader, device, non_blocking=non_blocking_transfer) if use_cuda_prefetcher else loader
+	iterator = iter(iterator_source)
+	stopped_by_time_limit = False
+	input_normalizer = _build_input_normalizer(loader, device, input_channels)
 
 	def _sync_if_timing() -> None:
-		if log_timing and device.type == "cuda":
+		if synchronize_timing and device.type == "cuda":
 			torch.cuda.synchronize(device)
 
 	for batch_offset in progress_bar:
+		if deadline_time is not None and time.perf_counter() >= float(deadline_time):
+			stopped_by_time_limit = True
+			if logger is not None:
+				logger.warning("Stopping %s epoch early because the configured runtime budget is nearly exhausted.", desc)
+			break
 		batch_number = int(batch_offset) + 1
 		fetch_start_time = time.perf_counter()
 		try:
@@ -289,10 +603,16 @@ def _run_epoch(
 
 		_assert_batch_shapes(x_batch, y_batch, input_sequence_length, input_channels, output_channels)
 		h2d_start_time = time.perf_counter()
-		x_batch = x_batch.to(device, non_blocking=True)
-		y_batch = y_batch.to(device, non_blocking=True)
+		if not _tensor_on_device(x_batch, device):
+			x_batch = x_batch.to(device, non_blocking=non_blocking_transfer)
+		if not _tensor_on_device(y_batch, device):
+			y_batch = y_batch.to(device, non_blocking=non_blocking_transfer)
 		_sync_if_timing()
-		h2d_time = time.perf_counter() - h2d_start_time
+		h2d_time = 0.0 if use_cuda_prefetcher else time.perf_counter() - h2d_start_time
+		normalization_start_time = time.perf_counter()
+		x_batch = _apply_input_normalizer(x_batch, input_normalizer)
+		_sync_if_timing()
+		normalization_time = time.perf_counter() - normalization_start_time
 
 		if train and optimizer is None:
 			raise ValueError("An optimizer is required for training epochs.")
@@ -307,7 +627,7 @@ def _run_epoch(
 		metrics_time = 0.0
 		batch_metrics: dict[str, float] = {}
 		with torch.set_grad_enabled(train):
-			with _maybe_autocast(mixed_precision and train):
+			with _maybe_autocast(device, amp_dtype):
 				forward_start_time = time.perf_counter()
 				y_pred = model(x_batch)
 				_sync_if_timing()
@@ -334,7 +654,7 @@ def _run_epoch(
 
 			if train:
 				should_step = (batch_number % gradient_accumulation_steps == 0) or (batch_number == total_batches)
-				if scaler is not None and mixed_precision:
+				if scaler is not None:
 					backward_start_time = time.perf_counter()
 					scaler.scale(loss_for_backward).backward()
 					if should_step and gradient_clip_norm is not None:
@@ -389,15 +709,44 @@ def _run_epoch(
 
 		batch_total_time = time.perf_counter() - fetch_start_time
 		samples_per_second = batch_size / max(batch_total_time, 1.0e-9)
+		gpu_mem_allocated_gb = 0.0
+		gpu_mem_reserved_gb = 0.0
+		if device.type == "cuda":
+			gpu_mem_allocated_gb = float(torch.cuda.memory_allocated(device)) / float(1024**3)
+			gpu_mem_reserved_gb = float(torch.cuda.memory_reserved(device)) / float(1024**3)
+		timing_values = {
+			"data_wait": data_wait_time,
+			"h2d": h2d_time,
+			"norm": normalization_time,
+			"forward": forward_time,
+			"loss": loss_time,
+			"backward": backward_time,
+			"optimizer": optimizer_time,
+			"metrics": metrics_time,
+			"total_step": batch_total_time,
+		}
+		for timing_name, timing_value in timing_values.items():
+			timing_totals[timing_name] += float(timing_value)
+		if timing_csv_path is not None:
+			timing_rows.append(
+				{
+					"epoch": epoch_number if epoch_number is not None else "",
+					"phase": desc,
+					"batch": batch_number,
+					"batch_size": batch_size,
+					"samples_per_second": samples_per_second,
+					"gpu_mem_allocated_gb": gpu_mem_allocated_gb,
+					"gpu_mem_reserved_gb": gpu_mem_reserved_gb,
+					**timing_values,
+				}
+			)
 		if log_timing and (batch_number % timing_interval == 0 or batch_number == total_batches):
 			message = (
-				f"[timing] epoch={epoch_number if epoch_number is not None else '?'} "
-				f"phase={desc} batch={batch_number}/{total_batches} "
-				f"data_wait={data_wait_time:.3f}s h2d={h2d_time:.3f}s "
-				f"forward={forward_time:.3f}s loss={loss_time:.3f}s "
-				f"backward={backward_time:.3f}s optimizer={optimizer_time:.3f}s "
-				f"metrics={metrics_time:.3f}s batch={batch_total_time:.3f}s "
-				f"samples/s={samples_per_second:.2f}"
+				f"step {batch_number} | epoch={epoch_number if epoch_number is not None else '?'} {desc} "
+				f"total={batch_total_time:.2f}s data={data_wait_time:.2f} h2d={h2d_time:.2f} "
+				f"norm={normalization_time:.2f} fwd={forward_time:.2f} loss={loss_time:.2f} "
+				f"bwd={backward_time:.2f} opt={optimizer_time:.2f} metrics={metrics_time:.2f} "
+				f"mem={gpu_mem_allocated_gb:.1f}/{gpu_mem_reserved_gb:.1f}GB samples/s={samples_per_second:.2f}"
 			)
 			if logger is not None:
 				logger.info(message)
@@ -422,6 +771,43 @@ def _run_epoch(
 		results[f"{desc}_{metric_name}"] = total_value / max(metric_samples, 1)
 	results[f"{desc}_samples"] = float(total_samples)
 	results[f"{desc}_batches"] = float(batch_number)
+	results[f"{desc}_stopped_by_time_limit"] = float(stopped_by_time_limit)
+	completed_batches = max(1, int(batch_number))
+	epoch_wall_time = time.perf_counter() - epoch_start_time
+	for timing_name, timing_total in timing_totals.items():
+		results[f"{desc}_{timing_name}_avg"] = float(timing_total) / completed_batches
+	results[f"{desc}_samples_per_second"] = float(total_samples) / max(epoch_wall_time, 1.0e-9)
+	results[f"{desc}_patches_per_second"] = float(total_samples) / max(epoch_wall_time, 1.0e-9)
+	if timing_csv_path is not None and timing_rows:
+		_log_rows_to_csv(timing_csv_path, timing_rows, append=timing_csv_path.exists())
+	avg_data_wait = results.get(f"{desc}_data_wait_avg", 0.0)
+	avg_forward = results.get(f"{desc}_forward_avg", 0.0)
+	avg_backward = results.get(f"{desc}_backward_avg", 0.0)
+	if logger is not None:
+		logger.info(
+			"%s timing summary | data_wait=%.3fs h2d=%.3fs norm=%.3fs forward=%.3fs "
+			"backward=%.3fs optimizer=%.3fs metrics=%.3fs samples/s=%.2f",
+			desc,
+			results.get(f"{desc}_data_wait_avg", 0.0),
+			results.get(f"{desc}_h2d_avg", 0.0),
+			results.get(f"{desc}_norm_avg", 0.0),
+			avg_forward,
+			avg_backward,
+			results.get(f"{desc}_optimizer_avg", 0.0),
+			results.get(f"{desc}_metrics_avg", 0.0),
+			results[f"{desc}_samples_per_second"],
+		)
+		if avg_data_wait > (avg_forward + avg_backward):
+			logger.info(
+				"Data loading appears to be the bottleneck. Try increasing num_workers, "
+				"shard_local_shuffle, or cache shard size."
+			)
+		if device.type == "cuda":
+			device_info = get_cuda_device_info()
+			total_memory_gb = float(device_info.get("total_memory_gb", 0.0) or 0.0)
+			reserved_memory_gb = float(torch.cuda.memory_reserved(device)) / float(1024**3)
+			if total_memory_gb > 0 and reserved_memory_gb < 0.5 * total_memory_gb and avg_data_wait <= (avg_forward + avg_backward):
+				logger.info("GPU memory underused. Try increasing batch size or enabling auto_batch_size.")
 	return results
 
 
@@ -440,6 +826,10 @@ def _run_external_test_epoch_with_spatial_handling(
 	metric_totals: dict[str, float] = defaultdict(float)
 	loss_component_totals: dict[str, float] = defaultdict(float)
 	mode_counts: dict[str, int] = defaultdict(int)
+	input_channels = int(getattr(getattr(loader, "dataset", None), "total_input_channels", 0))
+	if input_channels <= 0:
+		input_channels = int(_get_section(config, "model").get("input_channels", 0))
+	input_normalizer = _build_input_normalizer(loader, device, input_channels) if input_channels > 0 else None
 
 	for batch in loader:
 		x_batch, y_batch = _as_batch(batch)
@@ -448,6 +838,7 @@ def _run_external_test_epoch_with_spatial_handling(
 
 		x_batch = x_batch.to(device, non_blocking=True)
 		y_batch = y_batch.to(device, non_blocking=True)
+		x_batch = _apply_input_normalizer(x_batch, input_normalizer)
 		with torch.no_grad():
 			spatial_result = infer_with_external_test_spatial_handling(model, x_batch, config)
 			y_pred = spatial_result["y_pred"]
@@ -511,6 +902,119 @@ def _resolve_training_log_path(config: Mapping[str, Any]) -> Path:
 	return _resolve_path(config_path, configured)
 
 
+def _run_name(config: Mapping[str, Any]) -> str:
+	logging_config = _get_section(config, "logging")
+	name = logging_config.get("run_name") or _get_section(config, "model").get("name") or resolve_model_architecture(config)
+	return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(name)).strip("_") or "training_run"
+
+
+def _resolve_timing_log_path(config: Mapping[str, Any]) -> Path:
+	logging_config = _get_section(config, "logging")
+	configured = logging_config.get("timing_log_path")
+	if configured in (None, "", "null"):
+		configured = f"./artifacts/logs/training_timing_{_run_name(config)}.csv"
+	config_path_value = config.get("config_path", config.get("_config_path"))
+	config_path = Path(config_path_value).expanduser().resolve() if config_path_value else None
+	return _resolve_path(config_path, configured)
+
+
+def _positive_int_or_none(value: Any) -> int | None:
+	if value in (None, "", "null", 0, 0.0):
+		return None
+	result = int(value)
+	return result if result > 0 else None
+
+
+def _resolve_max_batches(config: Mapping[str, Any], split: str) -> int | None:
+	performance_config = get_performance_config(config)
+	training_config = _get_section(config, "training")
+	key = f"max_{split}_batches_per_epoch"
+	return _positive_int_or_none(performance_config.get(key, training_config.get(key)))
+
+
+def _model_parameter_count(model: nn.Module) -> int:
+	return int(sum(parameter.numel() for parameter in model.parameters()))
+
+
+def _current_git_commit() -> str | None:
+	try:
+		result = subprocess.run(
+			["git", "rev-parse", "HEAD"],
+			check=True,
+			capture_output=True,
+			text=True,
+			cwd=Path(__file__).resolve().parents[2],
+		)
+	except Exception:
+		return None
+	return result.stdout.strip() or None
+
+
+def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
+	path.parent.mkdir(parents=True, exist_ok=True)
+	with path.open("w", encoding="utf-8") as handle:
+		json.dump(payload, handle, indent=2, sort_keys=True, default=str)
+
+
+def _save_resolved_run_artifacts(
+	config: Mapping[str, Any],
+	model: nn.Module,
+	logger,
+	normalization_stats_path: Path | None,
+) -> dict[str, str]:
+	"""Save reproducibility artifacts for the resolved training run."""
+
+	run_name = _run_name(config)
+	config_dir = Path("./artifacts/configs").expanduser().resolve()
+	config_dir.mkdir(parents=True, exist_ok=True)
+	resolved_config_path = config_dir / f"{run_name}_resolved.yaml"
+	hardware_summary_path = config_dir / f"{run_name}_hardware.json"
+	cache_manifest_copy_path = config_dir / f"{run_name}_cache_manifest.json"
+	payload = dict(config)
+	payload.setdefault("resolved_run", {})
+	payload["resolved_run"] = {
+		"run_name": run_name,
+		"git_commit": _current_git_commit(),
+		"normalization_stats_path": str(normalization_stats_path) if normalization_stats_path is not None else None,
+		"model_parameter_count": _model_parameter_count(model),
+		"cuda": get_cuda_device_info(),
+	}
+	if yaml is not None:
+		with resolved_config_path.open("w", encoding="utf-8") as handle:
+			yaml.safe_dump(payload, handle, sort_keys=False)
+	else:
+		_write_json(resolved_config_path.with_suffix(".json"), payload)
+		resolved_config_path = resolved_config_path.with_suffix(".json")
+
+	hardware_summary = {
+		"cuda": get_cuda_device_info(),
+		"available_vram_gb": estimate_available_vram_gb(),
+		"backend": configure_torch_backend(config),
+		"git_commit": payload["resolved_run"]["git_commit"],
+		"model_parameter_count": payload["resolved_run"]["model_parameter_count"],
+	}
+	_write_json(hardware_summary_path, hardware_summary)
+
+	cache_config = _get_section(config, "cache")
+	if bool(cache_config.get("enabled", False)) and bool(cache_config.get("use_precomputed_patches", False)):
+		try:
+			from src.data.cache import MANIFEST_FILENAME, get_patch_cache_dir
+
+			manifest_path = get_patch_cache_dir(config) / MANIFEST_FILENAME
+			if manifest_path.exists():
+				shutil.copyfile(manifest_path, cache_manifest_copy_path)
+		except Exception as exc:
+			logger.warning("Could not copy cache manifest for run metadata: %s", exc)
+
+	logger.info("Saved resolved config: %s", resolved_config_path)
+	logger.info("Saved hardware summary: %s", hardware_summary_path)
+	return {
+		"resolved_config_path": str(resolved_config_path),
+		"hardware_summary_path": str(hardware_summary_path),
+		"cache_manifest_copy_path": str(cache_manifest_copy_path) if cache_manifest_copy_path.exists() else "",
+	}
+
+
 def _resolve_existing_normalization_stats_path(config: Mapping[str, Any]) -> Path | None:
 	"""Resolve normalization.path when the stats archive exists."""
 
@@ -524,8 +1028,8 @@ def _resolve_existing_normalization_stats_path(config: Mapping[str, Any]) -> Pat
 	return resolved_path if resolved_path.exists() else None
 
 
-def _build_optimizer(model: nn.Module, config: Mapping[str, Any]):
-	"""Construct the configured optimizer, defaulting to AdamW."""
+def _build_optimizer_from_parameters(parameters, config: Mapping[str, Any]):
+	"""Construct the configured optimizer for an iterable of parameters."""
 
 	training_config = _get_section(config, "training")
 	optimizer_name = str(training_config.get("optimizer", "adamw")).lower()
@@ -533,14 +1037,114 @@ def _build_optimizer(model: nn.Module, config: Mapping[str, Any]):
 	weight_decay = float(training_config.get("weight_decay", 0.0))
 
 	if optimizer_name == "adam":
-		return torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+		return torch.optim.Adam(parameters, lr=lr, weight_decay=weight_decay)
 	if optimizer_name == "adamw":
-		return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+		return torch.optim.AdamW(parameters, lr=lr, weight_decay=weight_decay)
 	if optimizer_name == "sgd":
 		momentum = float(training_config.get("momentum", 0.9))
-		return torch.optim.SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
+		return torch.optim.SGD(parameters, lr=lr, momentum=momentum, weight_decay=weight_decay)
 
 	raise ValueError(f"Unsupported optimizer: {optimizer_name}")
+
+
+def _build_optimizer(model: nn.Module, config: Mapping[str, Any]):
+	"""Construct the configured optimizer, defaulting to AdamW."""
+
+	return _build_optimizer_from_parameters(model.parameters(), config)
+
+
+def _maybe_probe_auto_batch_size(
+	config: dict[str, Any],
+	train_loader,
+	input_channels: int,
+	device: torch.device,
+	logger,
+) -> bool:
+	"""Optionally run a CUDA memory probe and update batch-size config."""
+
+	performance_config = get_performance_config(config)
+	if not bool(performance_config.get("auto_batch_size", False)):
+		return False
+	if device.type != "cuda" or not torch.cuda.is_available():
+		logger.info("auto_batch_size requested, but CUDA is unavailable; keeping configured batch size.")
+		return False
+
+	training_config = _get_section(config, "training")
+	current_batch_size = int(training_config.get("batch_size", config.get("batch_size", 1)))
+	max_batch_size = performance_config.get("auto_batch_max_batch_size")
+	auto_config = _architecture_auto_tuning_config(config, _get_section(training_config, "auto_hardware_tuning"))
+	if max_batch_size in (None, "", "null"):
+		max_batch_size = max(current_batch_size, int(auto_config.get("target_effective_batch_size", current_batch_size)))
+	original_host_safe_batch_size = training_config.get("_auto_batch_original_batch_size")
+	if original_host_safe_batch_size not in (None, "", "null"):
+		max_batch_size = min(int(max_batch_size), int(original_host_safe_batch_size))
+	max_batch_size = _cap_batch_size_for_host_memory(config, int(max_batch_size), auto_config, logger)
+	max_trials = int(performance_config.get("auto_batch_max_trials", 12))
+	logger.info(
+		"Running CUDA auto batch-size probe | initial=%s max=%s trials=%s",
+		current_batch_size,
+		max_batch_size,
+		max_trials,
+	)
+	sample_batch = next(iter(train_loader))
+	x_sample, y_sample = _as_batch(sample_batch)
+	if not torch.is_tensor(x_sample) or not torch.is_tensor(y_sample):
+		raise TypeError("Auto batch-size probing requires tensor batches.")
+
+	probe_model = build_model_from_config(config, input_channels=input_channels).to(device)
+	criterion = get_loss_function(config)
+	amp_dtype = choose_amp_dtype(config, device)
+	gradient_clip_norm_value = training_config.get("gradient_clip_norm", config.get("gradient_clip_norm", None))
+	gradient_clip_norm = None if gradient_clip_norm_value in (None, "", 0, 0.0) else float(gradient_clip_norm_value)
+	try:
+		selected_batch_size = find_max_batch_size(
+			model=probe_model,
+			criterion=criterion,
+			optimizer_factory=lambda parameters: _build_optimizer_from_parameters(parameters, config),
+			sample_batch=(x_sample, y_sample),
+			device=device,
+			amp_dtype=amp_dtype,
+			initial_batch_size=current_batch_size,
+			max_batch_size=int(max_batch_size),
+			gradient_accumulation_steps=max(1, int(training_config.get("gradient_accumulation_steps", 1))),
+			gradient_clip_norm=gradient_clip_norm,
+			logger=logger,
+			max_trials=max_trials,
+		)
+	finally:
+		del probe_model
+		if torch.cuda.is_available():
+			torch.cuda.empty_cache()
+
+	if selected_batch_size <= 0:
+		return False
+	host_safe_selected_batch_size = _cap_batch_size_for_host_memory(config, selected_batch_size, auto_config, logger)
+	if host_safe_selected_batch_size < selected_batch_size:
+		logger.info(
+			"Auto batch-size probe capped selected batch_size from %s to %s for host/DataLoader memory.",
+			selected_batch_size,
+			host_safe_selected_batch_size,
+		)
+		selected_batch_size = host_safe_selected_batch_size
+	original_batch_size = training_config.get("_auto_batch_original_batch_size")
+	if selected_batch_size != current_batch_size or original_batch_size is not None:
+		training_config["batch_size"] = selected_batch_size
+		config["batch_size"] = selected_batch_size
+		auto_config = _architecture_auto_tuning_config(config, _get_section(training_config, "auto_hardware_tuning"))
+		target_effective_batch = max(
+			selected_batch_size,
+			int(performance_config.get("target_effective_batch_size", auto_config.get("target_effective_batch_size", selected_batch_size))),
+		)
+		training_config["gradient_accumulation_steps"] = max(1, math.ceil(target_effective_batch / selected_batch_size))
+		logger.info(
+			"Auto batch-size probe selected batch_size=%s gradient_accumulation_steps=%s effective_batch_size=%s",
+			selected_batch_size,
+			training_config["gradient_accumulation_steps"],
+			selected_batch_size * int(training_config["gradient_accumulation_steps"]),
+		)
+		return selected_batch_size != current_batch_size
+	logger.info("Auto batch-size probe kept configured batch_size=%s.", current_batch_size)
+	return False
 
 
 def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -552,21 +1156,39 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 	config = dict(config)
 	config["return_metadata"] = False
 	training_config = _get_section(config, "training")
+	performance_config = get_performance_config(config)
 	logging_config = _get_section(config, "logging")
 	checkpoint_config = _get_section(config, "checkpoint")
+	checkpointing_config = _get_section(config, "checkpointing")
 	architecture = resolve_model_architecture(config)
 
 	seed = int(training_config.get("seed", config.get("seed", 42)))
 	set_seed(seed)
-	if bool(training_config.get("cudnn_benchmark", False)) and torch.backends.cudnn.is_available():
-		torch.backends.cudnn.deterministic = False
-		torch.backends.cudnn.benchmark = True
+	backend_summary = configure_torch_backend(config)
 
 	log_level = str(logging_config.get("level", "INFO"))
 	log_dir = Path(logging_config.get("log_dir", "./artifacts/logs")).expanduser().resolve()
 	log_dir.mkdir(parents=True, exist_ok=True)
 	logger = setup_logging(log_level, str(log_dir / f"train_{architecture}.log"))
+	logger.info("Torch backend: %s", backend_summary)
+	_apply_dataloader_worker_tuning(config, logger)
+	_apply_auto_hardware_tuning(config, logger)
+	performance_config = get_performance_config(config)
+	if bool(performance_config.get("auto_batch_size", False)) and torch.cuda.is_available():
+		current_batch_size = int(training_config.get("batch_size", config.get("batch_size", 1)))
+		probe_batch_size_value = performance_config.get("auto_batch_probe_batch_size", min(current_batch_size, 8))
+		if probe_batch_size_value not in (None, "", "null"):
+			probe_batch_size = max(1, int(probe_batch_size_value))
+			if probe_batch_size < current_batch_size:
+				training_config["_auto_batch_original_batch_size"] = current_batch_size
+				training_config["batch_size"] = probe_batch_size
+				config["batch_size"] = probe_batch_size
+				logger.info(
+					"auto_batch_size enabled; using initial probe DataLoader batch_size=%s before CUDA memory search.",
+					probe_batch_size,
+				)
 
+	normalization_stats_path = _resolve_existing_normalization_stats_path(config)
 	cache_config = _get_section(config, "cache")
 	if bool(cache_config.get("enabled", False)) and bool(cache_config.get("use_precomputed_patches", False)):
 		from src.data.cache import get_patch_cache_dir, validate_patch_cache
@@ -579,7 +1201,6 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 			else:
 				raise
 		else:
-			normalization_stats_path = _resolve_existing_normalization_stats_path(config)
 			if not bool(cache_config.get("save_normalized_inputs", False)) and normalization_stats_path is None:
 				raise RuntimeError(
 					"Training is configured to load unnormalized precomputed patch shards, "
@@ -611,11 +1232,18 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 	device = _get_device(config)
 	logger.info("Using device: %s", device)
 
+	if _maybe_probe_auto_batch_size(config, train_loader, input_channels, device, logger):
+		logger.info("Rebuilding dataloaders with probed batch_size=%s", _get_section(config, "training").get("batch_size", config.get("batch_size")))
+		train_loader, val_loader, test_loader = create_dataloaders(config)
+		input_channels = _infer_input_channels_from_loader(train_loader)
+		training_config = _get_section(config, "training")
+		performance_config = get_performance_config(config)
+
 	model = build_model_from_config(config, input_channels=input_channels)
 	model = model.to(device)
-	if bool(training_config.get("torch_compile", False)):
+	if bool(performance_config.get("torch_compile", training_config.get("torch_compile", False))):
 		if not hasattr(torch, "compile"):
-			logger.warning("training.torch_compile=true, but this PyTorch build does not provide torch.compile.")
+			logger.warning("torch_compile=true, but this PyTorch build does not provide torch.compile.")
 		else:
 			try:
 				model = torch.compile(model)
@@ -628,11 +1256,25 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 	epochs = int(config.get("epochs", training_config.get("epochs", 1)))
 	scheduler = _build_scheduler(optimizer, config, epochs)
 
-	use_mixed_precision = bool(training_config.get("mixed_precision", False)) and device.type == "cuda"
-	scaler = GradScaler(enabled=use_mixed_precision) if use_mixed_precision and GradScaler is not None else None
+	amp_dtype = choose_amp_dtype(config, device)
+	scaler = _make_grad_scaler(amp_dtype is not None and amp_dtype is torch.float16)
+	logger.info("Precision | amp_dtype=%s | grad_scaler=%s", amp_dtype, scaler is not None)
 	gradient_clip_norm_value = training_config.get("gradient_clip_norm", config.get("gradient_clip_norm", None))
 	gradient_clip_norm = None if gradient_clip_norm_value in (None, "", 0, 0.0) else float(gradient_clip_norm_value)
 	gradient_accumulation_steps = max(1, int(training_config.get("gradient_accumulation_steps", 1)))
+	max_runtime_hours = _optional_positive_float(training_config.get("max_runtime_hours", None))
+	runtime_safety_margin_seconds = max(
+		0.0,
+		float(training_config.get("runtime_safety_margin_minutes", 15.0)) * 60.0,
+	)
+	runtime_deadline_time = None
+	if max_runtime_hours is not None:
+		runtime_deadline_time = time.perf_counter() + max_runtime_hours * 3600.0 - runtime_safety_margin_seconds
+		logger.info(
+			"Runtime budget enabled | max_runtime_hours=%.2f | safety_margin_minutes=%.1f",
+			max_runtime_hours,
+			runtime_safety_margin_seconds / 60.0,
+		)
 
 	latest_checkpoint_path, best_checkpoint_path = _resolve_training_paths(config)
 	resume_enabled = bool(checkpoint_config.get("resume", True))
@@ -658,16 +1300,35 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 	if start_epoch >= epochs:
 		logger.info("Checkpoint already covers requested epochs (%s). Skipping training.", epochs)
 
+	save_every_n_epochs = max(1, int(checkpointing_config.get("save_every_n_epochs", checkpoint_config.get("save_every_n_epochs", 1))))
+	save_latest_checkpoint = bool(checkpointing_config.get("save_latest", True))
+	save_best_checkpoint = bool(checkpointing_config.get("save_best", True))
+	if bool(checkpointing_config.get("async_save", False)):
+		logger.warning("checkpointing.async_save=true is not enabled in this safe path; saving checkpoints synchronously.")
+
 	training_log_path = _resolve_training_log_path(config)
 	training_log_path.parent.mkdir(parents=True, exist_ok=True)
 	append_log = training_log_path.exists() and start_epoch > 0
+	timing_log_path = _resolve_timing_log_path(config)
+	timing_log_path.parent.mkdir(parents=True, exist_ok=True)
+	run_artifact_paths = _save_resolved_run_artifacts(config, model, logger, normalization_stats_path)
 
 	logger.info("Starting training for %s epochs", epochs)
 	test_sample_count = 0 if test_loader is None else len(test_loader.dataset)
 	logger.info("Train samples: %s | Val samples: %s | External test samples: %s", len(train_loader.dataset), len(val_loader.dataset), test_sample_count)
+	logger.info("Train DataLoader: %s", _loader_summary(train_loader))
+	logger.info("Val DataLoader: %s", _loader_summary(val_loader))
+	if test_loader is not None:
+		logger.info("Test DataLoader: %s", _loader_summary(test_loader))
 	logger.info("Inferred input channels: %s", input_channels)
 	logger.info("Model architecture: %s", architecture)
 	logger.info("Model output channels: %s", output_channels)
+	logger.info(
+		"Input normalization | train=%s | val=%s | test=%s",
+		_input_normalization_status(train_loader),
+		_input_normalization_status(val_loader),
+		"not_configured" if test_loader is None else _input_normalization_status(test_loader),
+	)
 	logger.info(
 		"Patch mode | train=%s eval=%s patch_size=%s active_patch_probability=%s active_threshold=%s grad_accum=%s",
 		bool(config.get("use_patches", False)),
@@ -680,6 +1341,9 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 
 	final_epoch_summary: dict[str, Any] = dict(history_rows[-1]) if history_rows else {}
 	for epoch_index in range(start_epoch, epochs):
+		if runtime_deadline_time is not None and time.perf_counter() >= runtime_deadline_time:
+			logger.warning("Stopping before epoch %s because the configured runtime budget is nearly exhausted.", epoch_index + 1)
+			break
 		epoch_number = epoch_index + 1
 		logger.info("Epoch %s/%s", epoch_number, epochs)
 
@@ -696,20 +1360,16 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 			optimizer=optimizer,
 			scaler=scaler,
 			gradient_clip_norm=gradient_clip_norm,
-			mixed_precision=use_mixed_precision,
+			amp_dtype=amp_dtype,
 			gradient_accumulation_steps=gradient_accumulation_steps,
-			max_batches=(
-				max(1, int(training_config.get("max_train_batches_per_epoch")))
-				if training_config.get("max_train_batches_per_epoch", None) not in (None, "", "null")
-				else None
-			),
+			max_batches=_resolve_max_batches(config, "train"),
 			logger=logger,
 			epoch_number=epoch_number,
+			deadline_time=runtime_deadline_time,
+			timing_csv_path=timing_log_path,
 		)
-		max_val_batches_value = training_config.get("max_val_batches_per_epoch", None)
-		max_val_batches = None
-		if max_val_batches_value not in (None, "", "null"):
-			max_val_batches = max(1, int(max_val_batches_value))
+		train_stopped_by_time_limit = bool(train_results.get("train_stopped_by_time_limit", 0.0))
+		max_val_batches = _resolve_max_batches(config, "val")
 		full_validation_every_n_epochs = int(training_config.get("full_validation_every_n_epochs", 1) or 0)
 		run_full_validation = max_val_batches is None or (
 			full_validation_every_n_epochs > 0 and epoch_number % full_validation_every_n_epochs == 0
@@ -722,26 +1382,41 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 				epoch_number,
 				full_validation_every_n_epochs,
 			)
-		val_results = _run_epoch(
-			model=model,
-			loader=val_loader,
-			criterion=criterion,
-			config=config,
-			device=device,
-			input_sequence_length=input_sequence_length,
-			input_channels=input_channels,
-			output_channels=output_channels,
-			train=False,
-			max_batches=val_max_batches,
-			logger=logger,
-			epoch_number=epoch_number,
-		)
+		if train_stopped_by_time_limit:
+			logger.warning("Skipping validation for epoch %s because training stopped at the runtime budget.", epoch_number)
+			val_results = {
+				"val_loss": math.nan,
+				"val_samples": 0.0,
+				"val_batches": 0.0,
+				"val_skipped_by_time_limit": 1.0,
+			}
+		else:
+			val_results = _run_epoch(
+				model=model,
+				loader=val_loader,
+				criterion=criterion,
+				config=config,
+				device=device,
+				input_sequence_length=input_sequence_length,
+				input_channels=input_channels,
+				output_channels=output_channels,
+				train=False,
+				max_batches=val_max_batches,
+				logger=logger,
+				epoch_number=epoch_number,
+				deadline_time=runtime_deadline_time,
+				amp_dtype=amp_dtype,
+				timing_csv_path=timing_log_path,
+			)
 
 		val_loss = float(val_results["val_loss"])
-		if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-			scheduler.step(val_loss)
+		if math.isfinite(val_loss):
+			if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+				scheduler.step(val_loss)
+			else:
+				scheduler.step()
 		else:
-			scheduler.step()
+			logger.warning("Skipping scheduler step because validation loss is not finite: %s", val_loss)
 
 		next_best_val_loss = min(best_val_loss, val_loss)
 		row = {
@@ -763,7 +1438,10 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 
 		history_rows.append(row)
 		is_best_epoch = val_loss < best_val_loss
-		if is_best_epoch:
+		should_save_latest = save_latest_checkpoint and (
+			epoch_number % save_every_n_epochs == 0 or epoch_number == epochs or train_stopped_by_time_limit
+		)
+		if is_best_epoch and save_best_checkpoint:
 			best_val_loss = val_loss
 			save_checkpoint(
 				best_checkpoint_path,
@@ -779,21 +1457,24 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 			)
 			if not best_checkpoint_path.exists():
 				raise RuntimeError(f"Best checkpoint was not created at: {best_checkpoint_path}")
+		elif is_best_epoch:
+			best_val_loss = val_loss
 
-		save_checkpoint(
-			latest_checkpoint_path,
-			config=config,
-			model=model,
-			optimizer=optimizer,
-			scheduler=scheduler,
-			epoch=epoch_index,
-			best_val_loss=best_val_loss,
-			input_channels=input_channels,
-			resumed_from_checkpoint=resumed_from_checkpoint,
-			history=history_rows,
-		)
-		if not latest_checkpoint_path.exists():
-			raise RuntimeError(f"Latest checkpoint was not created at: {latest_checkpoint_path}")
+		if should_save_latest:
+			save_checkpoint(
+				latest_checkpoint_path,
+				config=config,
+				model=model,
+				optimizer=optimizer,
+				scheduler=scheduler,
+				epoch=epoch_index,
+				best_val_loss=best_val_loss,
+				input_channels=input_channels,
+				resumed_from_checkpoint=resumed_from_checkpoint,
+				history=history_rows,
+			)
+			if not latest_checkpoint_path.exists():
+				raise RuntimeError(f"Latest checkpoint was not created at: {latest_checkpoint_path}")
 
 		_log_to_csv(training_log_path, row, append=append_log)
 		if not training_log_path.exists():
@@ -808,6 +1489,9 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 			val_results["val_loss"],
 			best_val_loss,
 		)
+		if train_stopped_by_time_limit or bool(val_results.get("val_stopped_by_time_limit", 0.0)):
+			logger.warning("Stopping training after epoch %s because the configured runtime budget is nearly exhausted.", epoch_number)
+			break
 
 	test_results: dict[str, float] = {}
 	test_plot_results: dict[str, float] = {}
@@ -845,6 +1529,8 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 				input_channels=input_channels,
 				output_channels=output_channels,
 				train=False,
+				amp_dtype=amp_dtype,
+				timing_csv_path=timing_log_path,
 			)
 			test_plot_results = _rename_result_prefix(val_like_test_results, "val_", "test_")
 			spatial_mode_counts = {}
@@ -872,6 +1558,8 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 		"latest_checkpoint_path": str(latest_checkpoint_path),
 		"best_checkpoint_path": str(best_checkpoint_path),
 		"training_log_path": str(training_log_path),
+		"timing_log_path": str(timing_log_path),
+		"run_artifact_paths": run_artifact_paths,
 		"training_curve_paths": training_curve_paths,
 		"final_epoch_summary": final_epoch_summary,
 		"test_results": test_results,
@@ -913,6 +1601,21 @@ def _log_to_csv(path: Path, row: Mapping[str, Any], append: bool) -> None:
 		if not append:
 			writer.writeheader()
 		writer.writerow(row)
+
+
+def _log_rows_to_csv(path: Path, rows: list[Mapping[str, Any]], append: bool) -> None:
+	"""Append multiple rows to a CSV file."""
+
+	if not rows:
+		return
+	path.parent.mkdir(parents=True, exist_ok=True)
+	fieldnames = list(rows[0].keys())
+	mode = "a" if append else "w"
+	with path.open(mode, newline="", encoding="utf-8") as handle:
+		writer = csv.DictWriter(handle, fieldnames=fieldnames)
+		if not append:
+			writer.writeheader()
+		writer.writerows(rows)
 
 
 def _current_lr(optimizer) -> float:
@@ -1086,10 +1789,10 @@ def _save_training_curves_figure(
 
 
 def train_model(config_path: str | Path) -> dict[str, Any]:
-	"""Train the ConvLSTM U-Net according to the provided YAML config."""
+	"""Train the forecasting model selected by the provided YAML config."""
 
 	if torch is None:
-		raise ImportError("PyTorch is required to train the ConvLSTM U-Net model.")
+		raise ImportError("PyTorch is required to train the wildfire forecasting model.")
 
 	config = _ensure_config_path(load_config(config_path), config_path)
 	return train_model_from_config(config)
@@ -1171,7 +1874,7 @@ def evaluate_model_on_test_set(
 def build_argument_parser() -> argparse.ArgumentParser:
 	"""Create the CLI argument parser."""
 
-	parser = argparse.ArgumentParser(description="Train the ConvLSTM U-Net wildfire model.")
+	parser = argparse.ArgumentParser(description="Train the wildfire forecasting model selected by the config.")
 	parser.add_argument("--config", required=True, help="Path to the YAML configuration file.")
 	return parser
 
