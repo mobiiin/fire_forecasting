@@ -41,6 +41,17 @@ from src.baselines.common import ensure_geometry, ensure_initial_fuel, resolve_p
 BaselinePredictor = Callable[[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any], Mapping[str, int] | None], np.ndarray]
 
 
+def _deep_merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
+	merged = dict(base)
+	for key, value in override.items():
+		current_value = merged.get(key)
+		if isinstance(current_value, Mapping) and isinstance(value, Mapping):
+			merged[key] = _deep_merge(current_value, value)
+		else:
+			merged[key] = value
+	return merged
+
+
 def _get_section(config: Mapping[str, Any] | None, *names: str) -> dict[str, Any]:
 	if not isinstance(config, Mapping):
 		return {}
@@ -310,6 +321,8 @@ def evaluate_baseline(
 	predict_fn: BaselinePredictor,
 	mode: str = "patch",
 	num_samples: int | None = None,
+	max_batches: int | None = None,
+	config_override: Mapping[str, Any] | None = None,
 	output_csv: str | Path | None = None,
 	save_predictions: bool = False,
 	save_visualizations: bool = False,
@@ -318,6 +331,8 @@ def evaluate_baseline(
 		raise ImportError("PyTorch is required to evaluate wildfire baselines.")
 
 	config = _ensure_config_path(load_config(config_path), config_path)
+	if isinstance(config_override, Mapping):
+		config = _deep_merge(config, dict(config_override))
 	config["return_metadata"] = True
 	normalization_stats = _resolve_normalization_stats(config)
 	dataset_records = discover_multiple_datasets(config)
@@ -343,11 +358,16 @@ def evaluate_baseline(
 	prediction_output_root = Path("artifacts/baselines") / method_name / split / "predictions"
 	visualization_output_root = Path("artifacts/baselines") / method_name / split / "visualizations"
 
-	for batch in loader:
+	if max_batches is not None and int(max_batches) <= 0:
+		raise ValueError("max_batches must be positive when provided.")
+
+	for batch_index, batch in enumerate(loader):
+		if max_batches is not None and batch_index >= int(max_batches):
+			break
 		if not isinstance(batch, (tuple, list)) or len(batch) < 3:
 			raise TypeError("Baseline evaluation requires batches with input tensors, target tensors, and metadata.")
 		y_batch = batch[1]
-		metadata_items = metadata_batch_to_list(batch[2])
+		metadata_items = metadata_batch_to_list(batch[2], batch_size=int(y_batch.shape[0]))
 		batch_limit = len(metadata_items)
 		if num_samples is not None:
 			remaining = int(num_samples) - total_samples

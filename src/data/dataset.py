@@ -101,7 +101,60 @@ def _extract_first_metadata_item(value):
 	return value
 
 
-def metadata_batch_to_list(metadata_batch: Mapping[str, Any]) -> list[dict[str, Any]]:
+def _metadata_lengths(value: Any) -> tuple[list[int], list[int]]:
+	"""Collect possible batch lengths from a collated metadata value."""
+
+	tensor_lengths: list[int] = []
+	sequence_lengths: list[int] = []
+	if torch is not None and torch.is_tensor(value):
+		if value.ndim > 0:
+			tensor_lengths.append(int(value.shape[0]))
+		return tensor_lengths, sequence_lengths
+	if isinstance(value, Mapping):
+		for nested_value in value.values():
+			nested_tensor_lengths, nested_sequence_lengths = _metadata_lengths(nested_value)
+			tensor_lengths.extend(nested_tensor_lengths)
+			sequence_lengths.extend(nested_sequence_lengths)
+		return tensor_lengths, sequence_lengths
+	if isinstance(value, (list, tuple)):
+		sequence_lengths.append(len(value))
+	return tensor_lengths, sequence_lengths
+
+
+def _most_likely_metadata_batch_size(lengths: Sequence[int]) -> int | None:
+	"""Choose the most common positive candidate length, preferring the larger value on ties."""
+
+	counts: dict[int, int] = {}
+	for length in lengths:
+		if int(length) > 0:
+			counts[int(length)] = counts.get(int(length), 0) + 1
+	if not counts:
+		return None
+	return max(counts, key=lambda length: (counts[length], length))
+
+
+def _metadata_value_for_sample(value: Any, sample_index: int, batch_size: int) -> Any:
+	"""Extract one sample's metadata value while preserving batch-level fields."""
+
+	if torch is not None and torch.is_tensor(value):
+		if value.ndim == 0:
+			return value.item()
+		if int(value.shape[0]) == int(batch_size):
+			sample_value = value[sample_index]
+			return sample_value.item() if sample_value.ndim == 0 else sample_value
+		return value.detach().cpu().tolist()
+	if isinstance(value, Mapping):
+		return {key: _metadata_value_for_sample(nested_value, sample_index, batch_size) for key, nested_value in value.items()}
+	if isinstance(value, (list, tuple)):
+		if len(value) == int(batch_size):
+			return value[sample_index]
+		if len(value) == 1:
+			return value[0]
+		return list(value)
+	return value
+
+
+def metadata_batch_to_list(metadata_batch: Mapping[str, Any], batch_size: int | None = None) -> list[dict[str, Any]]:
 	"""Convert a collated metadata batch into a list of per-sample dictionaries."""
 
 	if not isinstance(metadata_batch, Mapping):
@@ -109,30 +162,23 @@ def metadata_batch_to_list(metadata_batch: Mapping[str, Any]) -> list[dict[str, 
 	if not metadata_batch:
 		return []
 
-	batch_size = None
-	for value in metadata_batch.values():
-		if torch is not None and torch.is_tensor(value):
-			batch_size = int(value.shape[0]) if value.ndim > 0 else 1
-			break
-		if isinstance(value, (list, tuple)):
-			batch_size = len(value)
-			break
-	if batch_size is None:
+	resolved_batch_size = int(batch_size) if batch_size is not None else None
+	if resolved_batch_size is None:
+		tensor_lengths: list[int] = []
+		sequence_lengths: list[int] = []
+		for value in metadata_batch.values():
+			value_tensor_lengths, value_sequence_lengths = _metadata_lengths(value)
+			tensor_lengths.extend(value_tensor_lengths)
+			sequence_lengths.extend(value_sequence_lengths)
+		resolved_batch_size = _most_likely_metadata_batch_size(tensor_lengths) or _most_likely_metadata_batch_size(sequence_lengths)
+	if resolved_batch_size is None:
 		return [{key: _extract_first_metadata_item(value) for key, value in metadata_batch.items()}]
 
 	items: list[dict[str, Any]] = []
-	for sample_index in range(batch_size):
+	for sample_index in range(resolved_batch_size):
 		item: dict[str, Any] = {}
 		for key, value in metadata_batch.items():
-			if torch is not None and torch.is_tensor(value):
-				if value.ndim == 0:
-					item[key] = value.item()
-				else:
-					item[key] = value[sample_index].item()
-			elif isinstance(value, (list, tuple)):
-				item[key] = value[sample_index]
-			else:
-				item[key] = value
+			item[key] = _metadata_value_for_sample(value, sample_index, resolved_batch_size)
 		items.append(item)
 	return items
 

@@ -137,6 +137,41 @@ python scripts/verify_training_outputs.py \
   --root artifacts/runs
 ```
 
+## Quantitative Testing After Training
+After the training run folders are verified, generate paper-ready test metrics:
+
+```bash
+python scripts/list_training_runs.py \
+  --root artifacts/runs
+
+python scripts/verify_training_outputs.py \
+  --all \
+  --root artifacts/runs
+
+python scripts/evaluate_trained_models.py \
+  --config configs/default.yaml \
+  --mode quantitative \
+  --split test
+```
+
+For one model:
+
+```bash
+python scripts/evaluate_trained_models.py \
+  --config configs/default.yaml \
+  --mode quantitative \
+  --split test \
+  --model_architecture cawfe_latte
+```
+
+Then inspect:
+
+```text
+artifacts/results/quantitative/<eval_run_name>/paper_metrics.csv
+artifacts/results/quantitative/<eval_run_name>/paper_table.tex
+artifacts/results/quantitative/<eval_run_name>/per_fire_metrics.csv
+```
+
 Regenerate curves for a run if needed:
 
 ```bash

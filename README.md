@@ -214,6 +214,38 @@ python scripts/train_forecasting_model.py \
 
 The loss and metric curves are debugging plots for overfitting, instability, and training-speed inspection; they are not paper figures.
 
+## Evaluating Trained Models
+Use the paper-results evaluator after training jobs have produced run directories under `artifacts/runs/<architecture>/<run_name>/`. The script searches those run folders, selects the best checkpoint by validation metric, evaluates the held-out split, and writes paper-ready quantitative metrics.
+
+Evaluate all trained models on the test split:
+
+```bash
+python scripts/evaluate_trained_models.py \
+  --config configs/default.yaml \
+  --mode quantitative \
+  --split test
+```
+
+Evaluate only CAWFE-Latte:
+
+```bash
+python scripts/evaluate_trained_models.py \
+  --config configs/default.yaml \
+  --mode quantitative \
+  --split test \
+  --model_architecture cawfe_latte
+```
+
+Primary outputs are written to:
+
+```text
+artifacts/results/quantitative/<eval_run_name>/paper_metrics.csv
+artifacts/results/quantitative/<eval_run_name>/paper_table.tex
+artifacts/results/quantitative/<eval_run_name>/per_fire_metrics.csv
+```
+
+Qualitative prediction and rollout mode is reserved for a later implementation; for now, use `--mode quantitative`.
+
 ## Atmospheric Engineered Features
 From the raw atmospheric `U`, `V`, and `W` channels, the dataset can append three atmospheric feature groups for every input timestep.
 

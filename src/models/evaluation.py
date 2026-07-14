@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Mapping
+import warnings
 
 try:
 	import torch  # type: ignore[import-not-found]
@@ -17,6 +18,7 @@ from src.models.model_factory import build_model_from_config
 from src.training.checkpoints import load_checkpoint, validate_checkpoint_model_compatibility
 from src.training.losses import get_loss_function
 from src.training.metrics import compute_metrics
+from src.training.hardware import autocast_context, choose_amp_dtype
 from src.training.train import (
 	_coerce_loss_result,
 	_denormalize_target_tensors_for_metrics,
@@ -40,12 +42,47 @@ def _select_loader(train_loader, val_loader, test_loader, split: str):
 	raise ValueError(f"split must be one of train, val, test. Got {split!r}.")
 
 
+def _deep_merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
+	"""Recursively merge mapping overrides without dropping sibling config keys."""
+
+	merged = dict(base)
+	for key, value in override.items():
+		current_value = merged.get(key)
+		if isinstance(current_value, Mapping) and isinstance(value, Mapping):
+			merged[key] = _deep_merge(current_value, value)
+		else:
+			merged[key] = value
+	return merged
+
+
+def _validate_checkpoint_architecture(checkpoint: Mapping[str, Any], expected_architecture: str | None, checkpoint_path: Path) -> None:
+	"""Raise if checkpoint metadata names a different architecture than requested."""
+
+	if expected_architecture in (None, ""):
+		return
+	checkpoint_architecture = checkpoint.get("architecture")
+	if checkpoint_architecture in (None, ""):
+		warnings.warn(
+			f"Checkpoint {checkpoint_path} has no architecture metadata; continuing with requested architecture {expected_architecture!r}.",
+			RuntimeWarning,
+			stacklevel=2,
+		)
+		return
+	if str(checkpoint_architecture).lower() != str(expected_architecture).lower():
+		raise ValueError(
+			"Checkpoint architecture mismatch: "
+			f"checkpoint={checkpoint_architecture!r}, expected={expected_architecture!r}, path={checkpoint_path}"
+		)
+
+
 def evaluate_checkpoint_on_split(
 	config_path: str | Path,
 	split: str = "test",
 	checkpoint_path: str | Path | None = None,
 	checkpoint_kind: str = "best",
 	config_override: Mapping[str, Any] | None = None,
+	max_batches: int | None = None,
+	expected_architecture: str | None = None,
 ) -> dict[str, Any]:
 	"""Evaluate one checkpoint on the requested split using existing metrics/losses."""
 
@@ -54,22 +91,10 @@ def evaluate_checkpoint_on_split(
 
 	config = _ensure_config_path(load_config(config_path), config_path)
 	if isinstance(config_override, Mapping):
-		config = {**config, **dict(config_override)}
-		if isinstance(config.get("model"), Mapping) and isinstance(config_override.get("model"), Mapping):  # type: ignore[union-attr]
-			config["model"] = {**dict(config["model"]), **dict(config_override["model"])}  # type: ignore[index]
-		if isinstance(config.get("earthformer_lite"), Mapping) and isinstance(config_override.get("earthformer_lite"), Mapping):  # type: ignore[union-attr]
-			config["earthformer_lite"] = {**dict(config["earthformer_lite"]), **dict(config_override["earthformer_lite"])}  # type: ignore[index]
-		if isinstance(config.get("st_mamba_lite"), Mapping) and isinstance(config_override.get("st_mamba_lite"), Mapping):  # type: ignore[union-attr]
-			config["st_mamba_lite"] = {**dict(config["st_mamba_lite"]), **dict(config_override["st_mamba_lite"])}  # type: ignore[index]
-		if isinstance(config.get("weatherformer_lite"), Mapping) and isinstance(config_override.get("weatherformer_lite"), Mapping):  # type: ignore[union-attr]
-			config["weatherformer_lite"] = {**dict(config["weatherformer_lite"]), **dict(config_override["weatherformer_lite"])}  # type: ignore[index]
-		if isinstance(config.get("cawfe_latte_lite"), Mapping) and isinstance(config_override.get("cawfe_latte_lite"), Mapping):  # type: ignore[union-attr]
-			config["cawfe_latte_lite"] = {**dict(config["cawfe_latte_lite"]), **dict(config_override["cawfe_latte_lite"])}  # type: ignore[index]
-		if isinstance(config.get("cawfe_latte"), Mapping) and isinstance(config_override.get("cawfe_latte"), Mapping):  # type: ignore[union-attr]
-			config["cawfe_latte"] = {**dict(config["cawfe_latte"]), **dict(config_override["cawfe_latte"])}  # type: ignore[index]
-		if isinstance(config.get("checkpoint"), Mapping) and isinstance(config_override.get("checkpoint"), Mapping):  # type: ignore[union-attr]
-			config["checkpoint"] = {**dict(config["checkpoint"]), **dict(config_override["checkpoint"])}  # type: ignore[index]
+		config = _deep_merge(config, dict(config_override))
 	config["return_metadata"] = True
+	if max_batches is not None and int(max_batches) <= 0:
+		raise ValueError("max_batches must be positive when provided.")
 
 	train_loader, val_loader, test_loader = create_dataloaders(config)
 	selected_loader = _select_loader(train_loader, val_loader, test_loader, split)
@@ -90,9 +115,11 @@ def evaluate_checkpoint_on_split(
 		raise FileNotFoundError(f"Checkpoint not found: {resolved_checkpoint_path}")
 
 	checkpoint = load_checkpoint(resolved_checkpoint_path, map_location=device)
+	_validate_checkpoint_architecture(checkpoint, expected_architecture, resolved_checkpoint_path)
 	validate_checkpoint_model_compatibility(model, checkpoint, resolved_checkpoint_path)
 	model.load_state_dict(checkpoint["model_state_dict"])
 	model.eval()
+	amp_dtype = choose_amp_dtype(config, device)
 
 	aggregate_loss_total = 0.0
 	aggregate_metric_totals: dict[str, float] = defaultdict(float)
@@ -100,14 +127,17 @@ def evaluate_checkpoint_on_split(
 	aggregate_samples = 0
 	per_dataset: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
 
-	with torch.no_grad():
-		for batch in selected_loader:
+	with torch.inference_mode():
+		for batch_index, batch in enumerate(selected_loader):
+			if max_batches is not None and batch_index >= int(max_batches):
+				break
 			if not isinstance(batch, (tuple, list)) or len(batch) < 2:
 				raise TypeError("Expected DataLoader batches with at least input and target tensors.")
-			x_batch = batch[0].to(device)
-			y_batch = batch[1].to(device)
-			metadata_items = metadata_batch_to_list(batch[2]) if len(batch) >= 3 else [{} for _ in range(int(x_batch.shape[0]))]
-			y_pred = model(x_batch)
+			x_batch = batch[0].to(device, non_blocking=True)
+			y_batch = batch[1].to(device, non_blocking=True)
+			metadata_items = metadata_batch_to_list(batch[2], batch_size=int(x_batch.shape[0])) if len(batch) >= 3 else [{} for _ in range(int(x_batch.shape[0]))]
+			with autocast_context(device, amp_dtype):
+				y_pred = model(x_batch)
 			if tuple(y_pred.shape) != tuple(y_batch.shape):
 				raise ValueError(
 					f"Prediction shape {tuple(y_pred.shape)} does not match target shape {tuple(y_batch.shape)}."
@@ -116,7 +146,8 @@ def evaluate_checkpoint_on_split(
 				dataset_name = str(metadata.get("dataset_name", f"dataset_{metadata.get('dataset_id', 'unknown')}"))
 				sample_pred = y_pred[sample_index : sample_index + 1]
 				sample_true = y_batch[sample_index : sample_index + 1]
-				loss_result = criterion(sample_pred, sample_true)
+				with autocast_context(device, amp_dtype):
+					loss_result = criterion(sample_pred, sample_true)
 				loss, loss_components = _coerce_loss_result(loss_result)
 				metric_prediction, metric_target = _denormalize_target_tensors_for_metrics(
 					selected_loader,
