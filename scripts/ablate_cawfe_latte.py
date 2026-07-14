@@ -62,8 +62,12 @@ def _ablation_config(base_config: dict, filename: str, overrides: dict) -> dict:
 	config["logging"] = logging_config
 
 	training_config = dict(config.get("training", {}))
+	training_config["run_name"] = f"cawfe_latte_ablation_{name}"
 	training_config["run_test_after_training"] = False
 	training_config["run_external_test_after_training"] = False
+	output_config = dict(training_config.get("output", {}))
+	output_config["update_architecture_latest_checkpoint"] = False
+	training_config["output"] = output_config
 	config["training"] = training_config
 	return config
 

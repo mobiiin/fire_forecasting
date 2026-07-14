@@ -9,7 +9,7 @@ import math
 import random
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 import yaml
 
@@ -122,6 +122,34 @@ def _normalize_param_key(dotted_key: str) -> str:
 	return LOSS_PARAM_ALIASES.get(str(dotted_key), str(dotted_key))
 
 
+def _num_heads_match_backbone_dim(backbone_dim: int, num_heads: Any) -> bool:
+	if not isinstance(num_heads, Sequence) or isinstance(num_heads, (str, bytes)) or len(num_heads) != 2:
+		return False
+	try:
+		heads = [int(value) for value in num_heads]
+	except (TypeError, ValueError):
+		return False
+	stage_dims = [int(backbone_dim), 2 * int(backbone_dim)]
+	return all(head > 0 and dim % head == 0 for dim, head in zip(stage_dims, heads))
+
+
+def _select_divisor(value: int, preferred: Sequence[int]) -> int:
+	value = int(value)
+	for candidate in preferred:
+		head_count = int(candidate)
+		if head_count > 0 and value % head_count == 0:
+			return head_count
+	return 1
+
+
+def _compatible_num_heads_for_backbone_dim(backbone_dim: int) -> list[int]:
+	backbone_dim = int(backbone_dim)
+	return [
+		_select_divisor(backbone_dim, preferred=(4, 8, 6, 2, 1)),
+		_select_divisor(2 * backbone_dim, preferred=(6, 8, 4, 2, 1)),
+	]
+
+
 def _apply_backbone_dim_consistency(config: dict[str, Any], backbone_dim: int) -> None:
 	section = config.setdefault("cawfe_latte", {})
 	backbone_dim = int(backbone_dim)
@@ -129,6 +157,8 @@ def _apply_backbone_dim_consistency(config: dict[str, Any], backbone_dim: int) -
 	section["fused_dim"] = backbone_dim
 	section["bottleneck_dim"] = 2 * backbone_dim
 	section["decoder_channels"] = [2 * backbone_dim, backbone_dim, 64]
+	if not _num_heads_match_backbone_dim(backbone_dim, section.get("num_heads")):
+		section["num_heads"] = _compatible_num_heads_for_backbone_dim(backbone_dim)
 	if backbone_dim == 64:
 		section["atm_embed_dim"] = 32
 		section["fire_embed_dim"] = 32

@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=ff_latte_lite
+#SBATCH --job-name=latte_lite
 #SBATCH --account=cuuser_fafghah_trajectory_planning_in_unmanned_aerial_veh
 #SBATCH --partition=work1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=160gb
-#SBATCH --gpus=a100:1
-#SBATCH --constraint=gpu_a100_80gb
+#SBATCH --gpus=h100:1
 #SBATCH --time=72:00:00
 #SBATCH --chdir=/home/mhabibp/fire_forecasting
 #SBATCH --output=artifacts/logs/slurm_train_cawfe_latte_lite_%j.out

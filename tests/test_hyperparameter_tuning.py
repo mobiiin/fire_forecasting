@@ -98,6 +98,17 @@ def test_apply_tuned_params_modifies_nested_and_alias_keys(tmp_path: Path) -> No
 	assert config["cawfe_latte"]["decoder_channels"] == [128, 64, 64]
 	assert config["cawfe_latte"]["atm_embed_dim"] == 32
 	assert config["cawfe_latte"]["fire_embed_dim"] == 32
+	assert config["cawfe_latte"]["num_heads"] == [4, 8]
+
+
+def test_backbone_dim_search_values_resolve_valid_attention_heads(tmp_path: Path) -> None:
+	for backbone_dim, expected_heads in [(64, [4, 8]), (96, [4, 6]), (128, [4, 8])]:
+		config = apply_params(_base_config(tmp_path), {"cawfe_latte.backbone_dim": backbone_dim})
+		num_heads = config["cawfe_latte"]["num_heads"]
+		stage_dims = [backbone_dim, 2 * backbone_dim]
+
+		assert num_heads == expected_heads
+		assert all(dim % heads == 0 for dim, heads in zip(stage_dims, num_heads))
 
 
 def test_best_params_schema_builds_full_cawfe_latte_config(tmp_path: Path) -> None:
@@ -122,6 +133,7 @@ def test_best_params_schema_builds_full_cawfe_latte_config(tmp_path: Path) -> No
 	assert "early_stopping_patience" not in config["training"]
 	assert config["training"]["learning_rate"] == 5e-4
 	assert config["multitask"]["energy_loss_weight"] == 2.0
+	assert config["cawfe_latte"]["num_heads"] == [4, 8]
 	assert config["cache"]["allow_config_hash_mismatch"] is True
 	assert Path(config["checkpoint"]["best_path"]).is_absolute()
 	assert Path(config["fire_dataset_index_json"]).is_absolute()
@@ -145,6 +157,8 @@ def test_ablation_config_preserves_tuned_parameters(tmp_path: Path) -> None:
 	assert config["cawfe_latte"]["neural_operator_depth"] == 2
 	assert config["cawfe_latte"]["use_neural_operator_bottleneck"] is False
 	assert config["cawfe_latte"]["neural_operator_type"] == "none"
+	assert config["training"]["run_name"] == "cawfe_latte_ablation_cawfe_latte_no_operator"
+	assert config["training"]["output"]["update_architecture_latest_checkpoint"] is False
 	assert "cawfe_latte_no_operator" in config["checkpoint"]["best_path"]
 
 
