@@ -1079,6 +1079,41 @@ training:
   # Options: any positive integer >= 1.
   epochs: 20
 
+  # Optional explicit run name. When null, training creates:
+  # <architecture>_<YYYYMMDD_HHMMSS>_slurm<JOBID> or _local<pid>.
+  run_name: null
+
+  # Allow writing directly into an existing explicit run directory.
+  # When false, existing names get a _v2/_v3 suffix.
+  overwrite_run: false
+
+  output:
+    root_dir: artifacts/runs
+    checkpoint_root: artifacts/checkpoints
+    log_root: artifacts/logs
+    save_compatibility_checkpoints: true
+    update_architecture_latest_checkpoint: true
+    save_epoch_checkpoints: false
+    save_best_checkpoint: true
+    save_latest_checkpoint: true
+    save_training_curves: true
+    save_metric_curves: true
+    save_timing_plots: true
+    save_resolved_config: true
+    save_original_config: true
+    save_run_summary: true
+    save_hardware_summary: true
+    save_cache_manifest_copy: true
+    save_normalization_stats_copy: true
+
+  checkpointing:
+    monitor: val_loss
+    mode: min
+    save_best: true
+    save_latest: true
+    save_every_n_epochs: null
+    keep_last_n_epoch_checkpoints: 3
+
   # Automatically tune batch/accumulation from detected CUDA VRAM and architecture.
   # ConvLSTM-U-Net is much lighter than CAWFE-LATTE and can use larger batches.
   auto_hardware_tuning:

@@ -225,6 +225,7 @@ def make_trial_config(
 	config["epochs"] = int(trial_max_epochs)
 	training["run_test_after_training"] = False
 	training["run_external_test_after_training"] = False
+	training["run_name"] = f"cawfe_latte_hparam_trial_{trial_id:03d}"
 	if "trial_early_stopping_patience" in tuning_config:
 		training["early_stopping_patience"] = int(tuning_config["trial_early_stopping_patience"])
 
@@ -245,6 +246,10 @@ def make_trial_config(
 	checkpointing = config.setdefault("checkpointing", {})
 	checkpointing["save_best"] = True
 	checkpointing["save_latest"] = False
+
+	cache = config.setdefault("cache", {})
+	if bool(cache.get("use_precomputed_patches", config.get("use_precomputed_patches", False))):
+		cache["allow_config_hash_mismatch"] = True
 
 	logging = config.setdefault("logging", {})
 	logging["run_name"] = f"cawfe_latte_hparam_trial_{trial_id:03d}"
@@ -386,6 +391,10 @@ def make_final_config_from_best_params(
 	if isinstance(base_training, Mapping) and "max_val_batches_per_epoch" in base_training:
 		training["max_val_batches_per_epoch"] = base_config["training"]["max_val_batches_per_epoch"]
 	training.pop("early_stopping_patience", None)
+
+	cache = config.setdefault("cache", {})
+	if bool(cache.get("use_precomputed_patches", config.get("use_precomputed_patches", False))):
+		cache["allow_config_hash_mismatch"] = True
 
 	make_portable_tuned_config_paths(config, base_config)
 

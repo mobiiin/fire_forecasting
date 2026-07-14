@@ -14,6 +14,9 @@
 
 set -euo pipefail
 
+REPO_ROOT="/home/mhabibp/fire_forecasting"
+cd "${REPO_ROOT}"
+
 mkdir -p artifacts/logs artifacts/checkpoints /tmp/mhabibp_mplconfig
 
 export MPLCONFIGDIR=/tmp/mhabibp_mplconfig
@@ -26,6 +29,20 @@ export NUMEXPR_NUM_THREADS=1
 
 source "$HOME/anaconda3/etc/profile.d/conda.sh"
 conda activate fire_forecasting
+PYTHON_BIN="$(command -v python || true)"
+if [[ -z "${PYTHON_BIN}" ]]; then
+  echo "Could not find python after activating conda environment fire_forecasting." >&2
+  exit 1
+fi
+echo "Python executable: ${PYTHON_BIN}"
+"${PYTHON_BIN}" --version
+if [[ ":${PYTHONPATH:-}:" != *":${REPO_ROOT}:"* ]]; then
+  export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+else
+  export PYTHONPATH="${PYTHONPATH:-}"
+fi
+echo "Working directory: $(pwd)"
+echo "PYTHONPATH: ${PYTHONPATH}"
 
 echo "Job ID: ${SLURM_JOB_ID:-unknown}"
 echo "Node: ${SLURM_NODELIST:-unknown}"
@@ -35,5 +52,9 @@ echo "CUDA visible devices: ${CUDA_VISIBLE_DEVICES:-unset}"
 
 nvidia-smi
 
-srun --ntasks=1 python scripts/train_cawfe_latte.py \
-  --config configs/default.yaml
+RUN_NAME="cawfe_latte_${SLURM_JOB_ID:-local}"
+echo "Run name: ${RUN_NAME}"
+
+srun --ntasks=1 --chdir="${REPO_ROOT}" --export=ALL /usr/bin/env PYTHONPATH="${PYTHONPATH}" "${PYTHON_BIN}" -m scripts.train_cawfe_latte \
+  --config configs/default.yaml \
+  --run_name "${RUN_NAME}"

@@ -15,6 +15,9 @@
 
 set -euo pipefail
 
+REPO_ROOT="/home/mhabibp/fire_forecasting"
+cd "${REPO_ROOT}"
+
 mkdir -p artifacts/logs artifacts/checkpoints /tmp/mhabibp_mplconfig
 
 export MPLCONFIGDIR=/tmp/mhabibp_mplconfig
@@ -27,6 +30,20 @@ export NUMEXPR_NUM_THREADS=1
 
 source "$HOME/anaconda3/etc/profile.d/conda.sh"
 conda activate fire_forecasting
+PYTHON_BIN="$(command -v python || true)"
+if [[ -z "${PYTHON_BIN}" ]]; then
+  echo "Could not find python after activating conda environment fire_forecasting." >&2
+  exit 1
+fi
+echo "Python executable: ${PYTHON_BIN}"
+"${PYTHON_BIN}" --version
+if [[ ":${PYTHONPATH:-}:" != *":${REPO_ROOT}:"* ]]; then
+  export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+else
+  export PYTHONPATH="${PYTHONPATH:-}"
+fi
+echo "Working directory: $(pwd)"
+echo "PYTHONPATH: ${PYTHONPATH}"
 
 echo "========== Slurm =========="
 echo "Job ID: ${SLURM_JOB_ID:-unknown}"
@@ -44,12 +61,16 @@ if [[ ! -f artifacts/hparam/cawfe_latte/best_config.yaml ]]; then
   exit 1
 fi
 
+RUN_NAME="cawfe_latte_tuned_${SLURM_JOB_ID:-local}"
+echo "Run name: ${RUN_NAME}"
+
 echo "========== Training tuned CAWFE-Latte =========="
-srun --ntasks=1 python scripts/train_cawfe_latte.py \
-  --config artifacts/hparam/cawfe_latte/best_config.yaml
+srun --ntasks=1 --chdir="${REPO_ROOT}" --export=ALL /usr/bin/env PYTHONPATH="${PYTHONPATH}" "${PYTHON_BIN}" -m scripts.train_cawfe_latte \
+  --config artifacts/hparam/cawfe_latte/best_config.yaml \
+  --run_name "${RUN_NAME}"
 
 echo "========== Testing tuned CAWFE-Latte =========="
-srun --ntasks=1 python scripts/test_cawfe_latte.py \
+srun --ntasks=1 --chdir="${REPO_ROOT}" --export=ALL /usr/bin/env PYTHONPATH="${PYTHONPATH}" "${PYTHON_BIN}" -m scripts.test_cawfe_latte \
   --config artifacts/hparam/cawfe_latte/best_config.yaml \
   --checkpoint artifacts/checkpoints/cawfe_latte/best_model.pt \
   --split test

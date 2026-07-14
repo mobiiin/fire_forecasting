@@ -178,6 +178,42 @@ python scripts/train_forecasting_model.py \
 
 On Palmetto, request enough CPUs for the DataLoader, keep the patch cache on `/scratch/mhabibp/`, and prefer BF16 on A100/H100 GPUs. If GPU utilization is low and timing logs show high `data_wait`, tune workers or cache locality first. If VRAM is underused and `data_wait` is low, increase batch size or enable `training.performance.auto_batch_size`.
 
+## Training Run Outputs
+Every training entry point now creates a unique run directory:
+
+```text
+artifacts/runs/<architecture>/<run_name>/
+```
+
+The run directory is the source of truth for checkpoints, logs, configs, metadata, and training curves. For example, the best ConvLSTM checkpoint for a run is:
+
+```text
+artifacts/runs/convlstm_unet/<run_name>/checkpoints/best_model.pt
+```
+
+Each run stores `checkpoints/best_model.pt`, `checkpoints/latest_model.pt`, `logs/training_log.csv`, `logs/validation_log.csv`, `logs/timing_log.csv`, `figures/loss_curves.png`, `figures/metric_curves.png`, `configs/resolved_config.yaml`, and `metadata/run_summary.json`. Compatibility checkpoint copies are still written under `artifacts/checkpoints/<architecture>/`, but those files are only conveniences for older evaluation commands and can be replaced by the next run of the same architecture.
+
+Useful commands:
+
+```bash
+python scripts/list_training_runs.py --root artifacts/runs
+
+python scripts/verify_training_outputs.py --all --root artifacts/runs
+
+python scripts/plot_training_curves.py \
+  --run_dir artifacts/runs/cawfe_latte/<run_name>
+```
+
+You can also name a run explicitly:
+
+```bash
+python scripts/train_forecasting_model.py \
+  --config configs/default.yaml \
+  --run_name cawfe_latte_main_seed42
+```
+
+The loss and metric curves are debugging plots for overfitting, instability, and training-speed inspection; they are not paper figures.
+
 ## Atmospheric Engineered Features
 From the raw atmospheric `U`, `V`, and `W` channels, the dataset can append three atmospheric feature groups for every input timestep.
 
@@ -621,13 +657,13 @@ The tuner runs short validation-only CAWFE-Latte trials through the shared train
 
 ```bash
 # Tune on one A100 80GB GPU.
-sbatch scripts/slurm_tune_cawfe_latte_a10080.sh
+sbatch slurm/slurm_tune_cawfe_latte_a10080.sh
 
 # Final full training from the tuned config.
-sbatch scripts/slurm_train_cawfe_latte_tuned_a10080.sh
+sbatch slurm/slurm_train_cawfe_latte_tuned_a10080.sh
 
 # Tuned ablations.
-sbatch scripts/slurm_ablate_cawfe_latte_a10080.sh
+sbatch slurm/slurm_ablate_cawfe_latte_a10080.sh
 
 # Or submit tune -> train -> ablate with Slurm dependencies.
 bash scripts/submit_cawfe_latte_pipeline.sh

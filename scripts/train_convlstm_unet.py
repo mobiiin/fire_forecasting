@@ -6,7 +6,7 @@ import argparse
 from pathlib import Path
 
 from src.config import load_config
-from src.training.train import _ensure_config_path, train_model_from_config
+from src.training.train import _ensure_config_path, apply_training_cli_overrides, train_model_from_config
 
 
 def _convlstm_unet_config(config_path: str | Path) -> dict:
@@ -21,12 +21,21 @@ def _convlstm_unet_config(config_path: str | Path) -> dict:
 def build_argument_parser() -> argparse.ArgumentParser:
 	parser = argparse.ArgumentParser(description="Train the ConvLSTM U-Net wildfire model.")
 	parser.add_argument("--config", default="configs/default.yaml", help="Path to the YAML configuration file.")
+	parser.add_argument("--run_name", default=None, help="Optional explicit run name.")
+	parser.add_argument("--output_root", default=None, help="Override training.output.root_dir.")
+	parser.add_argument("--overwrite_run", action="store_true", help="Allow writing into an existing explicit run directory.")
 	return parser
 
 
 def main() -> None:
 	args = build_argument_parser().parse_args()
-	train_model_from_config(_convlstm_unet_config(args.config))
+	config = apply_training_cli_overrides(
+		_convlstm_unet_config(args.config),
+		run_name=args.run_name,
+		output_root=args.output_root,
+		overwrite_run=args.overwrite_run,
+	)
+	train_model_from_config(config)
 
 
 if __name__ == "__main__":

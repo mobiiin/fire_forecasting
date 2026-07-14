@@ -3,18 +3,30 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import csv
 import json
 import math
 import os
 import re
-import shutil
+import socket
 import subprocess
+import sys
 import time
 from collections import defaultdict
 from contextlib import nullcontext
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Mapping
+
+if "MPLCONFIGDIR" not in os.environ:
+	_mpl_config_dir = Path(os.environ.get("TMPDIR", "/tmp")) / "fire_forecasting_mplconfig"
+	_mpl_config_dir.mkdir(parents=True, exist_ok=True)
+	os.environ["MPLCONFIGDIR"] = str(_mpl_config_dir)
+if "XDG_CACHE_HOME" not in os.environ:
+	_xdg_cache_dir = Path(os.environ.get("TMPDIR", "/tmp")) / "fire_forecasting_xdg_cache"
+	_xdg_cache_dir.mkdir(parents=True, exist_ok=True)
+	os.environ["XDG_CACHE_HOME"] = str(_xdg_cache_dir)
 
 try:
 	import matplotlib
@@ -44,12 +56,7 @@ from src.data.dataset import create_dataloaders
 from src.data.spatial_transforms import infer_with_external_test_spatial_handling
 from src.models.architecture_registry import resolve_model_architecture
 from src.models.model_factory import build_model_from_config
-from src.training.checkpoints import (
-	latest_and_best_checkpoint_paths,
-	load_checkpoint,
-	save_checkpoint,
-	validate_checkpoint_model_compatibility,
-)
+from src.training.checkpoints import latest_and_best_checkpoint_paths, load_checkpoint, save_checkpoint, validate_checkpoint_model_compatibility
 from src.training.cuda_prefetcher import CUDAPrefetcher
 from src.training.hardware import (
 	autocast_context,
@@ -63,6 +70,8 @@ from src.training.hardware import (
 )
 from src.training.losses import get_loss_function
 from src.training.metrics import compute_metrics
+from src.training.run_manager import RunManager, get_training_checkpointing_config, get_training_output_config
+from src.training.run_plots import save_training_run_figures
 from src.utils.logging import setup_logging
 from src.utils.seed import set_seed
 
@@ -101,6 +110,28 @@ def _ensure_config_path(config: dict[str, Any], config_path: str | Path) -> dict
 	config["config_path"] = str(resolved_path)
 	config["_config_path"] = str(resolved_path)
 	return config
+
+
+def apply_training_cli_overrides(
+	config: Mapping[str, Any],
+	run_name: str | None = None,
+	output_root: str | Path | None = None,
+	overwrite_run: bool = False,
+) -> dict[str, Any]:
+	"""Apply common training-output CLI overrides to a config mapping."""
+
+	updated = dict(config)
+	training_config = dict(updated.get("training", {})) if isinstance(updated.get("training"), Mapping) else {}
+	if run_name not in (None, "", "null"):
+		training_config["run_name"] = str(run_name)
+	if output_root not in (None, "", "null"):
+		output_config = dict(training_config.get("output", {})) if isinstance(training_config.get("output"), Mapping) else {}
+		output_config["root_dir"] = str(output_root)
+		training_config["output"] = output_config
+	if overwrite_run:
+		training_config["overwrite_run"] = True
+	updated["training"] = training_config
+	return updated
 
 
 def _get_device(config: Mapping[str, Any]) -> torch.device:
@@ -310,6 +341,39 @@ def _estimated_sample_bytes(config: Mapping[str, Any]) -> int:
 	return max(1, input_bytes + target_bytes)
 
 
+def _host_memory_loader_settings(config: Mapping[str, Any], split: str = "train") -> tuple[int, int, bool]:
+	"""Resolve DataLoader settings that affect resident host-memory batches."""
+
+	training_config = _get_section(config, "training")
+	performance_config = get_performance_config(config)
+	data_loader_config = _get_section(config, "data_loader")
+	split_config = data_loader_config.get(split, {})
+	if not isinstance(split_config, Mapping):
+		split_config = {}
+	raw_workers = split_config.get(
+		"num_workers",
+		data_loader_config.get("num_workers", training_config.get("num_workers", config.get("num_workers", 0))),
+	)
+	num_workers = cap_num_workers_by_slurm(config, raw_workers)
+	pin_memory_default = bool(torch.cuda.is_available()) if torch is not None else False
+	pin_memory = bool(
+		split_config.get(
+			"pin_memory",
+			data_loader_config.get("pin_memory", training_config.get("pin_memory", pin_memory_default)),
+		)
+	)
+	if not bool(performance_config.get("non_blocking_transfer", True)):
+		pin_memory = False
+	prefetch_factor = 1
+	if num_workers > 0:
+		raw_prefetch_factor = split_config.get(
+			"prefetch_factor",
+			data_loader_config.get("prefetch_factor", training_config.get("prefetch_factor", 2)),
+		)
+		prefetch_factor = 2 if raw_prefetch_factor in (None, "", "null") else max(1, int(raw_prefetch_factor))
+	return max(0, int(num_workers)), int(prefetch_factor), bool(pin_memory)
+
+
 def _cap_batch_size_for_host_memory(
 	config: Mapping[str, Any],
 	batch_size: int,
@@ -319,15 +383,12 @@ def _cap_batch_size_for_host_memory(
 	memory_limit = _slurm_memory_limit_bytes()
 	if memory_limit is None:
 		return batch_size
-	training_config = _get_section(config, "training")
-	num_workers = max(0, int(training_config.get("num_workers", config.get("num_workers", 0))))
-	prefetch_factor = max(1, int(training_config.get("prefetch_factor", 2))) if num_workers > 0 else 1
-	pin_memory = bool(training_config.get("pin_memory", torch.cuda.is_available() if torch is not None else False))
+	num_workers, prefetch_factor, pin_memory = _host_memory_loader_settings(config, split="train")
 	resident_batches = max(1, num_workers * prefetch_factor + 1 + int(pin_memory))
 	max_fraction = float(auto_config.get("max_host_memory_fraction", 0.65))
 	sample_multiplier = max(
 		1.0,
-		float(auto_config.get("host_memory_sample_multiplier", training_config.get("host_memory_sample_multiplier", 3.0))),
+		float(auto_config.get("host_memory_sample_multiplier", _get_section(config, "training").get("host_memory_sample_multiplier", 3.0))),
 	)
 	sample_bytes = _estimated_sample_bytes(config)
 	host_cap = int((memory_limit * max_fraction) / float(sample_bytes * resident_batches * sample_multiplier))
@@ -335,9 +396,13 @@ def _cap_batch_size_for_host_memory(
 	if batch_size > host_cap and logger is not None:
 		logger.info(
 			"Auto hardware tuning capped batch_size from %s to %s based on SLURM memory, "
-			"resident DataLoader batches=%s, and host_memory_sample_multiplier=%.2f.",
+			"train_workers=%s, prefetch_factor=%s, pin_memory=%s, resident DataLoader batches=%s, "
+			"and host_memory_sample_multiplier=%.2f.",
 			batch_size,
 			host_cap,
+			num_workers,
+			prefetch_factor,
+			pin_memory,
 			resident_batches,
 			sample_multiplier,
 		)
@@ -941,44 +1006,114 @@ def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
 		json.dump(payload, handle, indent=2, sort_keys=True, default=str)
 
 
+def _slurm_environment_summary() -> dict[str, Any]:
+	"""Capture a compact set of Slurm environment variables for run metadata."""
+
+	keys = [
+		"SLURM_JOB_ID",
+		"SLURM_JOB_NAME",
+		"SLURM_NODELIST",
+		"SLURM_CPUS_PER_TASK",
+		"SLURM_MEM_PER_NODE",
+		"SLURM_MEM_PER_CPU",
+		"SLURM_GPUS",
+		"SLURM_JOB_GPUS",
+		"SLURM_SUBMIT_DIR",
+	]
+	return {key: os.environ.get(key) for key in keys if os.environ.get(key) is not None}
+
+
+def _build_hardware_summary(config: Mapping[str, Any], backend_summary: Mapping[str, Any], amp_dtype: Any) -> dict[str, Any]:
+	"""Build the hardware and runtime metadata saved with each run."""
+
+	cuda_info = get_cuda_device_info()
+	summary: dict[str, Any] = {
+		"hostname": socket.gethostname(),
+		"cuda": cuda_info,
+		"cuda_available": bool(cuda_info.get("available", False)),
+		"cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+		"torch_version": getattr(torch, "__version__", None) if torch is not None else None,
+		"torch_cuda_version": getattr(getattr(torch, "version", None), "cuda", None) if torch is not None else None,
+		"cudnn_version": torch.backends.cudnn.version() if torch is not None and hasattr(torch.backends, "cudnn") else None,
+		"selected_precision": str(amp_dtype),
+		"tf32_matmul_allowed": bool(getattr(torch.backends.cuda.matmul, "allow_tf32", False))
+		if torch is not None and hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul")
+		else None,
+		"tf32_cudnn_allowed": bool(getattr(torch.backends.cudnn, "allow_tf32", False)) if torch is not None and hasattr(torch.backends, "cudnn") else None,
+		"backend": dict(backend_summary),
+		"slurm": _slurm_environment_summary(),
+		"conda_default_env": os.environ.get("CONDA_DEFAULT_ENV"),
+		"python": sys.version,
+		"available_vram_gb": estimate_available_vram_gb(),
+	}
+	summary["gpu_name"] = cuda_info.get("name")
+	summary["gpu_total_vram_gb"] = cuda_info.get("total_memory_gb")
+	device_entries = cuda_info.get("devices")
+	if isinstance(device_entries, list) and device_entries:
+		first_device = device_entries[0]
+		if isinstance(first_device, Mapping):
+			summary["gpu_name"] = first_device.get("name")
+			total_memory_gb = first_device.get("total_memory_gb", first_device.get("memory_total_gb"))
+			if total_memory_gb is not None:
+				summary["gpu_total_vram_gb"] = total_memory_gb
+	return summary
+
+
+def _input_shape_metadata(config: Mapping[str, Any], input_channels: int) -> list[Any]:
+	training_config = _get_section(config, "training")
+	patching_config = _get_section(config, "patching")
+	sequence_length = int(config.get("input_sequence_length", training_config.get("input_sequence_length", 1)))
+	patch_height = int(patching_config.get("patch_height", patching_config.get("patch_size", config.get("patch_size", 64))))
+	patch_width = int(patching_config.get("patch_width", patching_config.get("patch_size", config.get("patch_size", 64))))
+	return ["batch", sequence_length, int(input_channels), patch_height, patch_width]
+
+
+def _output_shape_metadata(config: Mapping[str, Any], output_channels: int) -> list[Any]:
+	patching_config = _get_section(config, "patching")
+	patch_height = int(patching_config.get("patch_height", patching_config.get("patch_size", config.get("patch_size", 64))))
+	patch_width = int(patching_config.get("patch_width", patching_config.get("patch_size", config.get("patch_size", 64))))
+	return ["batch", int(output_channels), patch_height, patch_width]
+
+
 def _save_resolved_run_artifacts(
 	config: Mapping[str, Any],
+	original_config: Mapping[str, Any],
 	model: nn.Module,
 	logger,
 	normalization_stats_path: Path | None,
+	run_manager: RunManager,
+	backend_summary: Mapping[str, Any],
+	amp_dtype: Any,
+	input_channels: int,
+	output_channels: int,
+	loader_summaries: Mapping[str, Any],
 ) -> dict[str, str]:
 	"""Save reproducibility artifacts for the resolved training run."""
 
-	run_name = _run_name(config)
-	config_dir = Path("./artifacts/configs").expanduser().resolve()
-	config_dir.mkdir(parents=True, exist_ok=True)
-	resolved_config_path = config_dir / f"{run_name}_resolved.yaml"
-	hardware_summary_path = config_dir / f"{run_name}_hardware.json"
-	cache_manifest_copy_path = config_dir / f"{run_name}_cache_manifest.json"
 	payload = dict(config)
 	payload.setdefault("resolved_run", {})
 	payload["resolved_run"] = {
-		"run_name": run_name,
+		"architecture": run_manager.architecture,
+		"run_name": run_manager.run_name,
+		"run_dir": str(run_manager.run_dir),
 		"git_commit": _current_git_commit(),
 		"normalization_stats_path": str(normalization_stats_path) if normalization_stats_path is not None else None,
 		"model_parameter_count": _model_parameter_count(model),
 		"cuda": get_cuda_device_info(),
+		"input_shape": _input_shape_metadata(config, input_channels),
+		"output_shape": _output_shape_metadata(config, output_channels),
+		"loader_summaries": dict(loader_summaries),
 	}
-	if yaml is not None:
-		with resolved_config_path.open("w", encoding="utf-8") as handle:
-			yaml.safe_dump(payload, handle, sort_keys=False)
-	else:
-		_write_json(resolved_config_path.with_suffix(".json"), payload)
-		resolved_config_path = resolved_config_path.with_suffix(".json")
-
-	hardware_summary = {
-		"cuda": get_cuda_device_info(),
-		"available_vram_gb": estimate_available_vram_gb(),
-		"backend": configure_torch_backend(config),
-		"git_commit": payload["resolved_run"]["git_commit"],
-		"model_parameter_count": payload["resolved_run"]["model_parameter_count"],
-	}
-	_write_json(hardware_summary_path, hardware_summary)
+	paths = run_manager.save_configs(original_config=original_config, resolved_config=payload)
+	if bool(run_manager.output_config.get("save_hardware_summary", True)):
+		hardware_summary = _build_hardware_summary(config, backend_summary, amp_dtype)
+		hardware_summary["git_commit"] = payload["resolved_run"]["git_commit"]
+		hardware_summary["model_parameter_count"] = payload["resolved_run"]["model_parameter_count"]
+		hardware_summary["input_shape"] = payload["resolved_run"]["input_shape"]
+		hardware_summary["output_shape"] = payload["resolved_run"]["output_shape"]
+		hardware_summary_path = run_manager.save_metadata("hardware_summary.json", hardware_summary)
+		paths["hardware_summary_path"] = str(hardware_summary_path)
+	paths["git_info_path"] = str(run_manager.save_git_info())
 
 	cache_config = _get_section(config, "cache")
 	if bool(cache_config.get("enabled", False)) and bool(cache_config.get("use_precomputed_patches", False)):
@@ -987,17 +1122,29 @@ def _save_resolved_run_artifacts(
 
 			manifest_path = get_patch_cache_dir(config) / MANIFEST_FILENAME
 			if manifest_path.exists():
-				shutil.copyfile(manifest_path, cache_manifest_copy_path)
+				if bool(run_manager.output_config.get("save_cache_manifest_copy", True)):
+					cache_manifest_copy_path = run_manager.copy_metadata_file(manifest_path, "cache_manifest.json")
+					if cache_manifest_copy_path is not None:
+						paths["cache_manifest_copy_path"] = str(cache_manifest_copy_path)
+				path_record = run_manager.record_path_metadata("cache_manifest_path.txt", manifest_path)
+				if path_record is not None:
+					paths["cache_manifest_path_record"] = str(path_record)
 		except Exception as exc:
 			logger.warning("Could not copy cache manifest for run metadata: %s", exc)
 
-	logger.info("Saved resolved config: %s", resolved_config_path)
-	logger.info("Saved hardware summary: %s", hardware_summary_path)
-	return {
-		"resolved_config_path": str(resolved_config_path),
-		"hardware_summary_path": str(hardware_summary_path),
-		"cache_manifest_copy_path": str(cache_manifest_copy_path) if cache_manifest_copy_path.exists() else "",
-	}
+	if normalization_stats_path is not None:
+		path_record = run_manager.record_path_metadata("normalization_stats_path.txt", normalization_stats_path)
+		if path_record is not None:
+			paths["normalization_stats_path_record"] = str(path_record)
+		if bool(run_manager.output_config.get("save_normalization_stats_copy", True)):
+			normalization_copy_path = run_manager.copy_metadata_file(normalization_stats_path, "normalization_stats.json")
+			if normalization_copy_path is not None:
+				paths["normalization_stats_copy_path"] = str(normalization_copy_path)
+
+	logger.info("Saved resolved config: %s", paths.get("resolved_config_path"))
+	if "hardware_summary_path" in paths:
+		logger.info("Saved hardware summary: %s", paths["hardware_summary_path"])
+	return paths
 
 
 def _resolve_existing_normalization_stats_path(config: Mapping[str, Any]) -> Path | None:
@@ -1139,22 +1286,45 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 		raise ImportError("PyTorch is required to train the wildfire model.")
 
 	config = dict(config)
+	original_config = deepcopy(config)
 	config["return_metadata"] = False
 	training_config = _get_section(config, "training")
 	performance_config = get_performance_config(config)
 	logging_config = _get_section(config, "logging")
 	checkpoint_config = _get_section(config, "checkpoint")
-	checkpointing_config = _get_section(config, "checkpointing")
+	checkpointing_config = get_training_checkpointing_config(config)
+	output_config = get_training_output_config(config)
 	architecture = resolve_model_architecture(config)
+	run_manager = RunManager(config, architecture)
+	run_manager.create_run_dir()
+	training_config["run_name"] = run_manager.run_name
+	training_config["run_dir"] = str(run_manager.run_dir)
+	config["training"] = training_config
+	config["run"] = {
+		"architecture": run_manager.architecture,
+		"run_name": run_manager.run_name,
+		"run_dir": str(run_manager.run_dir),
+	}
+	checkpoint_config["path"] = str(run_manager.checkpoint_path("latest"))
+	checkpoint_config["best_path"] = str(run_manager.checkpoint_path("best"))
+	config["checkpoint"] = checkpoint_config
+	logging_config["log_dir"] = str(run_manager.log_dir)
+	logging_config["training_log_path"] = str(run_manager.log_path("training"))
+	logging_config["validation_log_path"] = str(run_manager.log_path("validation"))
+	logging_config["timing_log_path"] = str(run_manager.log_path("timing"))
+	logging_config["metrics_log_path"] = str(run_manager.log_path("metrics"))
+	config["logging"] = logging_config
 
 	seed = int(training_config.get("seed", config.get("seed", 42)))
 	set_seed(seed)
 	backend_summary = configure_torch_backend(config)
 
 	log_level = str(logging_config.get("level", "INFO"))
-	log_dir = Path(logging_config.get("log_dir", "./artifacts/logs")).expanduser().resolve()
+	log_dir = Path(logging_config.get("log_dir", run_manager.log_dir)).expanduser().resolve()
 	log_dir.mkdir(parents=True, exist_ok=True)
-	logger = setup_logging(log_level, str(log_dir / f"train_{architecture}.log"))
+	logger = setup_logging(log_level, str(run_manager.log_path("process")))
+	logger.info("Run outputs: %s", run_manager.run_dir)
+	logger.info("Run checkpoints: %s", run_manager.checkpoint_dir)
 	logger.info("Torch backend: %s", backend_summary)
 	_apply_dataloader_worker_tuning(config, logger)
 	_apply_auto_hardware_tuning(config, logger)
@@ -1256,6 +1426,8 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 	resume_enabled = bool(checkpoint_config.get("resume", True))
 	start_epoch = 0
 	best_val_loss = math.inf
+	best_epoch: int | None = None
+	global_step = 0
 	resumed_from_checkpoint = False
 	history_rows: list[dict[str, float | int]] = []
 
@@ -1270,24 +1442,69 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 			scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
 		start_epoch = int(checkpoint.get("epoch", -1)) + 1
 		best_val_loss = float(checkpoint.get("best_val_loss", math.inf))
+		best_epoch_value = checkpoint.get("best_epoch")
+		if best_epoch_value not in (None, "", "null"):
+			best_epoch = int(best_epoch_value)
+		global_step = int(checkpoint.get("global_step", 0))
 		resumed_from_checkpoint = True
 		history_rows = _coerce_history_rows(checkpoint.get("history", []))
 
 	if start_epoch >= epochs:
 		logger.info("Checkpoint already covers requested epochs (%s). Skipping training.", epochs)
 
-	save_every_n_epochs = max(1, int(checkpointing_config.get("save_every_n_epochs", checkpoint_config.get("save_every_n_epochs", 1))))
-	save_latest_checkpoint = bool(checkpointing_config.get("save_latest", True))
-	save_best_checkpoint = bool(checkpointing_config.get("save_best", True))
+	save_every_value = checkpointing_config.get("save_every_n_epochs", checkpoint_config.get("save_every_n_epochs", None))
+	save_every_n_epochs = 1 if save_every_value in (None, "", "null", 0, 0.0) else max(1, int(save_every_value))
+	save_latest_checkpoint = bool(output_config.get("save_latest_checkpoint", True)) and bool(checkpointing_config.get("save_latest", True))
+	save_best_checkpoint = bool(output_config.get("save_best_checkpoint", True)) and bool(checkpointing_config.get("save_best", True))
+	save_epoch_checkpoints = bool(output_config.get("save_epoch_checkpoints", False))
+	keep_last_n_epoch_checkpoints = checkpointing_config.get("keep_last_n_epoch_checkpoints", 3)
 	if bool(checkpointing_config.get("async_save", False)):
 		logger.warning("checkpointing.async_save=true is not enabled in this safe path; saving checkpoints synchronously.")
 
 	training_log_path = _resolve_training_log_path(config)
 	training_log_path.parent.mkdir(parents=True, exist_ok=True)
 	append_log = training_log_path.exists() and start_epoch > 0
+	validation_log_path = Path(logging_config.get("validation_log_path", run_manager.log_path("validation"))).expanduser().resolve()
+	validation_log_path.parent.mkdir(parents=True, exist_ok=True)
+	append_validation_log = validation_log_path.exists() and start_epoch > 0
+	metrics_log_path = Path(logging_config.get("metrics_log_path", run_manager.log_path("metrics"))).expanduser().resolve()
+	metrics_log_path.parent.mkdir(parents=True, exist_ok=True)
+	append_metrics_log = metrics_log_path.exists() and start_epoch > 0
 	timing_log_path = _resolve_timing_log_path(config)
 	timing_log_path.parent.mkdir(parents=True, exist_ok=True)
-	run_artifact_paths = _save_resolved_run_artifacts(config, model, logger, normalization_stats_path)
+	loader_summaries = {
+		"train": _loader_summary(train_loader),
+		"val": _loader_summary(val_loader),
+		"test": {} if test_loader is None else _loader_summary(test_loader),
+	}
+	config["resolved_run"] = {
+		"architecture": architecture,
+		"run_name": run_manager.run_name,
+		"run_dir": str(run_manager.run_dir),
+		"checkpoint_dir": str(run_manager.checkpoint_dir),
+		"log_dir": str(run_manager.log_dir),
+		"figure_dir": str(run_manager.figure_dir),
+		"input_channels": input_channels,
+		"output_channels": output_channels,
+		"input_shape": _input_shape_metadata(config, input_channels),
+		"output_shape": _output_shape_metadata(config, output_channels),
+		"effective_batch_size": int(training_config.get("batch_size", config.get("batch_size", 1)))
+		* int(training_config.get("gradient_accumulation_steps", 1)),
+		"normalization_stats_path": str(normalization_stats_path) if normalization_stats_path is not None else None,
+	}
+	run_artifact_paths = _save_resolved_run_artifacts(
+		config,
+		original_config,
+		model,
+		logger,
+		normalization_stats_path,
+		run_manager,
+		backend_summary,
+		amp_dtype,
+		input_channels,
+		output_channels,
+		loader_summaries,
+	)
 
 	logger.info("Starting training for %s epochs", epochs)
 	test_sample_count = 0 if test_loader is None else len(test_loader.dataset)
@@ -1315,10 +1532,68 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 		gradient_accumulation_steps,
 	)
 
+	partial_training_result: dict[str, Any] = {
+		"start_epoch": start_epoch,
+		"epochs": epochs,
+		"best_val_loss": best_val_loss,
+		"best_epoch": best_epoch,
+		"best_metric_name": str(checkpointing_config.get("monitor", checkpoint_config.get("monitor", "val_loss"))),
+		"global_step": global_step,
+		"latest_checkpoint_path": str(latest_checkpoint_path),
+		"best_checkpoint_path": str(best_checkpoint_path),
+		"training_log_path": str(training_log_path),
+		"validation_log_path": str(validation_log_path),
+		"metrics_log_path": str(metrics_log_path),
+		"timing_log_path": str(timing_log_path),
+		"run_dir": str(run_manager.run_dir),
+		"run_name": run_manager.run_name,
+		"architecture": architecture,
+		"run_artifact_paths": run_artifact_paths,
+		"history_rows": history_rows,
+		"final_epoch_summary": {},
+		"num_epochs_completed": start_epoch,
+	}
+	run_completed = False
+
+	def _write_incomplete_run_summary() -> None:
+		if run_completed:
+			return
+		try:
+			run_manager.finalize(
+				partial_training_result,
+				status="failed",
+				error_message="Training process exited before successful completion.",
+			)
+		except Exception:
+			pass
+
+	atexit.register(_write_incomplete_run_summary)
+
+	def _checkpoint_extra_state() -> dict[str, Any]:
+		return {
+			"architecture": architecture,
+			"run_name": run_manager.run_name,
+			"run_dir": str(run_manager.run_dir),
+			"global_step": global_step,
+			"best_metric": best_val_loss,
+			"best_metric_name": str(checkpointing_config.get("monitor", checkpoint_config.get("monitor", "val_loss"))),
+			"best_epoch": best_epoch,
+			"input_channels": input_channels,
+			"input_shape": _input_shape_metadata(config, input_channels),
+			"output_shape": _output_shape_metadata(config, output_channels),
+			"normalization_stats": str(normalization_stats_path) if normalization_stats_path is not None else None,
+			"cache_manifest_path": run_artifact_paths.get("cache_manifest_copy_path")
+			or run_artifact_paths.get("cache_manifest_path_record"),
+			"resolved_config_path": run_artifact_paths.get("resolved_config_path"),
+			"resumed_from_checkpoint": resumed_from_checkpoint,
+			"history": history_rows,
+		}
+
 	final_epoch_summary: dict[str, Any] = dict(history_rows[-1]) if history_rows else {}
 	epochs_without_validation_improvement = 0
 	for epoch_index in range(start_epoch, epochs):
 		epoch_number = epoch_index + 1
+		epoch_start_time = time.perf_counter()
 		logger.info("Epoch %s/%s", epoch_number, epochs)
 
 		train_results = _run_epoch(
@@ -1380,13 +1655,31 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 		else:
 			logger.warning("Skipping scheduler step because validation loss is not finite: %s", val_loss)
 
+		global_step += int(math.ceil(float(train_results.get("train_batches", 0.0)) / float(gradient_accumulation_steps)))
 		next_best_val_loss = min(best_val_loss, val_loss)
+		is_best_epoch = val_loss < best_val_loss
+		if is_best_epoch:
+			best_epoch = epoch_number
+		epoch_time_sec = time.perf_counter() - epoch_start_time
+		gpu_memory_allocated_gb = 0.0
+		gpu_memory_reserved_gb = 0.0
+		if device.type == "cuda":
+			gpu_memory_allocated_gb = float(torch.cuda.memory_allocated(device)) / float(1024**3)
+			gpu_memory_reserved_gb = float(torch.cuda.memory_reserved(device)) / float(1024**3)
+		train_samples = float(train_results.get("train_samples", 0.0))
 		row = {
 			"epoch": epoch_number,
+			"global_step": global_step,
 			"learning_rate": _current_lr(optimizer),
 			"train_loss": train_results["train_loss"],
 			"val_loss": val_results["val_loss"],
 			"best_val_loss": next_best_val_loss,
+			"best_metric_so_far": next_best_val_loss,
+			"is_best": int(is_best_epoch),
+			"epoch_time_sec": epoch_time_sec,
+			"samples_per_sec": train_samples / max(epoch_time_sec, 1.0e-9),
+			"gpu_memory_allocated_gb": gpu_memory_allocated_gb,
+			"gpu_memory_reserved_gb": gpu_memory_reserved_gb,
 			"use_patches_train": int(bool(config.get("use_patches", False))),
 			"use_patches_eval": int(bool(config.get("use_patches_for_eval", False))),
 			"patch_size": int(config.get("patch_size", 64)),
@@ -1399,7 +1692,6 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 				row[metric_name] = metric_value
 
 		history_rows.append(row)
-		is_best_epoch = val_loss < best_val_loss
 		should_save_latest = save_latest_checkpoint and (
 			epoch_number % save_every_n_epochs == 0 or epoch_number == epochs
 		)
@@ -1413,12 +1705,12 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 				scheduler=scheduler,
 				epoch=epoch_index,
 				best_val_loss=best_val_loss,
-				input_channels=input_channels,
-				resumed_from_checkpoint=resumed_from_checkpoint,
-				history=history_rows,
+				**_checkpoint_extra_state(),
 			)
 			if not best_checkpoint_path.exists():
 				raise RuntimeError(f"Best checkpoint was not created at: {best_checkpoint_path}")
+			for compatibility_path in run_manager.copy_checkpoint_to_compatibility(best_checkpoint_path, "best"):
+				logger.info("Updated compatibility best checkpoint: %s", compatibility_path)
 		elif is_best_epoch:
 			best_val_loss = val_loss
 
@@ -1431,18 +1723,65 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 				scheduler=scheduler,
 				epoch=epoch_index,
 				best_val_loss=best_val_loss,
-				input_channels=input_channels,
-				resumed_from_checkpoint=resumed_from_checkpoint,
-				history=history_rows,
+				**_checkpoint_extra_state(),
 			)
 			if not latest_checkpoint_path.exists():
 				raise RuntimeError(f"Latest checkpoint was not created at: {latest_checkpoint_path}")
+			for compatibility_path in run_manager.copy_checkpoint_to_compatibility(latest_checkpoint_path, "latest"):
+				logger.info("Updated compatibility latest checkpoint: %s", compatibility_path)
+
+		if save_epoch_checkpoints and (epoch_number % save_every_n_epochs == 0 or epoch_number == epochs):
+			epoch_checkpoint_path = run_manager.checkpoint_path("epoch", epoch=epoch_number)
+			save_checkpoint(
+				epoch_checkpoint_path,
+				config=config,
+				model=model,
+				optimizer=optimizer,
+				scheduler=scheduler,
+				epoch=epoch_index,
+				best_val_loss=best_val_loss,
+				**_checkpoint_extra_state(),
+			)
+			run_manager.prune_epoch_checkpoints(keep_last_n_epoch_checkpoints)
 
 		_log_to_csv(training_log_path, row, append=append_log)
 		if not training_log_path.exists():
 			raise RuntimeError(f"Training log CSV was not created at: {training_log_path}")
 		append_log = True
+		validation_row = {
+			key: value
+			for key, value in row.items()
+			if key in {"epoch", "global_step", "val_loss", "best_val_loss", "best_metric_so_far", "is_best"}
+			or key.startswith("val_")
+		}
+		if validation_row:
+			_log_to_csv(validation_log_path, validation_row, append=append_validation_log)
+			append_validation_log = True
+		metrics_row = {
+			key: value
+			for key, value in row.items()
+			if key in {"epoch", "global_step"}
+			or (
+				key.startswith(("train_", "val_"))
+				and not key.endswith("loss")
+				and not key.endswith("_avg")
+				and key not in {"train_samples", "train_batches", "val_samples", "val_batches"}
+			)
+		}
+		if len(metrics_row) > 2:
+			_log_to_csv(metrics_log_path, metrics_row, append=append_metrics_log)
+			append_metrics_log = True
 		final_epoch_summary = row
+		partial_training_result.update(
+			{
+				"best_val_loss": best_val_loss,
+				"best_epoch": best_epoch,
+				"global_step": global_step,
+				"history_rows": history_rows,
+				"final_epoch_summary": final_epoch_summary,
+				"num_epochs_completed": epoch_number,
+			}
+		)
 
 		logger.info(
 			"Epoch %s summary | train_loss=%.6f | val_loss=%.6f | best_val_loss=%.6f",
@@ -1516,26 +1855,73 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 		logger.info("Post-training test evaluation requested, but no test dataset is configured.")
 
 	training_curve_paths: list[str] = []
-	for checkpoint_path in (latest_checkpoint_path, best_checkpoint_path):
-		figure_path = _save_training_curves_figure(checkpoint_path, history_rows, test_plot_results)
-		if figure_path is not None and str(figure_path) not in training_curve_paths:
-			training_curve_paths.append(str(figure_path))
-			logger.info("Saved training curves: %s", figure_path)
+	if (
+		bool(output_config.get("save_training_curves", True))
+		or bool(output_config.get("save_metric_curves", True))
+		or bool(output_config.get("save_timing_plots", True))
+	):
+		try:
+			figure_groups = save_training_run_figures(
+				run_manager.run_dir,
+				architecture=architecture,
+				run_name=run_manager.run_name,
+				test_results=test_plot_results,
+			)
+			for group_name, paths in figure_groups.items():
+				if group_name in {"loss_curves", "learning_rate_curve"} and not bool(output_config.get("save_training_curves", True)):
+					continue
+				if group_name == "timing_breakdown" and not bool(output_config.get("save_timing_plots", True)):
+					continue
+				if group_name == "metric_curves" and not bool(output_config.get("save_metric_curves", True)):
+					continue
+				for figure_path in paths:
+					if figure_path not in training_curve_paths:
+						training_curve_paths.append(figure_path)
+						logger.info("Saved training figure: %s", figure_path)
+		except Exception as exc:
+			logger.warning("Could not save training figures for run %s: %s", run_manager.run_name, exc)
 
-	return {
+	result = {
 		"start_epoch": start_epoch,
 		"epochs": epochs,
 		"best_val_loss": best_val_loss,
+		"best_epoch": best_epoch,
+		"best_metric_name": str(checkpointing_config.get("monitor", checkpoint_config.get("monitor", "val_loss"))),
+		"global_step": global_step,
+		"num_epochs_completed": int(final_epoch_summary.get("epoch", start_epoch)) if final_epoch_summary else start_epoch,
 		"latest_checkpoint_path": str(latest_checkpoint_path),
 		"best_checkpoint_path": str(best_checkpoint_path),
 		"training_log_path": str(training_log_path),
+		"validation_log_path": str(validation_log_path),
+		"metrics_log_path": str(metrics_log_path),
 		"timing_log_path": str(timing_log_path),
+		"run_dir": str(run_manager.run_dir),
+		"run_name": run_manager.run_name,
+		"architecture": architecture,
 		"run_artifact_paths": run_artifact_paths,
 		"training_curve_paths": training_curve_paths,
 		"final_epoch_summary": final_epoch_summary,
 		"history_rows": history_rows,
 		"test_results": test_results,
 	}
+	hardware_summary_path = run_artifact_paths.get("hardware_summary_path")
+	if hardware_summary_path:
+		try:
+			with Path(hardware_summary_path).open("r", encoding="utf-8") as handle:
+				hardware_summary = json.load(handle)
+			result["gpu_name"] = hardware_summary.get("gpu_name")
+			result["gpu_total_vram_gb"] = hardware_summary.get("gpu_total_vram_gb")
+		except Exception:
+			pass
+	run_manager.finalize(result, status="completed")
+	run_completed = True
+	try:
+		atexit.unregister(_write_incomplete_run_summary)
+	except Exception:
+		pass
+	logger.info("Training outputs saved under: %s", run_manager.run_dir)
+	logger.info("Best checkpoint: %s", best_checkpoint_path)
+	return result
 
 
 def _build_scheduler(optimizer, config: Mapping[str, Any], epochs: int):
@@ -1567,11 +1953,31 @@ def _log_to_csv(path: Path, row: Mapping[str, Any], append: bool) -> None:
 	"""Append a row to the training CSV, creating the header when needed."""
 
 	path.parent.mkdir(parents=True, exist_ok=True)
-	mode = "a" if append else "w"
-	with path.open(mode, newline="", encoding="utf-8") as handle:
+	row = dict(row)
+	if append and path.exists():
+		with path.open("r", newline="", encoding="utf-8") as handle:
+			reader = csv.DictReader(handle)
+			existing_fieldnames = list(reader.fieldnames or [])
+			existing_rows = list(reader)
+		fieldnames = list(existing_fieldnames)
+		for key in row:
+			if key not in fieldnames:
+				fieldnames.append(key)
+		if fieldnames != existing_fieldnames:
+			with path.open("w", newline="", encoding="utf-8") as handle:
+				writer = csv.DictWriter(handle, fieldnames=fieldnames)
+				writer.writeheader()
+				writer.writerows(existing_rows)
+				writer.writerow(row)
+			return
+		with path.open("a", newline="", encoding="utf-8") as handle:
+			writer = csv.DictWriter(handle, fieldnames=fieldnames)
+			writer.writerow(row)
+		return
+
+	with path.open("w", newline="", encoding="utf-8") as handle:
 		writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
-		if not append:
-			writer.writeheader()
+		writer.writeheader()
 		writer.writerow(row)
 
 
@@ -1760,13 +2166,19 @@ def _save_training_curves_figure(
 	return plot_path
 
 
-def train_model(config_path: str | Path) -> dict[str, Any]:
+def train_model(
+	config_path: str | Path,
+	run_name: str | None = None,
+	output_root: str | Path | None = None,
+	overwrite_run: bool = False,
+) -> dict[str, Any]:
 	"""Train the forecasting model selected by the provided YAML config."""
 
 	if torch is None:
 		raise ImportError("PyTorch is required to train the wildfire forecasting model.")
 
 	config = _ensure_config_path(load_config(config_path), config_path)
+	config = apply_training_cli_overrides(config, run_name=run_name, output_root=output_root, overwrite_run=overwrite_run)
 	return train_model_from_config(config)
 
 
@@ -1848,6 +2260,9 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
 	parser = argparse.ArgumentParser(description="Train the wildfire forecasting model selected by the config.")
 	parser.add_argument("--config", required=True, help="Path to the YAML configuration file.")
+	parser.add_argument("--run_name", default=None, help="Optional explicit run name for artifacts/runs/<architecture>/<run_name>.")
+	parser.add_argument("--output_root", default=None, help="Override training.output.root_dir for run artifacts.")
+	parser.add_argument("--overwrite_run", action="store_true", help="Allow writing into an existing explicit run directory.")
 	return parser
 
 
@@ -1855,7 +2270,7 @@ def main() -> None:
 	"""CLI entry point for training."""
 
 	args = build_argument_parser().parse_args()
-	train_model(args.config)
+	train_model(args.config, run_name=args.run_name, output_root=args.output_root, overwrite_run=args.overwrite_run)
 
 
 if __name__ == "__main__":

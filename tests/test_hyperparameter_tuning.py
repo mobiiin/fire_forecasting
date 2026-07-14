@@ -31,6 +31,7 @@ def _base_config(tmp_path: Path) -> dict:
 			"energy_loss_weight": 1.0,
 		},
 		"normalization": {"path": "./artifacts/normalization_stats.npz"},
+		"cache": {"use_precomputed_patches": True, "allow_config_hash_mismatch": False},
 		"cawfe_latte": {
 			"backbone_dim": 96,
 			"fused_dim": 96,
@@ -71,8 +72,10 @@ def test_random_search_generates_requested_trial_configs(tmp_path: Path) -> None
 	assert len(configs) == 5
 	assert all(config["model"]["architecture"] == "cawfe_latte" for config in configs)
 	assert configs[0]["training"]["epochs"] == 2
+	assert configs[0]["training"]["run_name"] == "cawfe_latte_hparam_trial_000"
 	assert configs[0]["training"]["performance"]["max_train_batches_per_epoch"] == 10
 	assert configs[0]["training"]["performance"]["max_val_batches_per_epoch"] == 4
+	assert configs[0]["cache"]["allow_config_hash_mismatch"] is True
 
 
 def test_apply_tuned_params_modifies_nested_and_alias_keys(tmp_path: Path) -> None:
@@ -119,6 +122,7 @@ def test_best_params_schema_builds_full_cawfe_latte_config(tmp_path: Path) -> No
 	assert "early_stopping_patience" not in config["training"]
 	assert config["training"]["learning_rate"] == 5e-4
 	assert config["multitask"]["energy_loss_weight"] == 2.0
+	assert config["cache"]["allow_config_hash_mismatch"] is True
 	assert Path(config["checkpoint"]["best_path"]).is_absolute()
 	assert Path(config["fire_dataset_index_json"]).is_absolute()
 	assert Path(config["normalization"]["path"]).is_absolute()
@@ -146,9 +150,9 @@ def test_ablation_config_preserves_tuned_parameters(tmp_path: Path) -> None:
 
 def test_cawfe_latte_slurm_scripts_exist_and_are_executable() -> None:
 	scripts = [
-		"scripts/slurm_tune_cawfe_latte_a10080.sh",
-		"scripts/slurm_train_cawfe_latte_tuned_a10080.sh",
-		"scripts/slurm_ablate_cawfe_latte_a10080.sh",
+		"slurm/slurm_tune_cawfe_latte_a10080.sh",
+		"slurm/slurm_train_cawfe_latte_tuned_a10080.sh",
+		"slurm/slurm_ablate_cawfe_latte_a10080.sh",
 		"scripts/submit_cawfe_latte_pipeline.sh",
 	]
 

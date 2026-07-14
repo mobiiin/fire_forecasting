@@ -12,7 +12,7 @@ except ImportError:  # pragma: no cover - environment-specific fallback
 
 from src.config import load_config
 from src.models.model_factory import build_model_from_config
-from src.training.train import _ensure_config_path, train_model_from_config
+from src.training.train import _ensure_config_path, apply_training_cli_overrides, train_model_from_config
 
 
 def _weatherformer_config(config_path: str | Path) -> dict:
@@ -36,6 +36,9 @@ def _weatherformer_config(config_path: str | Path) -> dict:
 def build_argument_parser() -> argparse.ArgumentParser:
 	parser = argparse.ArgumentParser(description="Train the WeatherFormer-lite wildfire model.")
 	parser.add_argument("--config", default="configs/default.yaml", help="Path to the YAML configuration file.")
+	parser.add_argument("--run_name", default=None, help="Optional explicit run name.")
+	parser.add_argument("--output_root", default=None, help="Override training.output.root_dir.")
+	parser.add_argument("--overwrite_run", action="store_true", help="Allow writing into an existing explicit run directory.")
 	return parser
 
 
@@ -61,7 +64,12 @@ def _print_model_summary(config: dict) -> None:
 
 def main() -> None:
 	args = build_argument_parser().parse_args()
-	config = _weatherformer_config(args.config)
+	config = apply_training_cli_overrides(
+		_weatherformer_config(args.config),
+		run_name=args.run_name,
+		output_root=args.output_root,
+		overwrite_run=args.overwrite_run,
+	)
 	_print_model_summary(config)
 	train_model_from_config(config)
 

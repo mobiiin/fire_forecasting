@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from src.data.cache import MANIFEST_FILENAME, compute_cache_config_hash, validate_patch_cache
+from src.data.cache import MANIFEST_FILENAME, _compute_legacy_cache_config_hash, compute_cache_config_hash, validate_patch_cache
 
 
 def _config(cache_dir: Path) -> dict:
@@ -105,6 +105,56 @@ def test_manifest_records_patch_modes_and_strides(tmp_path: Path) -> None:
 		"val": 60,
 		"test": 60,
 	}
+
+
+def test_cache_hash_ignores_multitask_loss_weights(tmp_path: Path) -> None:
+	cache_dir = tmp_path / "cache"
+	config = _config(cache_dir)
+	config["multitask"] = {
+		"output_mode": "surface_canopy_consumed_plus_mask",
+		"surface_fuel_channel": 84,
+		"canopy_fuel_channel": 85,
+		"mask_target_type": "burned_fuel",
+		"consumed_fuel_threshold": 0.01,
+		"segmentation_loss_weight": 5.0,
+	}
+	tuned = json.loads(json.dumps(config))
+	tuned["multitask"]["segmentation_loss_weight"] = 2.0
+	tuned["multitask"]["energy_loss_weight"] = 2.0
+
+	assert compute_cache_config_hash(tuned) == compute_cache_config_hash(config)
+
+
+def test_cache_hash_keeps_multitask_target_settings(tmp_path: Path) -> None:
+	cache_dir = tmp_path / "cache"
+	config = _config(cache_dir)
+	config["multitask"] = {
+		"mask_target_type": "burned_fuel",
+		"consumed_fuel_threshold": 0.01,
+	}
+	changed = json.loads(json.dumps(config))
+	changed["multitask"]["consumed_fuel_threshold"] = 0.02
+
+	assert compute_cache_config_hash(changed) != compute_cache_config_hash(config)
+
+
+def test_cache_validation_accepts_legacy_manifest_hash(tmp_path: Path) -> None:
+	cache_dir = tmp_path / "cache"
+	config = _config(cache_dir)
+	config["multitask"] = {
+		"mask_target_type": "burned_fuel",
+		"consumed_fuel_threshold": 0.01,
+		"segmentation_loss_weight": 5.0,
+	}
+	_write_minimal_cache(cache_dir, config)
+	manifest_path = cache_dir / MANIFEST_FILENAME
+	manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+	manifest["config_hash"] = _compute_legacy_cache_config_hash(config)
+	manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+	summary = validate_patch_cache(config, split="train")
+
+	assert summary["config_hash_status"] == "legacy"
 
 
 def test_cache_validation_fails_on_stride_mismatch(tmp_path: Path) -> None:

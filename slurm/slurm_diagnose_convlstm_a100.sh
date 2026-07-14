@@ -15,6 +15,9 @@
 
 set -euo pipefail
 
+REPO_ROOT="/home/mhabibp/fire_forecasting"
+cd "${REPO_ROOT}"
+
 mkdir -p artifacts/logs /tmp/mhabibp_mplconfig
 export MPLCONFIGDIR=/tmp/mhabibp_mplconfig
 export PYTHONUNBUFFERED=1
@@ -24,6 +27,20 @@ export NUMEXPR_NUM_THREADS=1
 
 source "$HOME/anaconda3/etc/profile.d/conda.sh"
 conda activate fire_forecasting
+PYTHON_BIN="$(command -v python || true)"
+if [[ -z "${PYTHON_BIN}" ]]; then
+  echo "Could not find python after activating conda environment fire_forecasting." >&2
+  exit 1
+fi
+echo "Python executable: ${PYTHON_BIN}"
+"${PYTHON_BIN}" --version
+if [[ ":${PYTHONPATH:-}:" != *":${REPO_ROOT}:"* ]]; then
+  export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+else
+  export PYTHONPATH="${PYTHONPATH:-}"
+fi
+echo "Working directory: $(pwd)"
+echo "PYTHONPATH: ${PYTHONPATH}"
 
 echo "Job ID: ${SLURM_JOB_ID:-unknown}"
 echo "Node: ${SLURM_NODELIST:-unknown}"
@@ -32,7 +49,7 @@ echo "Memory per node MB: ${SLURM_MEM_PER_NODE:-unknown}"
 echo "CUDA visible devices: ${CUDA_VISIBLE_DEVICES:-unset}"
 nvidia-smi
 
-python scripts/diagnose_training_pipeline.py \
+srun --ntasks=1 --chdir="${REPO_ROOT}" --export=ALL /usr/bin/env PYTHONPATH="${PYTHONPATH}" "${PYTHON_BIN}" -m scripts.diagnose_training_pipeline \
   --config configs/default.yaml \
   --model_architecture convlstm_unet \
   --num_batches 50

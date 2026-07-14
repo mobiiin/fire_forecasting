@@ -101,6 +101,64 @@ def compute_cache_config_hash(config: Mapping[str, Any]) -> str:
 		"channel_layout",
 		"engineered_features",
 		"atmospheric_features",
+		"energy_release",
+		"geometry",
+		"patching",
+		"target_normalization",
+	)
+	payload = {key: config.get(key) for key in relevant_keys if key in config}
+	model_section = _get_section(config, "model")
+	payload["model"] = {
+		"input_channels": model_section.get("input_channels"),
+		"output_channels": model_section.get("output_channels"),
+	}
+	cache_section = _get_section(config, "cache")
+	payload["cache"] = {
+		"save_normalized_inputs": bool(cache_section.get("save_normalized_inputs", False)),
+	}
+	multitask_section = _get_section(config, "multitask")
+	payload["multitask"] = {
+		key: multitask_section.get(key)
+		for key in (
+			"output_mode",
+			"output_channels",
+			"surface_fuel_channel",
+			"canopy_fuel_channel",
+			"flux_mask_channel",
+			"mask_target_type",
+			"flux_fire_threshold",
+			"consumed_fuel_threshold",
+			"clamp_consumed_fuel_targets_nonnegative",
+		)
+		if key in multitask_section
+	}
+	encoded = json.dumps(_jsonable(payload), sort_keys=True, separators=(",", ":"), default=str)
+	return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _compute_legacy_cache_config_hash(config: Mapping[str, Any]) -> str:
+	"""Return the historical hash used by existing patch-cache manifests."""
+
+	relevant_keys = (
+		"main_data_dir",
+		"data_dir",
+		"data_dirs",
+		"fire_dataset_index_json",
+		"data_discovery",
+		"fire_filter",
+		"manual_fire_split",
+		"file_pattern",
+		"input_sequence_length",
+		"prediction_horizon",
+		"target_channel",
+		"task_type",
+		"fire_threshold",
+		"active_threshold",
+		"input_channel_count",
+		"input_channel_indices",
+		"channel_layout",
+		"engineered_features",
+		"atmospheric_features",
 		"multitask",
 		"energy_release",
 		"geometry",
@@ -213,11 +271,14 @@ def validate_patch_cache(config: Mapping[str, Any], split: str | Sequence[str] |
 
 	expected_hash = compute_cache_config_hash(config)
 	actual_hash = str(manifest.get("config_hash", ""))
-	if actual_hash != expected_hash and not bool(cache_config.get("allow_config_hash_mismatch", False)):
+	legacy_hash = _compute_legacy_cache_config_hash(config)
+	hash_status = "current" if actual_hash == expected_hash else "legacy" if actual_hash == legacy_hash else "mismatch"
+	if hash_status == "mismatch" and not bool(cache_config.get("allow_config_hash_mismatch", False)):
 		raise RuntimeError(
 			f"Patch-cache config hash mismatch under {cache_dir}.\n"
 			f"manifest config_hash={actual_hash}\n"
 			f"current  config_hash={expected_hash}\n"
+			f"legacy  config_hash={legacy_hash}\n"
 			"Rerun precompute, or set cache.allow_config_hash_mismatch=true only if the cache-affecting config change is intentional."
 		)
 
@@ -295,4 +356,7 @@ def validate_patch_cache(config: Mapping[str, Any], split: str | Sequence[str] |
 		"manifest": manifest,
 		"splits": summaries,
 		"config_hash": expected_hash,
+		"legacy_config_hash": legacy_hash,
+		"manifest_config_hash": actual_hash,
+		"config_hash_status": hash_status,
 	}

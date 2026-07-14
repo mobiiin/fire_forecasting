@@ -106,8 +106,11 @@ python scripts/train_forecasting_model.py --config configs/default.yaml
 
 Expected outputs:
 
-- checkpoints under `artifacts/checkpoints/`
-- logs under `artifacts/logs/`
+- source-of-truth run folder under `artifacts/runs/<architecture>/<run_name>/`
+- best/latest checkpoints under `artifacts/runs/<architecture>/<run_name>/checkpoints/`
+- CSV logs under `artifacts/runs/<architecture>/<run_name>/logs/`
+- curve images under `artifacts/runs/<architecture>/<run_name>/figures/`
+- compatibility checkpoint copies under `artifacts/checkpoints/<architecture>/`
 - training and validation loss printed each epoch
 
 Test the trained model:
@@ -117,6 +120,35 @@ python scripts/test_model.py --config configs/default.yaml
 ```
 
 This evaluates the model on the held-out test fires from your manual split.
+
+## Checking Training Outputs
+After one or more local or Slurm training jobs finish, list the saved runs:
+
+```bash
+python scripts/list_training_runs.py \
+  --root artifacts/runs
+```
+
+Verify expected files and checkpoint metadata:
+
+```bash
+python scripts/verify_training_outputs.py \
+  --all \
+  --root artifacts/runs
+```
+
+Regenerate curves for a run if needed:
+
+```bash
+python scripts/plot_training_curves.py \
+  --run_dir artifacts/runs/cawfe_latte/<run_name>
+```
+
+The best checkpoint for a run is:
+
+```text
+artifacts/runs/<architecture>/<run_name>/checkpoints/best_model.pt
+```
 
 Visualize results:
 
@@ -244,7 +276,7 @@ This workflow tunes only `cawfe_latte`; all other architectures use their defaul
 ```bash
 cd /home/mhabibp/fire_forecasting
 
-sbatch scripts/slurm_tune_cawfe_latte_a10080.sh
+sbatch slurm/slurm_tune_cawfe_latte_a10080.sh
 squeue -u mhabibp
 tail -f artifacts/logs/slurm_tune_cawfe_latte_<JOBID>.out
 ```
@@ -253,8 +285,8 @@ After tuning finishes:
 
 ```bash
 cat artifacts/hparam/cawfe_latte/best_params.json
-sbatch scripts/slurm_train_cawfe_latte_tuned_a10080.sh
-sbatch scripts/slurm_ablate_cawfe_latte_a10080.sh
+sbatch slurm/slurm_train_cawfe_latte_tuned_a10080.sh
+sbatch slurm/slurm_ablate_cawfe_latte_a10080.sh
 ```
 
 Or submit the dependent sequence in one step:

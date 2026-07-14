@@ -59,6 +59,35 @@ def test_host_memory_cap_limits_auto_batch_size(monkeypatch: pytest.MonkeyPatch)
 	assert capped < 1000
 
 
+def test_host_memory_cap_uses_split_specific_dataloader_workers(monkeypatch: pytest.MonkeyPatch) -> None:
+	from src.training.train import _cap_batch_size_for_host_memory
+
+	monkeypatch.setenv("SLURM_CPUS_PER_TASK", "16")
+	monkeypatch.setenv("SLURM_MEM_PER_NODE", "163840")
+	config = {
+		"input_sequence_length": 6,
+		"patching": {"patch_size": 64, "patch_height": 64, "patch_width": 64},
+		"model": {"input_channels": 129, "output_channels": 4},
+		"training": {"num_workers": 2, "pin_memory": True, "prefetch_factor": 1},
+		"data_loader": {
+			"train": {
+				"num_workers": 16,
+				"pin_memory": True,
+				"prefetch_factor": 1,
+			}
+		},
+	}
+
+	capped = _cap_batch_size_for_host_memory(
+		config,
+		batch_size=512,
+		auto_config={"max_host_memory_fraction": 0.55, "host_memory_sample_multiplier": 3.0},
+		logger=None,
+	)
+
+	assert capped < 200
+
+
 def test_input_normalization_matches_expected_tensor_math() -> None:
 	torch = pytest.importorskip("torch")
 	from src.training.train import _apply_input_normalizer
