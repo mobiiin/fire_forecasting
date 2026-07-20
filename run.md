@@ -172,6 +172,30 @@ artifacts/results/quantitative/<eval_run_name>/paper_table.tex
 artifacts/results/quantitative/<eval_run_name>/per_fire_metrics.csv
 ```
 
+## Debug A Suspicious Model Checkpoint
+If a trained model looks worse than persistence or its qualitative outputs look wrong, inspect a few batches directly:
+
+```bash
+python scripts/list_training_runs.py --root artifacts/runs
+
+python scripts/debug_model_predictions.py \
+  --config configs/default.yaml \
+  --model_architecture convlstm_unet \
+  --checkpoint artifacts/runs/convlstm_unet/<run_name>/checkpoints/best_model.pt \
+  --split test \
+  --num_batches 2 \
+  --num_samples_to_plot 4
+```
+
+Then inspect:
+
+```text
+artifacts/debug_predictions/convlstm_unet/<timestamp>/diagnostics_summary.txt
+artifacts/debug_predictions/convlstm_unet/<timestamp>/channel_stats.csv
+artifacts/debug_predictions/convlstm_unet/<timestamp>/metrics_summary.json
+artifacts/debug_predictions/convlstm_unet/<timestamp>/figures/
+```
+
 Regenerate curves for a run if needed:
 
 ```bash

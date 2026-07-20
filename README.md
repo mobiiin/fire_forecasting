@@ -246,6 +246,26 @@ artifacts/results/quantitative/<eval_run_name>/per_fire_metrics.csv
 
 Qualitative prediction and rollout mode is reserved for a later implementation; for now, use `--mode quantitative`.
 
+## Debugging Model Predictions
+Use the prediction debug utility when a checkpoint looks suspicious, for example when a model performs worse than persistence or appears to overpredict energy/background activity.
+
+```bash
+python scripts/debug_model_predictions.py \
+  --config configs/default.yaml \
+  --model_architecture convlstm_unet \
+  --checkpoint artifacts/runs/convlstm_unet/<run_name>/checkpoints/best_model.pt \
+  --split test \
+  --num_batches 2
+```
+
+The script loads the checkpoint through the shared model factory and dataloader path, applies the same input-normalization path used during training/evaluation, prints target and prediction channel statistics, computes quick metrics, and saves prediction figures. It is meant to catch wrong checkpoints, output scale mismatches, energy explosions, mask collapse, channel-order mistakes, and unconstrained fuel/energy outputs.
+
+Outputs are written under:
+
+```text
+artifacts/debug_predictions/<model_architecture>/<timestamp>/
+```
+
 ## Atmospheric Engineered Features
 From the raw atmospheric `U`, `V`, and `W` channels, the dataset can append three atmospheric feature groups for every input timestep.
 

@@ -39,6 +39,7 @@ def get_performance_config(config: Mapping[str, Any] | None) -> dict[str, Any]:
 		"timing_log_every_n_batches": int(training.get("timing_log_every_n_batches", 50)),
 		"synchronize_timing": bool(training.get("synchronize_timing", False)),
 		"auto_batch_size": False,
+		"auto_batch_max_memory_fraction": float(training.get("auto_batch_max_memory_fraction", 0.85)),
 		"prefetch_to_cuda": False,
 		"non_blocking_transfer": True,
 		"max_train_batches_per_epoch": training.get("max_train_batches_per_epoch"),
@@ -229,6 +230,7 @@ def find_max_batch_size(
 	max_batch_size: int | None = None,
 	gradient_accumulation_steps: int = 1,
 	gradient_clip_norm: float | None = None,
+	max_memory_fraction: float | None = None,
 	logger=None,
 	max_trials: int = 12,
 ) -> int:
@@ -246,6 +248,15 @@ def find_max_batch_size(
 	max_batch_size = max_batch_size if max_batch_size is not None else max(initial_batch_size, int(x_sample.shape[0]) * 4)
 	max_batch_size = max(1, int(max_batch_size))
 	max_trials = max(1, int(max_trials))
+	if max_memory_fraction in (None, 0, 0.0):
+		memory_fraction = None
+	else:
+		raw_memory_fraction = float(max_memory_fraction)
+		memory_fraction = None if raw_memory_fraction <= 0.0 else min(raw_memory_fraction, 1.0)
+	peak_limit_gb = None
+	if memory_fraction is not None:
+		properties = torch.cuda.get_device_properties(device)
+		peak_limit_gb = float(properties.total_memory) * memory_fraction / float(1024**3)
 	optimizer = optimizer_factory(model.parameters())
 	best = 0
 	low = initial_batch_size
@@ -278,8 +289,26 @@ def find_max_batch_size(
 			if gradient_clip_norm is not None:
 				torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
 			torch.cuda.synchronize(device)
-			peak_gb = float(torch.cuda.max_memory_allocated(device)) / float(1024**3)
-			log("auto_batch trial ok | batch_size=%s | peak_allocated=%.2f GB | time=%.2fs", batch_size, peak_gb, time.perf_counter() - start)
+			peak_allocated_gb = float(torch.cuda.max_memory_allocated(device)) / float(1024**3)
+			peak_reserved_gb = float(torch.cuda.max_memory_reserved(device)) / float(1024**3)
+			peak_used_gb = max(peak_allocated_gb, peak_reserved_gb)
+			if peak_limit_gb is not None and peak_used_gb > peak_limit_gb:
+				log(
+					"auto_batch trial over memory margin | batch_size=%s | peak_allocated=%.2f GB | peak_reserved=%.2f GB | limit=%.2f GB | fraction=%.2f",
+					batch_size,
+					peak_allocated_gb,
+					peak_reserved_gb,
+					peak_limit_gb,
+					memory_fraction,
+				)
+				return False
+			log(
+				"auto_batch trial ok | batch_size=%s | peak_allocated=%.2f GB | peak_reserved=%.2f GB | time=%.2fs",
+				batch_size,
+				peak_allocated_gb,
+				peak_reserved_gb,
+				time.perf_counter() - start,
+			)
 			return True
 		except RuntimeError as exc:
 			if not _is_cuda_oom(exc):

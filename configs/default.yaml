@@ -1152,10 +1152,15 @@ training:
     auto_batch_size: true
     auto_batch_probe_batch_size: 8
     auto_batch_max_trials: 12
+    # Treat probe batches above this fraction of total GPU memory as unsafe.
+    # This leaves headroom for real-batch variability and allocator fragmentation.
+    auto_batch_max_memory_fraction: 0.85
     prefetch_to_cuda: false
     non_blocking_transfer: true
     log_timing: true
     timing_log_every_n_batches: 50
+    show_progress_bar: true
+    progress_log_percent_step: 0
     synchronize_timing: false
     compute_train_metrics_every_batch: false
     cheap_train_metrics_every_n_batches: 100
@@ -1249,6 +1254,8 @@ training:
   # Options: true, false
   log_timing: true
   timing_log_every_n_batches: 50
+  show_progress_bar: true
+  progress_log_percent_step: 0
 
   # Whether to run external test evaluation automatically after training.
   # Options: true, false
@@ -1346,5 +1353,3 @@ logging:
   # CSV path for epoch-level training metrics.
   # Options: any relative or absolute file path.
   training_log_path: ./artifacts/logs/training_log.csv
-
-

@@ -21,6 +21,11 @@ cd "${REPO_ROOT}"
 mkdir -p artifacts/logs /tmp/mhabibp_mplconfig
 export MPLCONFIGDIR=/tmp/mhabibp_mplconfig
 export PYTHONUNBUFFERED=1
+export TQDM_DISABLE=1
+export FIRE_FORECASTING_PROGRESS_BAR=0
+export FIRE_FORECASTING_PROGRESS_PERCENT=5
+export FIRE_FORECASTING_TIMING_LOG_EVERY_N_BATCHES=0
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1

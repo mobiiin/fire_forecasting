@@ -183,3 +183,52 @@ def test_run_epoch_respects_max_batches() -> None:
 
 	assert results["train_batches"] == 2.0
 	assert results["train_samples"] == 4.0
+
+
+def test_run_epoch_can_log_percent_progress_without_tqdm(capsys: pytest.CaptureFixture[str]) -> None:
+	torch = pytest.importorskip("torch")
+	from src.training.train import _run_epoch
+
+	class ToyModel(torch.nn.Module):
+		def __init__(self) -> None:
+			super().__init__()
+			self.scale = torch.nn.Parameter(torch.tensor(1.0))
+
+		def forward(self, x):
+			return x[:, -1, :1] * self.scale
+
+	loader = [
+		(torch.ones(2, 2, 1, 4, 4), torch.zeros(2, 1, 4, 4))
+		for _ in range(4)
+	]
+	model = ToyModel()
+	optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+
+	_run_epoch(
+		model=model,
+		loader=loader,
+		criterion=torch.nn.MSELoss(),
+		config={
+			"training": {
+				"performance": {
+					"log_timing": False,
+					"show_progress_bar": False,
+					"progress_log_percent_step": 50,
+				}
+			}
+		},
+		device=torch.device("cpu"),
+		input_sequence_length=2,
+		input_channels=1,
+		output_channels=1,
+		train=True,
+		optimizer=optimizer,
+		logger=None,
+	)
+
+	output = capsys.readouterr().out
+	assert "train progress" in output
+	assert "50%" in output
+	assert "100%" in output
+	assert "elapsed=" in output
+	assert "remaining=" in output

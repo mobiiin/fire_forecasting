@@ -91,6 +91,53 @@ def _get_section(config: Mapping[str, Any], *names: str) -> dict[str, Any]:
 	return {}
 
 
+def _env_bool(name: str, default: bool) -> bool:
+	value = os.environ.get(name)
+	if value is None:
+		return default
+	normalized = value.strip().lower()
+	if normalized in {"1", "true", "yes", "on"}:
+		return True
+	if normalized in {"0", "false", "no", "off", ""}:
+		return False
+	return default
+
+
+def _env_int(name: str, default: int) -> int:
+	value = os.environ.get(name)
+	if value is None:
+		return int(default)
+	try:
+		return int(value)
+	except (TypeError, ValueError):
+		return int(default)
+
+
+def _env_float(name: str, default: float) -> float:
+	value = os.environ.get(name)
+	if value is None:
+		return float(default)
+	try:
+		return float(value)
+	except (TypeError, ValueError):
+		return float(default)
+
+
+def _progress_log_interval(total_batches: int, percent_step: float) -> int | None:
+	if percent_step <= 0.0:
+		return None
+	return max(1, int(math.ceil(float(total_batches) * min(percent_step, 100.0) / 100.0)))
+
+
+def _format_duration(seconds: float) -> str:
+	total_seconds = max(0, int(round(seconds)))
+	hours, remainder = divmod(total_seconds, 3600)
+	minutes, seconds = divmod(remainder, 60)
+	if hours > 0:
+		return f"{hours:d}:{minutes:02d}:{seconds:02d}"
+	return f"{minutes:02d}:{seconds:02d}"
+
+
 def _resolve_path(base_path: Path | None, configured_path: str | Path) -> Path:
 	"""Resolve a configured path relative to a config file when available."""
 
@@ -607,7 +654,13 @@ def _run_epoch(
 	training_config = _get_section(config, "training")
 	performance_config = get_performance_config(config)
 	log_timing = bool(performance_config.get("log_timing", training_config.get("log_timing", False)))
-	timing_interval = max(1, int(performance_config.get("timing_log_every_n_batches", training_config.get("timing_log_every_n_batches", 50))))
+	timing_interval = max(
+		0,
+		_env_int(
+			"FIRE_FORECASTING_TIMING_LOG_EVERY_N_BATCHES",
+			int(performance_config.get("timing_log_every_n_batches", training_config.get("timing_log_every_n_batches", 50))),
+		),
+	)
 	synchronize_timing = bool(performance_config.get("synchronize_timing", False))
 	compute_train_metrics_every_batch = bool(performance_config.get("compute_train_metrics_every_batch", training_config.get("compute_train_metrics_every_batch", False)))
 	train_metrics_every_n_batches = max(
@@ -617,6 +670,17 @@ def _run_epoch(
 	compute_val_metrics = bool(performance_config.get("compute_val_metrics", training_config.get("compute_val_metrics", True)))
 	non_blocking_transfer = bool(performance_config.get("non_blocking_transfer", True))
 	use_cuda_prefetcher = bool(performance_config.get("prefetch_to_cuda", False)) and device.type == "cuda"
+	show_progress_bar = _env_bool(
+		"FIRE_FORECASTING_PROGRESS_BAR",
+		bool(performance_config.get("show_progress_bar", training_config.get("show_progress_bar", True))),
+	)
+	progress_log_percent_step = max(
+		0.0,
+		_env_float(
+			"FIRE_FORECASTING_PROGRESS_PERCENT",
+			float(performance_config.get("progress_log_percent_step", training_config.get("progress_log_percent_step", 0.0))),
+		),
+	)
 
 	total_samples = 0
 	total_loss = 0.0
@@ -630,7 +694,10 @@ def _run_epoch(
 	total_batches = total_loader_batches if max_batches is None else min(total_loader_batches, int(max_batches))
 	if total_batches <= 0:
 		raise ValueError(f"The {desc} DataLoader produced no batches.")
-	progress_bar = tqdm(range(total_batches), desc=desc, total=total_batches, leave=False) if tqdm is not None else range(total_batches)
+	progress_log_batch_interval = _progress_log_interval(total_batches, progress_log_percent_step)
+	next_progress_log_batch = progress_log_batch_interval
+	use_progress_bar = bool(show_progress_bar and tqdm is not None)
+	progress_bar = tqdm(range(total_batches), desc=desc, total=total_batches, leave=False) if use_progress_bar else range(total_batches)
 	iterator_source = CUDAPrefetcher(loader, device, non_blocking=non_blocking_transfer) if use_cuda_prefetcher else loader
 	iterator = iter(iterator_source)
 	input_normalizer = _build_input_normalizer(loader, device, input_channels)
@@ -791,7 +858,7 @@ def _run_epoch(
 					**timing_values,
 				}
 			)
-		if log_timing and (batch_number % timing_interval == 0 or batch_number == total_batches):
+		if log_timing and timing_interval > 0 and (batch_number % timing_interval == 0 or batch_number == total_batches):
 			message = (
 				f"step {batch_number} | epoch={epoch_number if epoch_number is not None else '?'} {desc} "
 				f"total={batch_total_time:.2f}s data={data_wait_time:.2f} h2d={h2d_time:.2f} "
@@ -804,13 +871,31 @@ def _run_epoch(
 			else:
 				print(message)
 
-		if tqdm is not None and hasattr(progress_bar, "set_postfix"):
+		if use_progress_bar and hasattr(progress_bar, "set_postfix"):
 			postfix = {"loss": f"{batch_loss_value:.5f}"}
 			for component_name, component_value in batch_loss_components.items():
 				postfix[component_name] = f"{float(component_value):.5f}"
 			for metric_name, metric_value in batch_metrics.items():
 				postfix[metric_name] = f"{float(metric_value):.5f}"
 			progress_bar.set_postfix(postfix)
+		if progress_log_batch_interval is not None and next_progress_log_batch is not None:
+			if batch_number >= next_progress_log_batch or batch_number == total_batches:
+				percent_complete = min(100.0, 100.0 * float(batch_number) / float(total_batches))
+				elapsed_time = time.perf_counter() - epoch_start_time
+				remaining_batches = max(0, total_batches - batch_number)
+				estimated_remaining_time = elapsed_time * float(remaining_batches) / float(max(1, batch_number))
+				message = (
+					f"{desc} progress | epoch={epoch_number if epoch_number is not None else '?'} "
+					f"{percent_complete:.0f}% | batch={batch_number}/{total_batches} "
+					f"elapsed={_format_duration(elapsed_time)} remaining={_format_duration(estimated_remaining_time)} "
+					f"loss={batch_loss_value:.5f} samples/s={samples_per_second:.2f}"
+				)
+				if logger is not None:
+					logger.info(message)
+				else:
+					print(message)
+				while next_progress_log_batch is not None and next_progress_log_batch <= batch_number:
+					next_progress_log_batch += progress_log_batch_interval
 
 	if total_samples == 0:
 		raise ValueError(f"The {desc} DataLoader produced no samples.")
@@ -1212,11 +1297,21 @@ def _maybe_probe_auto_batch_size(
 		max_batch_size = min(int(max_batch_size), int(original_host_safe_batch_size))
 	max_batch_size = _cap_batch_size_for_host_memory(config, int(max_batch_size), auto_config, logger)
 	max_trials = int(performance_config.get("auto_batch_max_trials", 12))
+	auto_batch_max_memory_fraction_value = performance_config.get(
+		"auto_batch_max_memory_fraction",
+		auto_config.get("auto_batch_max_memory_fraction", 0.85),
+	)
+	auto_batch_max_memory_fraction = (
+		None
+		if auto_batch_max_memory_fraction_value in (None, "", "null", 0, 0.0)
+		else float(auto_batch_max_memory_fraction_value)
+	)
 	logger.info(
-		"Running CUDA auto batch-size probe | initial=%s max=%s trials=%s",
+		"Running CUDA auto batch-size probe | initial=%s max=%s trials=%s max_memory_fraction=%s",
 		current_batch_size,
 		max_batch_size,
 		max_trials,
+		auto_batch_max_memory_fraction,
 	)
 	sample_batch = next(iter(train_loader))
 	x_sample, y_sample = _as_batch(sample_batch)
@@ -1240,6 +1335,7 @@ def _maybe_probe_auto_batch_size(
 			max_batch_size=int(max_batch_size),
 			gradient_accumulation_steps=max(1, int(training_config.get("gradient_accumulation_steps", 1))),
 			gradient_clip_norm=gradient_clip_norm,
+			max_memory_fraction=auto_batch_max_memory_fraction,
 			logger=logger,
 			max_trials=max_trials,
 		)
