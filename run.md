@@ -17,7 +17,52 @@ python scripts/discover_fire_datasets.py --main_data_dir /media/mhabibp/Elements
 
 That command should rewrite `fire_dataset_index.json` in the project root. If any fire path is stale or missing, update the manual fire lists in `configs/default.yaml` before continuing.
 
-Then run the intermediate validation step:
+## Manual Fire Start Trimming
+After regenerating `fire_dataset_index.json`, choose the first useful frame for each fire manually. The raw CAWFE files are not changed, and the trimmed index stores compact `temporal_trim` start/end indices instead of a full list of frame paths.
+
+```bash
+python scripts/manual_trim_fire_datasets.py \
+  --input_index fire_dataset_index.json \
+  --output_index fire_dataset_index_trimmed.json
+```
+
+To review only one fire:
+
+```bash
+python scripts/manual_trim_fire_datasets.py \
+  --input_index fire_dataset_index.json \
+  --only_fire MCKINNEY \
+  --output_index fire_dataset_index_trimmed.json
+```
+
+Apply existing choices without interaction:
+
+```bash
+python scripts/manual_trim_fire_datasets.py \
+  --apply_only \
+  --input_index fire_dataset_index.json \
+  --trim_config configs/manual_fire_trim.json \
+  --output_index fire_dataset_index_trimmed.json
+```
+
+Inspect the compact trimmed index:
+
+```bash
+python scripts/inspect_multi_fire_dataset.py \
+  --index fire_dataset_index_trimmed.json \
+  --config configs/default.yaml
+```
+
+To train from the trimmed sequence window, set `fire_dataset_index_json: ../fire_dataset_index_trimmed.json` in `configs/default.yaml`, bump `cache.cache_version`, then rebuild cache and normalization:
+
+```bash
+python scripts/precompute_patch_cache.py --config configs/default.yaml --split all
+python scripts/compute_normalization.py --config configs/default.yaml --from_cache
+```
+
+Old patch cache shards, normalization stats, and checkpoints are incompatible after changing trim decisions.
+
+If you are not switching to the trimmed-index cache workflow yet, run the intermediate validation step:
 
 ```bash
 python scripts/compute_normalization.py --config configs/default.yaml
@@ -257,7 +302,7 @@ python scripts/evaluate_all_baselines.py --config configs/default.yaml --split t
 ```
 
 Notes:
-- canonical ST-Mamba-Lite patch input is `(B, 6, 129, 64, 64)`
+- canonical ST-Mamba-Lite patch input is `(B, 5, 129, 64, 64)`
 - canonical output is `(B, 4, 64, 64)`
 - channel `2` remains mask logits; the model does not apply sigmoid internally
 - for real comparisons, install `mamba-ssm` and set `st_mamba_lite.mamba_backend: mamba_ssm`
@@ -278,7 +323,7 @@ python scripts/evaluate_all_baselines.py --config configs/default.yaml --split t
 ```
 
 Notes:
-- canonical WeatherFormer-lite patch input is `(B, 6, 129, 64, 64)`
+- canonical WeatherFormer-lite patch input is `(B, 5, 129, 64, 64)`
 - canonical output is `(B, 4, 64, 64)`
 - it uses factorized temporal attention and local spatial window attention
 - the shifted-window path currently uses cyclic shifts without a masking scheme
@@ -300,7 +345,7 @@ python scripts/evaluate_all_baselines.py --config configs/default.yaml --split t
 ```
 
 Notes:
-- canonical CAWFE-Latte-Lite patch input is `(B, 6, 129, 64, 64)`
+- canonical CAWFE-Latte-Lite patch input is `(B, 5, 129, 64, 64)`
 - canonical output is `(B, 4, 64, 64)`
 - channel `2` remains mask logits; the model does not apply sigmoid internally
 - detailed architecture documentation is in `cawfe_latte.md`
@@ -322,7 +367,7 @@ python scripts/evaluate_all_baselines.py --config configs/default.yaml --split t
 ```
 
 Notes:
-- canonical full CAWFE-Latte patch input is `(B, 6, 129, 64, 64)`
+- canonical full CAWFE-Latte patch input is `(B, 5, 129, 64, 64)`
 - canonical output is `(B, 4, 64, 64)`
 - channel `2` remains mask logits; the model does not apply sigmoid internally
 - if `mamba-ssm` is not installed, `mamba_backend: auto` uses the fallback gated SSM for smoke/debug runs

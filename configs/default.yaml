@@ -8,7 +8,11 @@
 # main_data_dir: /media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/
 main_data_dir: /project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE
 
-fire_dataset_index_json: ../fire_dataset_index.json
+# Use ../fire_dataset_index_trimmed.json here after running scripts/manual_trim_fire_datasets.py.
+# The trimmed index stores compact temporal_trim start/end indices, not long frame-path lists.
+# Keep this pointed at ../fire_dataset_index.json until you intentionally switch to manual trims.
+# Rebuild patch cache and normalization stats after switching indexes.
+fire_dataset_index_json: ../fire_dataset_index_trimmed.json
 
 data_dirs: []
 
@@ -41,11 +45,22 @@ external_test_file_pattern: "*.npy"
 
 # Number of historical frames fed into the model.
 # Options: any positive integer >= 1.
-input_sequence_length: 6
+input_sequence_length: 5
 
 # Forecast horizon in frames after the last input timestep.
 # Options: any integer >= 0.
-prediction_horizon: 1
+prediction_horizon: 10
+
+data:
+  # Mirrors fire_dataset_index_json for documentation-oriented tools.
+  # Use fire_dataset_index_trimmed.json after running scripts/manual_trim_fire_datasets.py.
+  fire_dataset_index: fire_dataset_index_trimmed.json
+  input_sequence_length: 5
+  prediction_horizon: 10
+
+sequence:
+  input_sequence_length: 5
+  prediction_horizon: 10
 
 # Legacy single-target channel index used by regression/segmentation utilities.
 # Options: any valid raw channel index in [0, C_raw - 1].
@@ -71,47 +86,62 @@ manual_fire_split:
 
   # Fire names must match keys in fire_dataset_index.json.
   # These defaults are examples and should be updated to match the fires currently available in your mounted dataset tree.
+  # train_fires:
+  #   - ARCHIECREEK
+  #   - CALWOOD
+  #   - CAMP
+  #   - CARR_FIRENADO
+  #   - CARR_GROWTHDAY
+  #   - CHIMNEYTOPS2
+  #   - CREEK
+  #   - ESPERANZA
+  #   - KING__period1__keepz_08
+  #   - KING__period2__keepz_08
+  #   - KING__period3__keepz_08
+  #   - MARSHALL
+  #   - MOSQUITO
+  #   - NORTHCOMPLX
+  #   - RIM__0820__keepz_08
+  #   - RIM__0822__keepz_08
+  #   - SLATER
+  #   - THOMAS__1204__keepz_08
+  #   - THOMAS__1208__keepz_08
+  #   - THOMAS__1209__keepz_08
+  #   - THOMAS__1210__keepz_08
+  #   - REDWOODVALLEY
+  #   - GLASS
+  #   - LITTLEBEAR__lbvaa__keepz_08
+  #   - LITTLEBEAR__lbvab__keepz_08
+  #   - LITTLEBEAR__lbvac__keepz_08
+
+  # val_fires:
+  #   - EASTTROUBLESOME
+  #   - PARKCTY_HYPOTHETICAL
+  #   - Tubbs
+  #   - WITCHCREEK
+
+  # test_fires:
+  #   - MCKINNEY
+  #   - TRUCKEE_HYPOTHETICAL
+  #   - TUOLUMNE_65
+  #   - WOOLSEY
+  #   - SPRINGS
+  #   - YUBA_HYPOTHETICAL
+  
   train_fires:
-    - ARCHIECREEK
-    - CALWOOD
-    - CAMP
-    - CARR_FIRENADO
-    - CARR_GROWTHDAY
-    - CHIMNEYTOPS2
-    - CREEK
     - ESPERANZA
-    - KING__period1__keepz_08
-    - KING__period2__keepz_08
-    - KING__period3__keepz_08
-    - MARSHALL
-    - MOSQUITO
-    - NORTHCOMPLX
-    - RIM__0820__keepz_08
-    - RIM__0822__keepz_08
-    - SLATER
     - THOMAS__1204__keepz_08
     - THOMAS__1208__keepz_08
     - THOMAS__1209__keepz_08
     - THOMAS__1210__keepz_08
-    - REDWOODVALLEY
-    - GLASS
-    - LITTLEBEAR__lbvaa__keepz_08
-    - LITTLEBEAR__lbvab__keepz_08
-    - LITTLEBEAR__lbvac__keepz_08
-
   val_fires:
-    - EASTTROUBLESOME
-    - PARKCTY_HYPOTHETICAL
-    - Tubbs
     - WITCHCREEK
 
   test_fires:
-    - MCKINNEY
-    - TRUCKEE_HYPOTHETICAL
-    - TUOLUMNE_65
     - WOOLSEY
-    - SPRINGS
-    - YUBA_HYPOTHETICAL
+
+
+  
 
   use_full_fire_for_split: true
   within_fire_train_fraction: 1.0
@@ -126,6 +156,16 @@ manual_fire_split:
   save_resolved_split_json: true
   resolved_split_json: artifacts/splits/manual_fire_split_resolved.json
   fraction_warning_tolerance: 0.20
+
+temporal_trim:
+  # Manual pre-fire trimming workflow:
+  # 1) choose fire start/end frames with scripts/manual_trim_fire_datasets.py
+  # 2) write compact temporal_trim metadata to fire_dataset_index_trimmed.json
+  # 3) point fire_dataset_index_json at ../fire_dataset_index_trimmed.json and rebuild cache/stats
+  enabled: true
+  mode: manual
+  trim_config: configs/manual_fire_trim.json
+  trimmed_index: fire_dataset_index_trimmed.json
 
 # Learning task.
 # Supported options:
@@ -142,7 +182,10 @@ cache:
   enabled: true
   scratch_root: /scratch/mhabibp/
   cache_dir: /scratch/mhabibp/fire_forecasting_patch_cache/
-  cache_version: v2_sliding_stride60
+  cache_version: v5_manual_trim_T5_H10_stride60
+  input_sequence_length: 5
+  prediction_horizon: 10
+  target_definition_version: interval_consumed_current_to_horizon_target_v1
   use_precomputed_patches: true
   allow_dynamic_fallback: false
   validate_cache_before_training: true
@@ -171,6 +214,8 @@ cache:
 
 patching:
   enabled: true
+  input_sequence_length: 5
+  prediction_horizon: 10
   patch_size: 64
   patch_height: 64
   patch_width: 64
@@ -585,6 +630,8 @@ energy_release:
   predict_latent: false
 
 baselines:
+  prediction_horizon: 10
+
   persistence:
     mask_mode: zero
 
@@ -623,6 +670,7 @@ model:
   # - cawfe_latte
   architecture: convlstm_unet
   name: convlstm_unet
+  input_sequence_length: 5
 
   # Total input channels after all enabled engineered features are appended.
   # Options: any positive integer matching the actual dataset tensor width after engineering.
@@ -661,8 +709,11 @@ model:
   # Note: multitask mode forces this to null internally.
   output_activation: null
 
+convlstm_unet:
+  input_sequence_length: 5
+
 earthformer_lite:
-  input_sequence_length: 6
+  input_sequence_length: 5
   patch_size: 64
   embed_dim: 64
   depths: [2, 2]
@@ -686,7 +737,7 @@ earthformer_lite:
   required_patch_divisibility: 16
 
 st_mamba_lite:
-  input_sequence_length: 6
+  input_sequence_length: 5
   patch_size: 64
   embed_dim: 64
   encoder_channels: [64, 128]
@@ -718,8 +769,11 @@ st_mamba_lite:
   gradient_checkpointing: false
   required_patch_divisibility: 16
 
+cawfe_st_mamba:
+  input_sequence_length: 5
+
 weatherformer_lite:
-  input_sequence_length: 6
+  input_sequence_length: 5
   patch_size: 64
   embed_dim: 64
   encoder_channels: [64, 128]
@@ -754,7 +808,7 @@ weatherformer_lite:
   required_patch_divisibility: 16
 
 cawfe_latte_lite:
-  input_sequence_length: 6
+  input_sequence_length: 5
   patch_size: 64
 
   # Main dimensions.
@@ -840,7 +894,7 @@ cawfe_latte_lite:
   required_patch_divisibility: 16
 
 cawfe_latte:
-  input_sequence_length: 6
+  input_sequence_length: 5
   patch_size: 64
 
   # Main dimensions.

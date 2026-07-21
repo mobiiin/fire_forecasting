@@ -140,6 +140,49 @@ python scripts/train_forecasting_model.py --config configs/default.yaml
 
 Choose training fires to cover a range of fire sizes, durations, energy-release regimes, and spatial extents. Hold out validation/test fires as unseen events when you want a scientifically cleaner cross-fire generalization result.
 
+## Manual Fire Start Trimming
+Use the manual trim workflow after dataset discovery when you want to remove inactive pre-fire frames. The raw CAWFE `.npy` files are not modified. The trimmed index stores compact per-fire `temporal_trim` start/end indices only, so it does not duplicate thousands of frame paths.
+
+```bash
+python scripts/manual_trim_fire_datasets.py \
+  --input_index fire_dataset_index.json \
+  --output_index fire_dataset_index_trimmed.json
+```
+
+To review only one fire:
+
+```bash
+python scripts/manual_trim_fire_datasets.py \
+  --input_index fire_dataset_index.json \
+  --only_fire MCKINNEY \
+  --output_index fire_dataset_index_trimmed.json
+```
+
+To apply existing choices without opening the interactive reviewer:
+
+```bash
+python scripts/manual_trim_fire_datasets.py \
+  --apply_only \
+  --input_index fire_dataset_index.json \
+  --trim_config configs/manual_fire_trim.json \
+  --output_index fire_dataset_index_trimmed.json
+```
+
+Inspect the result before training:
+
+```bash
+python scripts/inspect_multi_fire_dataset.py \
+  --index fire_dataset_index_trimmed.json \
+  --config configs/default.yaml
+```
+
+Then point `fire_dataset_index_json` in `configs/default.yaml` at `../fire_dataset_index_trimmed.json` when you are ready to use it. Dataset loading and patch-cache precompute interpret local sample starts through each fire's `temporal_trim` metadata, preserving original frame indices in sample metadata. After trimming frames, rebuild the patch cache and normalization stats because old cached patches/statistics are incompatible with the new frame sequences. Bump `cache.cache_version` when switching trim decisions.
+
+```bash
+python scripts/precompute_patch_cache.py --config configs/default.yaml --split all
+python scripts/compute_normalization.py --config configs/default.yaml --from_cache
+```
+
 ## Fast Patch Cache Training
 The default config can train from precomputed patch shards under `/scratch/mhabibp/fire_forecasting_patch_cache/`. This avoids reopening full `.npy` frames and rebuilding full-domain engineered features, multitask targets, and energy-release maps inside every training batch.
 
@@ -328,6 +371,17 @@ Why fuel/flux history is allowed as input:
 - past fuel/flux are known historical state
 - future fuel/perimeter are prediction targets
 
+## Default Forecast Target
+The default paper task uses `input_sequence_length: 5` and `prediction_horizon: 10`.
+
+For sample start index `s`:
+- input frame indices are `[s, s+1, s+2, s+3, s+4]`
+- last input index is `s + 4`
+- target index is `s + 4 + 10 = s + 14`
+- valid sample count per fire is `num_frames - input_sequence_length - prediction_horizon + 1`
+
+The multitask output remains `(B, 4, H, W)`: surface consumed fuel and canopy consumed fuel are computed from the last input frame to the horizon target frame, while the mask and `log1p` energy map come from the target frame. Rebuild the patch cache and recompute normalization stats after changing these temporal settings.
+
 ## Earthformer-lite Transformer Baseline
 This project now includes `earthformer_lite`, an in-project simplified Earthformer-inspired model for comparison. It is not the full official Earthformer implementation.
 
@@ -337,7 +391,7 @@ The design uses axial space-time attention inspired by cuboid attention:
 - width attention
 
 Canonical patch-cache input/output:
-- input: `(B, 6, 129, 64, 64)`
+- input: `(B, 5, 129, 64, 64)`
 - output: `(B, 4, 64, 64)`
 
 The model predicts:
@@ -372,7 +426,7 @@ python scripts/evaluate_all_baselines.py --config configs/default.yaml --split t
 This project also includes `st_mamba_lite`, a CAWFE-tailored spatiotemporal Mamba model for dense wildfire forecasting. It is inspired by MetMamba's route-based 3D scanning ideas and ST-Mamba's ST-Mixer / ST-SSM design pattern, but it is not an official reproduction of either paper.
 
 Canonical patch-cache input/output:
-- input: `(B, 6, 129, 64, 64)`
+- input: `(B, 5, 129, 64, 64)`
 - output: `(B, 4, 64, 64)`
 
 Output channels:
@@ -424,7 +478,7 @@ OOM troubleshooting:
 This project also includes `weatherformer_lite`, an in-project WeatherFormer-inspired factorized transformer tailored to CAWFE wildfire forecasting. It is not the official WeatherFormer implementation.
 
 Canonical patch-cache input/output:
-- input: `(B, 6, 129, 64, 64)`
+- input: `(B, 5, 129, 64, 64)`
 - output: `(B, 4, 64, 64)`
 
 Output channels:
@@ -501,14 +555,14 @@ Notes:
 - train, validation, and test now all use sliding-window patchification
 - the train cache is much larger than the older sampled-train cache, so one epoch can be substantially longer
 - if needed, reduce epochs or set `training.max_train_batches_per_epoch`
-- after changing patch stride or patch mode, rebuild the scratch cache or bump `cache.cache_version`
+- after changing patch stride, patch mode, input sequence length, prediction horizon, or target definition, rebuild the scratch cache or bump `cache.cache_version`
 - old sampled or stride-32 caches are incompatible with the current config
 
 ## ST-Mamba-Lite Baseline
 This project is also being extended with `st_mamba_lite`, a CAWFE-tailored spatial-temporal Mamba baseline for dense wildfire forecasting. It should not be described as an official reproduction of any prior Mamba paper.
 
 Planned/expected patch-cache input/output:
-- input: `(B, 6, 129, 64, 64)`
+- input: `(B, 5, 129, 64, 64)`
 - output: `(B, 4, 64, 64)`
 
 Planned prediction targets:
@@ -579,7 +633,9 @@ predicted future canopy fuel = current canopy fuel - predicted canopy consumed f
 These reconstructed maps are clamped to `>= 0`.
 
 ## Multi-Step Autoregressive Rollout
-One-step forecasts can look good because adjacent timestamps are often similar. Multi-step rollout is the harder test: start from a true input window, predict one step ahead, write the predicted surface and canopy fuel back into the next raw frame, rebuild engineered features from that updated raw window, and repeat.
+The default paper task is now a direct `prediction_horizon: 10` forecast. Use the standard test/evaluation scripts for that H-step target.
+
+Autoregressive rollout remains available only for separate `prediction_horizon: 1` experiments: start from a true input window, predict one step ahead, write the predicted surface and canopy fuel back into the next raw frame, rebuild engineered features from that updated raw window, and repeat.
 
 The rollout path currently supports only `window_mode: static`, which keeps the model input length equal to `input_sequence_length`. After every step, the oldest frame is dropped and the newly constructed next frame is appended.
 

@@ -437,7 +437,8 @@ def _run_single_rollout(
 		raise ValueError(f"exogenous_mode must be 'teacher_forced' or 'constant', got {exogenous_mode!r}.")
 	if int(dataset.prediction_horizon) != 1:
 		raise NotImplementedError(
-			"Autoregressive rollout currently requires prediction_horizon == 1 because each step advances the raw window by one frame."
+			"Autoregressive rollout currently requires prediction_horizon == 1 because each step advances the raw window by one frame. "
+			f"The configured/trained horizon is {int(dataset.prediction_horizon)}; use direct evaluation for this H-step target."
 		)
 
 	context = _dataset_context(dataset, split_sample_index)

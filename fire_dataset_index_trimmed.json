@@ -20,6 +20,19 @@
         168,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 2040,
+        "removed_end_frames": 0,
+        "removed_start_frames": 140,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 2039,
+        "trim_start_index": 140,
+        "trimmed_num_frames": 1900,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/ARCHIECREEK/keepz_08/ARCHM2M04ASC.terrain",
       "valid_for_energy_release": true
     },
@@ -43,6 +56,19 @@
         168,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 600,
+        "removed_end_frames": 0,
+        "removed_start_frames": 121,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 599,
+        "trim_start_index": 121,
+        "trimmed_num_frames": 479,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/CALWOOD/keepz_08/CALWD1M04ASC.terrain",
       "valid_for_energy_release": true
     },
@@ -66,6 +92,19 @@
         96,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 2055,
+        "removed_end_frames": 0,
+        "removed_start_frames": 14,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 2054,
+        "trim_start_index": 14,
+        "trimmed_num_frames": 2041,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/CAMP/keepz_08/CAMPA3M04ASC.terrain",
       "valid_for_energy_release": true
     },
@@ -89,6 +128,19 @@
         168,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 1017,
+        "removed_end_frames": 0,
+        "removed_start_frames": 8,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 1016,
+        "trim_start_index": 8,
+        "trimmed_num_frames": 1009,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/CARR_FIRENADO/keepz_08/CARRAAM04ASC.terrain",
       "valid_for_energy_release": true
     },
@@ -112,6 +164,19 @@
         168,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 585,
+        "removed_end_frames": 0,
+        "removed_start_frames": 25,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 584,
+        "trim_start_index": 25,
+        "trimmed_num_frames": 560,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/CARR_GROWTHDAY/keepz_08/CARRAAM04ASC.terrain",
       "valid_for_energy_release": true
     },
@@ -135,6 +200,19 @@
         168,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 1335,
+        "removed_end_frames": 0,
+        "removed_start_frames": 172,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 1334,
+        "trim_start_index": 172,
+        "trimmed_num_frames": 1163,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/CHIMNEYTOPS2/keepz_08/CT2A01M04ASC.terrain",
       "valid_for_energy_release": true
     },
@@ -158,6 +236,19 @@
         192,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 2067,
+        "removed_end_frames": 0,
+        "removed_start_frames": 4,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 2066,
+        "trim_start_index": 4,
+        "trimmed_num_frames": 2063,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/CREEK/keepz_08/CREEKAM04ASC.terrain",
       "valid_for_energy_release": true
     },
@@ -181,6 +272,19 @@
         192,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 960,
+        "removed_end_frames": 0,
+        "removed_start_frames": 45,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 959,
+        "trim_start_index": 45,
+        "trimmed_num_frames": 915,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/EASTTROUBLESOME/keepz_08/EASTT1M04ASC.terrain",
       "valid_for_energy_release": true
     },
@@ -204,6 +308,19 @@
         120,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 1110,
+        "removed_end_frames": 0,
+        "removed_start_frames": 0,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 1109,
+        "trim_start_index": 0,
+        "trimmed_num_frames": 1110,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/ESPERANZA/keepz_08/ESPBDWM05ASC.terrain",
       "valid_for_energy_release": true
     },
@@ -227,6 +344,19 @@
         72,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 2070,
+        "removed_end_frames": 0,
+        "removed_start_frames": 33,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 2069,
+        "trim_start_index": 33,
+        "trimmed_num_frames": 2037,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/GLASS/keepz_08/FRFCA1M04ASC.terrain",
       "valid_for_energy_release": true
     },
@@ -250,6 +380,19 @@
         144,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 2355,
+        "removed_end_frames": 0,
+        "removed_start_frames": 378,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 2354,
+        "trim_start_index": 378,
+        "trimmed_num_frames": 1977,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/KING/period1/keepz_08/KNG2V1M04ASC.terrain",
       "valid_for_energy_release": true
     },
@@ -273,6 +416,19 @@
         144,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 2760,
+        "removed_end_frames": 0,
+        "removed_start_frames": 3,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 2759,
+        "trim_start_index": 3,
+        "trimmed_num_frames": 2757,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/KING/period2/keepz_08/KINGNSM04ASC.terrain",
       "valid_for_energy_release": true
     },
@@ -296,6 +452,19 @@
         144,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 1518,
+        "removed_end_frames": 0,
+        "removed_start_frames": 2,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 1517,
+        "trim_start_index": 2,
+        "trimmed_num_frames": 1516,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/KING/period3/keepz_08/KING3AM04ASC.terrain",
       "valid_for_energy_release": true
     },
@@ -319,6 +488,19 @@
         120,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 2235,
+        "removed_end_frames": 0,
+        "removed_start_frames": 2,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 2234,
+        "trim_start_index": 2,
+        "trimmed_num_frames": 2233,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/LITTLEBEAR/lbvaa/keepz_08/LBVAA5M04ASC.terrain",
       "valid_for_energy_release": true
     },
@@ -342,6 +524,19 @@
         120,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 1500,
+        "removed_end_frames": 0,
+        "removed_start_frames": 13,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 1499,
+        "trim_start_index": 13,
+        "trimmed_num_frames": 1487,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/LITTLEBEAR/lbvab/keepz_08/LBVAB5M04ASC.terrain",
       "valid_for_energy_release": true
     },
@@ -365,6 +560,19 @@
         120,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 1110,
+        "removed_end_frames": 0,
+        "removed_start_frames": 1,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 1109,
+        "trim_start_index": 1,
+        "trimmed_num_frames": 1109,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/LITTLEBEAR/lbvac/keepz_08/LBVAC5M04ASC.terrain",
       "valid_for_energy_release": true
     },
@@ -388,6 +596,19 @@
         120,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 810,
+        "removed_end_frames": 0,
+        "removed_start_frames": 91,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 809,
+        "trim_start_index": 91,
+        "trimmed_num_frames": 719,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/MARSHALL/keepz_08/MARSHWM05ASC.terrain",
       "valid_for_energy_release": true
     },
@@ -411,6 +632,19 @@
         144,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 1305,
+        "removed_end_frames": 0,
+        "removed_start_frames": 31,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 1304,
+        "trim_start_index": 31,
+        "trimmed_num_frames": 1274,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/MCKINNEY/keepz_08/FRFCA1M04ASC.terrain",
       "valid_for_energy_release": true
     },
@@ -434,6 +668,19 @@
         90,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 2013,
+        "removed_end_frames": 0,
+        "removed_start_frames": 6,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 2012,
+        "trim_start_index": 6,
+        "trimmed_num_frames": 2007,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/MOSQUITO/keepz_08/FRFCA1M04ASC.terrain",
       "valid_for_energy_release": true
     },
@@ -457,6 +704,19 @@
         192,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 2040,
+        "removed_end_frames": 0,
+        "removed_start_frames": 10,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 2039,
+        "trim_start_index": 10,
+        "trimmed_num_frames": 2030,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/NORTHCOMPLX/keepz_08/NRTHA3M04ASC.terrain",
       "valid_for_energy_release": true
     },
@@ -480,6 +740,19 @@
         138,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 2040,
+        "removed_end_frames": 0,
+        "removed_start_frames": 60,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 2039,
+        "trim_start_index": 60,
+        "trimmed_num_frames": 1980,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/PARKCTY_HYPOTHETICAL/keepz_08/FRFCA1M04ASC.terrain",
       "valid_for_energy_release": true
     },
@@ -503,6 +776,19 @@
         192,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 1125,
+        "removed_end_frames": 0,
+        "removed_start_frames": 155,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 1124,
+        "trim_start_index": 155,
+        "trimmed_num_frames": 970,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/REDWOODVALLEY/keepz_08/RDVCF1M05ASC.terrain",
       "valid_for_energy_release": true
     },
@@ -526,6 +812,19 @@
         120,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 2070,
+        "removed_end_frames": 0,
+        "removed_start_frames": 30,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 2069,
+        "trim_start_index": 30,
+        "trimmed_num_frames": 2040,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/RIM/0820/keepz_08/RIMAB1M04ASC.terrain",
       "valid_for_energy_release": true
     },
@@ -549,6 +848,19 @@
         120,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 2025,
+        "removed_end_frames": 0,
+        "removed_start_frames": 30,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 2024,
+        "trim_start_index": 30,
+        "trimmed_num_frames": 1995,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/RIM/0822/keepz_08/RM822AM04ASC.terrain",
       "valid_for_energy_release": true
     },
@@ -572,6 +884,19 @@
         192,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 1780,
+        "removed_end_frames": 0,
+        "removed_start_frames": 223,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 1779,
+        "trim_start_index": 223,
+        "trimmed_num_frames": 1557,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/SLATER/keepz_08/SLATA1M04ASC.terrain",
       "valid_for_energy_release": true
     },
@@ -595,6 +920,19 @@
         72,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 1020,
+        "removed_end_frames": 0,
+        "removed_start_frames": 1,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 1019,
+        "trim_start_index": 1,
+        "trimmed_num_frames": 1019,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/SPRINGS/keepz_08/FRFCA1M04ASC.terrain",
       "valid_for_energy_release": true
     },
@@ -618,6 +956,19 @@
         144,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 2070,
+        "removed_end_frames": 0,
+        "removed_start_frames": 56,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 2069,
+        "trim_start_index": 56,
+        "trimmed_num_frames": 2014,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/THOMAS/1204/keepz_08/THONV2M04ASC.terrain",
       "valid_for_energy_release": true
     },
@@ -641,6 +992,19 @@
         144,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 2100,
+        "removed_end_frames": 0,
+        "removed_start_frames": 3,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 2099,
+        "trim_start_index": 3,
+        "trimmed_num_frames": 2097,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/THOMAS/1208/keepz_08/TH218IM04ASC.terrain",
       "valid_for_energy_release": true
     },
@@ -664,6 +1028,19 @@
         144,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 556,
+        "removed_end_frames": 0,
+        "removed_start_frames": 0,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 555,
+        "trim_start_index": 0,
+        "trimmed_num_frames": 556,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/THOMAS/1209/keepz_08/TH218IM04ASC.terrain",
       "valid_for_energy_release": true
     },
@@ -687,6 +1064,19 @@
         144,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 1305,
+        "removed_end_frames": 0,
+        "removed_start_frames": 33,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 1304,
+        "trim_start_index": 33,
+        "trimmed_num_frames": 1272,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/THOMAS/1210/keepz_08/TH218IM04ASC.terrain",
       "valid_for_energy_release": true
     },
@@ -710,6 +1100,19 @@
         144,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 367,
+        "removed_end_frames": 0,
+        "removed_start_frames": 60,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 366,
+        "trim_start_index": 60,
+        "trimmed_num_frames": 307,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/TRUCKEE_HYPOTHETICAL/keepz_08/FRFCA1M05ASC.terrain",
       "valid_for_energy_release": true
     },
@@ -733,6 +1136,19 @@
         72,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 1275,
+        "removed_end_frames": 0,
+        "removed_start_frames": 64,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 1274,
+        "trim_start_index": 64,
+        "trimmed_num_frames": 1211,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/TUOLUMNE_65/keepz_08/FRFCA1M04ASC.terrain",
       "valid_for_energy_release": true
     },
@@ -756,6 +1172,19 @@
         72,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 2010,
+        "removed_end_frames": 0,
+        "removed_start_frames": 73,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 2009,
+        "trim_start_index": 73,
+        "trimmed_num_frames": 1937,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/Tubbs/keepz_08/TUBBF1M04ASC.terrain",
       "valid_for_energy_release": true
     },
@@ -779,6 +1208,19 @@
         192,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 1871,
+        "removed_end_frames": 0,
+        "removed_start_frames": 50,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 1870,
+        "trim_start_index": 50,
+        "trimmed_num_frames": 1821,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/WITCHCREEK/keepz_08/WTHCK1M04ASC.terrain",
       "valid_for_energy_release": true
     },
@@ -802,6 +1244,19 @@
         120,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 2070,
+        "removed_end_frames": 0,
+        "removed_start_frames": 142,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 2069,
+        "trim_start_index": 142,
+        "trimmed_num_frames": 1928,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/WOOLSEY/keepz_08/WLS1A1M04ASC.terrain",
       "valid_for_energy_release": true
     },
@@ -825,11 +1280,33 @@
         120,
         86
       ],
+      "temporal_trim": {
+        "enabled": true,
+        "mode": "manual",
+        "original_num_frames": 910,
+        "removed_end_frames": 0,
+        "removed_start_frames": 10,
+        "selected_by": "manual_trim_fire_datasets.py",
+        "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+        "trim_end_index": 909,
+        "trim_start_index": 10,
+        "trimmed_num_frames": 900,
+        "updated_at": "2026-07-21T04:57:14+00:00"
+      },
       "terrain_path": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE/YUBA_HYPOTHETICAL/keepz_08/YUBFT1M04ASC.terrain",
       "valid_for_energy_release": true
     }
   },
+  "last_manual_fire_trim_updated": "2026-07-21T04:57:14+00:00",
   "last_updated": "2026-07-20T21:53:04+00:00",
   "main_data_dir": "/project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE",
-  "num_fires": 36
+  "num_fires": 36,
+  "temporal_trim": {
+    "enabled": true,
+    "mode": "manual",
+    "source_index": "/home/mhabibp/fire_forecasting/fire_dataset_index.json",
+    "stores_frame_paths": false,
+    "trim_config": "/home/mhabibp/fire_forecasting/configs/manual_fire_trim.json",
+    "updated_at": "2026-07-21T04:57:14+00:00"
+  }
 }

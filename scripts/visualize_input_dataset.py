@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import re
 import sys
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+os.environ.setdefault("MPLCONFIGDIR", str(PROJECT_ROOT / "artifacts" / "matplotlib"))
+Path(os.environ["MPLCONFIGDIR"]).mkdir(parents=True, exist_ok=True)
 
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button

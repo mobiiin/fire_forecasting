@@ -16,7 +16,7 @@ from src.training.losses import get_loss_function
 def _config() -> dict:
 	return {
 		"task_type": "multitask",
-		"input_sequence_length": 6,
+		"input_sequence_length": 5,
 		"model": {
 			"architecture": "st_mamba_lite",
 			"name": "st_mamba_lite",
@@ -24,7 +24,7 @@ def _config() -> dict:
 			"output_channels": 4,
 		},
 		"st_mamba_lite": {
-			"input_sequence_length": 6,
+			"input_sequence_length": 5,
 			"patch_size": 64,
 			"embed_dim": 32,
 			"encoder_channels": [32, 64],
@@ -82,7 +82,7 @@ def _config() -> dict:
 
 def test_st_mamba_lite_forward_shape() -> None:
 	model = build_model_from_config(_config(), input_channels=129)
-	x = torch.randn(2, 6, 129, 64, 64)
+	x = torch.randn(2, 5, 129, 64, 64)
 	y = model(x)
 	assert tuple(y.shape) == (2, 4, 64, 64)
 
@@ -106,14 +106,14 @@ def test_st_mamba_block_preserves_shape() -> None:
 		mlp_ratio=2.0,
 		gradient_checkpointing=False,
 	)
-	x = torch.randn(2, 6, 64, 64, 64)
+	x = torch.randn(2, 5, 64, 64, 64)
 	y = block(x)
 	assert tuple(y.shape) == tuple(x.shape)
 
 
 @pytest.mark.parametrize("route", ["HVT", "TVH"])
 def test_scan_route_roundtrip(route: str) -> None:
-	x = torch.randn(2, 6, 8, 4, 5)
+	x = torch.randn(2, 5, 8, 4, 5)
 	sequence = flatten_by_route(x, route)
 	restored = unflatten_by_route(sequence, route, tuple(int(value) for value in x.shape))
 	assert torch.equal(restored, x)
@@ -131,7 +131,7 @@ def test_bidirectional_scan_preserves_shape() -> None:
 		bidirectional_scan=True,
 		use_st_mixer=False,
 	)
-	x = torch.randn(2, 6, 32, 8, 8)
+	x = torch.randn(2, 5, 32, 8, 8)
 	y = layer(x)
 	assert tuple(y.shape) == tuple(x.shape)
 
@@ -141,8 +141,16 @@ def test_model_factory_returns_st_mamba_lite() -> None:
 	assert isinstance(model, STMamba)
 
 
+def test_model_factory_accepts_cawfe_st_mamba_alias() -> None:
+	config = _config()
+	config["model"]["architecture"] = "cawfe_st_mamba"
+	config["model"]["name"] = "cawfe_st_mamba"
+	model = build_model_from_config(config, input_channels=129)
+	assert isinstance(model, STMamba)
+
+
 def test_input_adapter_returns_unchanged_sequence() -> None:
-	x = torch.randn(2, 6, 129, 64, 64)
+	x = torch.randn(2, 5, 129, 64, 64)
 	y = adapt_input_for_architecture(x, "st_mamba_lite")
 	assert y is x
 
@@ -151,7 +159,7 @@ def test_one_training_step_has_finite_gradients() -> None:
 	config = _config()
 	model = build_model_from_config(config, input_channels=129)
 	criterion = get_loss_function(config)
-	x = torch.randn(2, 6, 129, 64, 64)
+	x = torch.randn(2, 5, 129, 64, 64)
 	target = torch.randn(2, 4, 64, 64)
 	target[:, 2] = torch.randint(0, 2, size=(2, 64, 64)).to(torch.float32)
 	prediction = model(x)

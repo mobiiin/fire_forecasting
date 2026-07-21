@@ -39,6 +39,10 @@ def main() -> None:
 	)
 	print(f"method: {result['method']}")
 	print(f"split: {result['split']}")
+	sequence = result.get("sequence", {})
+	if sequence:
+		print(f"input_sequence_length: {sequence.get('input_sequence_length')}")
+		print(f"prediction_horizon: {sequence.get('prediction_horizon')}")
 	print(f"num_samples: {result['num_samples']}")
 	for metric_name, metric_value in sorted(result["aggregate_results"].items()):
 		print(f"{metric_name}: {metric_value:.6f}")

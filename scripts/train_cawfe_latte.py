@@ -51,7 +51,7 @@ def _print_model_summary(config: dict) -> None:
 	model = build_model_from_config(config, input_channels=input_channels)
 	parameter_count = sum(parameter.numel() for parameter in model.parameters())
 	section = config.get("cawfe_latte", {})
-	sequence_length = int(section.get("input_sequence_length", config.get("input_sequence_length", 6)))
+	sequence_length = int(section.get("input_sequence_length", config.get("input_sequence_length", 5)))
 	patch_size = int(section.get("patch_size", config.get("patch_size", 64)))
 	output_channels = int(config.get("model", {}).get("output_channels", 4))
 	print("architecture: cawfe_latte")

@@ -53,7 +53,7 @@ def _smoke_forward(config: dict, architecture: str) -> dict[str, str]:
 	if torch is None:
 		return {"status": "skipped", "detail": "PyTorch not installed"}
 	section = config.get(architecture, {})
-	sequence_length = int(section.get("input_sequence_length", config.get("input_sequence_length", 6))) if isinstance(section, dict) else int(config.get("input_sequence_length", 6))
+	sequence_length = int(section.get("input_sequence_length", config.get("input_sequence_length", 5))) if isinstance(section, dict) else int(config.get("input_sequence_length", 5))
 	input_channels = int(config.get("model", {}).get("input_channels", config.get("input_channel_count", 129)))
 	output_channels = int(config.get("model", {}).get("output_channels", 4))
 	patch_size = int(section.get("patch_size", config.get("patch_size", 64))) if isinstance(section, dict) else int(config.get("patch_size", 64))

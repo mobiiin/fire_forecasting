@@ -18,7 +18,7 @@ from scripts.evaluate_trained_models import (
 )
 from src.data.dataset import metadata_batch_to_list
 from src.evaluation.run_discovery import discover_runs, find_best_run
-from src.models.evaluation import _validate_checkpoint_architecture
+from src.models.evaluation import _validate_checkpoint_architecture, _validate_checkpoint_sequence
 
 
 def _fake_run(
@@ -95,6 +95,23 @@ def test_find_best_run_selects_higher_dice_when_max(tmp_path: Path) -> None:
 def test_checkpoint_architecture_mismatch_raises() -> None:
 	with pytest.raises(ValueError, match="Checkpoint architecture mismatch"):
 		_validate_checkpoint_architecture({"architecture": "earthformer_lite"}, "convlstm_unet", Path("best_model.pt"))
+
+
+def test_checkpoint_sequence_mismatch_raises() -> None:
+	config = {
+		"input_sequence_length": 5,
+		"prediction_horizon": 10,
+		"cache": {"target_definition_version": "interval_consumed_current_to_horizon_target_v1"},
+	}
+	checkpoint = {
+		"input_sequence_length": 6,
+		"prediction_horizon": 1,
+		"target_offset_from_start": 6,
+		"target_offset_from_last_input": 1,
+		"target_definition_version": "interval_consumed_current_to_horizon_target_v1",
+	}
+	with pytest.raises(ValueError, match="Checkpoint sequence metadata mismatch"):
+		_validate_checkpoint_sequence(checkpoint, config, Path("best_model.pt"))
 
 
 def test_paper_metrics_csv_has_exact_required_columns(tmp_path: Path) -> None:

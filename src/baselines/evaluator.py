@@ -25,7 +25,7 @@ except ImportError:  # pragma: no cover - environment-specific fallback
 
 from src.config import load_config
 from src.data.cached_patch_dataset import CachedPatchDataset
-from src.data.cache import get_patch_cache_dir
+from src.data.cache import get_patch_cache_dir, target_definition_version, temporal_target_offsets
 from src.data.dataset import MultiFirePatchSequenceDataset, metadata_batch_to_list
 from src.data.discovery import discover_multiple_datasets
 from src.data.patching import resolve_patching_config, resolve_split_patch_mode
@@ -39,6 +39,17 @@ from src.baselines.common import ensure_geometry, ensure_initial_fuel, resolve_p
 
 
 BaselinePredictor = Callable[[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any], Mapping[str, int] | None], np.ndarray]
+
+
+def _sequence_metadata(config: Mapping[str, Any]) -> dict[str, Any]:
+	offsets = temporal_target_offsets(config)
+	return {
+		"input_sequence_length": int(config["input_sequence_length"]),
+		"prediction_horizon": int(config["prediction_horizon"]),
+		"target_offset_from_start": int(offsets["target_offset_from_start"]),
+		"target_offset_from_last_input": int(offsets["target_offset_from_last_input"]),
+		"target_definition_version": target_definition_version(config),
+	}
 
 
 def _deep_merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
@@ -441,6 +452,7 @@ def evaluate_baseline(
 		per_dataset_results[dataset_name] = row
 
 	rows: list[dict[str, Any]] = []
+	sequence_metadata = _sequence_metadata(config)
 	rows.append(
 		{
 			"method": method_name,
@@ -448,6 +460,7 @@ def evaluate_baseline(
 			"scope": "aggregate",
 			"dataset_name": "",
 			"num_samples": total_samples,
+			**sequence_metadata,
 			**aggregate_results,
 		}
 	)
@@ -458,6 +471,7 @@ def evaluate_baseline(
 				"split": split,
 				"scope": "per_fire",
 				"dataset_name": dataset_name,
+				**sequence_metadata,
 				**per_dataset_results[dataset_name],
 			}
 		)
@@ -469,6 +483,7 @@ def evaluate_baseline(
 		"method": method_name,
 		"split": split,
 		"num_samples": total_samples,
+		"sequence": sequence_metadata,
 		"aggregate_results": aggregate_results,
 		"per_dataset_results": per_dataset_results,
 		"rows": rows,

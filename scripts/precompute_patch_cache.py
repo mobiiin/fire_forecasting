@@ -18,7 +18,18 @@ except ImportError:  # pragma: no cover - optional .pt shards
 	torch = None
 
 from src.config import load_config
-from src.data.cache import MANIFEST_FILENAME, compute_cache_config_hash, get_patch_cache_dir, load_cache_manifest
+from src.data.cache import (
+	MANIFEST_FILENAME,
+	compute_cache_config_hash,
+	compute_current_trim_metadata_hash,
+	compute_dataset_index_hash,
+	extract_temporal_trim_manifest,
+	get_patch_cache_dir,
+	load_cache_manifest,
+	resolve_dataset_index_path,
+	target_definition_version,
+	temporal_target_offsets,
+)
 from src.data.dataset import MultiFirePatchSequenceDataset
 from src.data.discovery import discover_multiple_datasets
 from src.data.energy_release import resolve_energy_output_channel_names, resolve_energy_release_config
@@ -160,6 +171,36 @@ def _parse_sample_id(sample_id: str) -> tuple[str, int | None, int | None, int |
 	return fire_name, sample_index, patch_y0, patch_x0
 
 
+def _sequence_metadata(sample_index: int, config: Mapping[str, Any]) -> dict[str, Any]:
+	input_sequence_length = int(config["input_sequence_length"])
+	prediction_horizon = int(config["prediction_horizon"])
+	start_idx = int(sample_index)
+	last_input_idx = start_idx + input_sequence_length - 1
+	target_idx = last_input_idx + prediction_horizon
+	offsets = temporal_target_offsets(config)
+	return {
+		"start_idx": start_idx,
+		"input_indices": list(range(start_idx, start_idx + input_sequence_length)),
+		"last_input_idx": int(last_input_idx),
+		"target_idx": int(target_idx),
+		"current_idx": int(last_input_idx),
+		"future_idx": int(target_idx),
+		"current_index": int(last_input_idx),
+		"future_index": int(target_idx),
+		"input_sequence_length": input_sequence_length,
+		"prediction_horizon": prediction_horizon,
+		"target_offset_from_start": int(offsets["target_offset_from_start"]),
+		"target_offset_from_last_input": int(offsets["target_offset_from_last_input"]),
+		"target_definition_version": target_definition_version(config),
+	}
+
+
+def _with_sequence_metadata(row: Mapping[str, Any], sample_index: int, config: Mapping[str, Any]) -> dict[str, Any]:
+	item = dict(row)
+	item.update(_sequence_metadata(sample_index, config))
+	return item
+
+
 def _complete_metadata_rows_from_npz_shard(
 	shard_path: Path,
 	split: str,
@@ -183,12 +224,13 @@ def _complete_metadata_rows_from_npz_shard(
 		for offset, row in enumerate(existing_rows)
 	}
 	shard_name = shard_path.name
-	input_sequence_length = int(config["input_sequence_length"])
-	prediction_horizon = int(config["prediction_horizon"])
 	completed: list[dict[str, Any]] = []
 	for local_index in range(num_samples):
 		if local_index in rows_by_local_index:
 			item = dict(rows_by_local_index[local_index])
+			sample_index = int(item.get("sample_index", item.get("start_idx", -1)))
+			if sample_index >= 0:
+				item.update(_sequence_metadata(sample_index, config))
 			item["shard"] = f"{split}/{shard_name}"
 			item["local_index"] = int(local_index)
 			completed.append(item)
@@ -201,32 +243,27 @@ def _complete_metadata_rows_from_npz_shard(
 		patch_x0 = patch_x0_values[local_index] if patch_x0_values is not None else parsed_x0
 		if sample_index is None or patch_y0 is None or patch_x0 is None:
 			raise ValueError(f"Cannot reconstruct metadata for {shard_path} local_index={local_index}.")
-		current_idx = int(sample_index) + input_sequence_length - 1
-		future_idx = current_idx + prediction_horizon
 		patch_h = int(y_shape[-2])
 		patch_w = int(y_shape[-1])
-		completed.append(
-			{
-				"split": split,
-				"fire_name": fire_name,
-				"dataset_id": int(dataset_ids[local_index]) if dataset_ids is not None else -1,
-				"sample_index": int(sample_index),
-				"current_idx": int(current_idx),
-				"future_idx": int(future_idx),
-				"patch": {
-					"y0": int(patch_y0),
-					"y1": int(patch_y0) + patch_h,
-					"x0": int(patch_x0),
-					"x1": int(patch_x0) + patch_w,
-				},
-				"patch_type": "reconstructed",
-				"x_shape": [int(value) for value in x_shape[1:]],
-				"y_shape": [int(value) for value in y_shape[1:]],
-				"sample_id": sample_id or f"{split}:{fire_name}:{sample_index}:{patch_y0}:{patch_x0}",
-				"shard": f"{split}/{shard_name}",
-				"local_index": int(local_index),
-			}
-		)
+		item = {
+			"split": split,
+			"fire_name": fire_name,
+			"dataset_id": int(dataset_ids[local_index]) if dataset_ids is not None else -1,
+			"sample_index": int(sample_index),
+			"patch": {
+				"y0": int(patch_y0),
+				"y1": int(patch_y0) + patch_h,
+				"x0": int(patch_x0),
+				"x1": int(patch_x0) + patch_w,
+			},
+			"patch_type": "reconstructed",
+			"x_shape": [int(value) for value in x_shape[1:]],
+			"y_shape": [int(value) for value in y_shape[1:]],
+			"sample_id": sample_id or f"{split}:{fire_name}:{sample_index}:{patch_y0}:{patch_x0}",
+			"shard": f"{split}/{shard_name}",
+			"local_index": int(local_index),
+		}
+		completed.append(_with_sequence_metadata(item, int(sample_index), config))
 	return completed
 
 
@@ -290,7 +327,13 @@ def _materialize_legacy_shard_metadata(
 		shard_index += 1
 
 
-def _discover_completed_shards(split_dir: Path, shard_format: str, *, validate_shard_shapes: bool = False) -> list[dict[str, Any]]:
+def _discover_completed_shards(
+	split_dir: Path,
+	shard_format: str,
+	*,
+	validate_shard_shapes: bool = False,
+	config: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
 	completed: list[dict[str, Any]] = []
 	if not split_dir.exists():
 		return completed
@@ -302,6 +345,26 @@ def _discover_completed_shards(split_dir: Path, shard_format: str, *, validate_s
 		metadata_rows = _read_metadata_rows(metadata_path)
 		if not metadata_rows:
 			break
+		if config is not None:
+			enriched_rows: list[dict[str, Any]] = []
+			changed = False
+			for row in metadata_rows:
+				item = dict(row)
+				sample_index = item.get("sample_index", item.get("start_idx"))
+				try:
+					sample_index_int = int(sample_index)
+				except (TypeError, ValueError):
+					enriched_rows.append(item)
+					continue
+				enriched = _with_sequence_metadata(item, sample_index_int, config)
+				changed = changed or enriched != item
+				enriched_rows.append(enriched)
+			if changed:
+				_atomic_write_text(
+					metadata_path,
+					"".join(json.dumps(row, sort_keys=True) + "\n" for row in enriched_rows),
+				)
+			metadata_rows = enriched_rows
 		num_samples = int(len(metadata_rows))
 		if validate_shard_shapes:
 			shard_samples = _read_shard_num_samples(shard_path, shard_format)
@@ -478,14 +541,26 @@ def _base_manifest(
 	energy_release = resolve_energy_release_config(config)
 	energy_names = resolve_energy_output_channel_names(config)
 	cache_config = _get_section(config, "cache")
+	target_offsets = temporal_target_offsets(config)
+	dataset_index_path = resolve_dataset_index_path(config)
+	trim_manifest = extract_temporal_trim_manifest(dataset_records)
 	return {
 		"cache_version": str(cache_config.get("cache_version", "v1")),
 		"created_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
 		"config_hash": compute_cache_config_hash(config),
+		"dataset_index_path": str(dataset_index_path) if dataset_index_path is not None else None,
+		"trimmed_index_path": str(dataset_index_path) if dataset_index_path is not None else None,
+		"dataset_index_hash": compute_dataset_index_hash(config),
+		"trim_metadata_hash": compute_current_trim_metadata_hash(config),
+		"temporal_trim_enabled": bool(trim_manifest["temporal_trim_enabled"]),
+		"fires": trim_manifest["fires"],
 		"split_mode": str(config.get("split_mode", "train_val_test")),
 		"manual_fire_split": _get_section(config, "manual_fire_split"),
 		"input_sequence_length": int(config["input_sequence_length"]),
 		"prediction_horizon": int(config["prediction_horizon"]),
+		"target_offset_from_start": int(target_offsets["target_offset_from_start"]),
+		"target_offset_from_last_input": int(target_offsets["target_offset_from_last_input"]),
+		"target_definition_version": target_definition_version(config),
 		"input_channels": int(dataset.total_input_channels),
 		"base_input_channel_count": int(dataset.base_input_channel_count),
 		"fuel_flux_engineered_channel_count": int(dataset.fuel_flux_engineered_channel_count),
@@ -529,6 +604,8 @@ def _base_manifest(
 				"dataset_name": str(record["dataset_name"]),
 				"data_dir": str(record["data_dir"]),
 				"num_files": int(record["num_files"]),
+				"effective_num_files": int(record.get("effective_num_files", record["num_files"])),
+				"temporal_trim": dict(record.get("temporal_trim", {})),
 				"raw_shape": [int(value) for value in record["raw_shape"]],
 			}
 			for record in dataset_records
@@ -567,13 +644,38 @@ def _metadata_row(
 	config: Mapping[str, Any],
 ) -> dict[str, Any]:
 	patch = _patch_from_metadata(metadata, y_array)
+	sequence_row = _sequence_metadata(int(metadata.get("sample_index", -1)), config)
+	for key in (
+		"start_idx",
+		"input_indices",
+		"last_input_idx",
+		"target_idx",
+		"current_idx",
+		"future_idx",
+		"current_index",
+		"future_index",
+		"local_start_idx",
+		"local_input_indices",
+		"local_last_input_idx",
+		"local_target_idx",
+		"original_start_idx",
+		"original_input_indices",
+		"original_last_input_idx",
+		"original_target_idx",
+		"trim_start_index",
+		"trim_end_index",
+		"trimmed_num_frames",
+		"original_num_frames",
+		"temporal_trim_enabled",
+	):
+		if key in metadata:
+			sequence_row[key] = metadata[key]
 	row = {
 		"split": split,
 		"fire_name": str(metadata.get("dataset_name", metadata.get("data_dir", ""))),
 		"dataset_id": int(metadata.get("dataset_id", -1)),
 		"sample_index": int(metadata.get("sample_index", -1)),
-		"current_idx": int(metadata.get("current_idx", metadata.get("current_index", -1))),
-		"future_idx": int(metadata.get("future_idx", metadata.get("future_index", -1))),
+		**sequence_row,
 		"patch": patch,
 		"patch_type": _patch_type(split, metadata, y_array, config),
 		"x_shape": [int(value) for value in x_array.shape],
@@ -735,8 +837,19 @@ def _rebuild_summary_csv(cache_dir: Path) -> None:
 		"fire_name",
 		"shard",
 		"sample_index",
+		"start_idx",
+		"local_start_idx",
+		"original_start_idx",
+		"last_input_idx",
+		"target_idx",
+		"original_last_input_idx",
+		"original_target_idx",
+		"trim_start_index",
+		"trim_end_index",
 		"current_idx",
 		"future_idx",
+		"input_sequence_length",
+		"prediction_horizon",
 		"patch_y0",
 		"patch_x0",
 		"patch_type",
@@ -761,8 +874,19 @@ def _rebuild_summary_csv(cache_dir: Path) -> None:
 						"fire_name": item.get("fire_name"),
 						"shard": item.get("shard"),
 						"sample_index": item.get("sample_index"),
+						"start_idx": item.get("start_idx"),
+						"local_start_idx": item.get("local_start_idx"),
+						"original_start_idx": item.get("original_start_idx"),
+						"last_input_idx": item.get("last_input_idx"),
+						"target_idx": item.get("target_idx"),
+						"original_last_input_idx": item.get("original_last_input_idx"),
+						"original_target_idx": item.get("original_target_idx"),
+						"trim_start_index": item.get("trim_start_index"),
+						"trim_end_index": item.get("trim_end_index"),
 						"current_idx": item.get("current_idx"),
 						"future_idx": item.get("future_idx"),
+						"input_sequence_length": item.get("input_sequence_length"),
+						"prediction_horizon": item.get("prediction_horizon"),
 						"patch_y0": patch.get("y0"),
 						"patch_x0": patch.get("x0"),
 						"patch_type": item.get("patch_type"),
@@ -798,7 +922,7 @@ def _precompute_split(
 	shard_format = str(cache_config.get("shard_format", "npz")).lower()
 	if save_metadata:
 		_materialize_legacy_shard_metadata(split_dir, split, shard_format, config)
-	existing_shards = _discover_completed_shards(split_dir, shard_format)
+	existing_shards = _discover_completed_shards(split_dir, shard_format, config=config)
 	existing_manifest_shards = [
 		{
 			"path": f"{split}/{Path(str(item['path'])).name}",
@@ -1004,10 +1128,19 @@ def main() -> None:
 			)
 		for key in (
 			"cache_version",
+			"dataset_index_path",
+			"trimmed_index_path",
+			"dataset_index_hash",
+			"trim_metadata_hash",
+			"temporal_trim_enabled",
+			"fires",
 			"split_mode",
 			"manual_fire_split",
 			"input_sequence_length",
 			"prediction_horizon",
+			"target_offset_from_start",
+			"target_offset_from_last_input",
+			"target_definition_version",
 			"input_channels",
 			"base_input_channel_count",
 			"fuel_flux_engineered_channel_count",
@@ -1056,6 +1189,14 @@ def main() -> None:
 	print("Cache patch mode:")
 	for split in ("train", "val", "test"):
 		print(f"  {split}: {resolve_split_patch_mode(config, split)} stride={resolve_split_patch_stride(config, split)}")
+	target_offsets = temporal_target_offsets(config)
+	print(
+		"Temporal target: "
+		f"input_sequence_length={int(config['input_sequence_length'])} "
+		f"prediction_horizon={int(config['prediction_horizon'])} "
+		f"target_offset_from_start={target_offsets['target_offset_from_start']} "
+		f"target_definition_version={target_definition_version(config)}"
+	)
 
 	manifest["created_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 	manifest["config_hash"] = compute_cache_config_hash(config)

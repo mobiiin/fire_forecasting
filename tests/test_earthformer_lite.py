@@ -13,7 +13,7 @@ from src.training.losses import get_loss_function
 def _config() -> dict:
 	return {
 		"task_type": "multitask",
-		"input_sequence_length": 6,
+		"input_sequence_length": 5,
 		"model": {
 			"architecture": "earthformer_lite",
 			"name": "earthformer_lite",
@@ -21,7 +21,7 @@ def _config() -> dict:
 			"output_channels": 4,
 		},
 		"earthformer_lite": {
-			"input_sequence_length": 6,
+			"input_sequence_length": 5,
 			"patch_size": 64,
 			"embed_dim": 32,
 			"depths": [1, 1],
@@ -70,7 +70,7 @@ def _config() -> dict:
 def test_earthformer_lite_forward_shape() -> None:
 	config = _config()
 	model = build_model_from_config(config, input_channels=129)
-	x = torch.randn(2, 6, 129, 64, 64)
+	x = torch.randn(2, 5, 129, 64, 64)
 	y = model(x)
 	assert tuple(y.shape) == (2, 4, 64, 64)
 
@@ -86,7 +86,7 @@ def test_axial_cuboid_attention_block_preserves_shape() -> None:
 		use_global_vectors=True,
 		num_global_vectors=4,
 	)
-	x = torch.randn(2, 6, 64, 64, 64)
+	x = torch.randn(2, 5, 64, 64, 64)
 	y = block(x)
 	assert tuple(y.shape) == tuple(x.shape)
 
@@ -96,7 +96,7 @@ def test_patch_size_divisibility_validation() -> None:
 		EarthformerLite(
 			input_channels=129,
 			output_channels=4,
-			input_sequence_length=6,
+			input_sequence_length=5,
 			patch_size=72,
 			embed_dim=32,
 			depths=[1, 1],
@@ -123,7 +123,7 @@ def test_one_training_step_has_finite_gradients() -> None:
 	config = _config()
 	model = build_model_from_config(config, input_channels=129)
 	criterion = get_loss_function(config)
-	x = torch.randn(2, 6, 129, 64, 64)
+	x = torch.randn(2, 5, 129, 64, 64)
 	target = torch.randn(2, 4, 64, 64)
 	target[:, 2] = torch.randint(0, 2, size=(2, 64, 64)).to(torch.float32)
 	prediction = model(x)

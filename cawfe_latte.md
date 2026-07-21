@@ -7,7 +7,7 @@ CAWFE-Latte is the custom paper architecture for this project. CAWFE data are no
 Canonical input:
 
 ```text
-X: (B, 6, 129, 64, 64)
+X: (B, 5, 129, 64, 64)
 ```
 
 Canonical output:
@@ -24,6 +24,8 @@ Output channels:
 - `pred[:, 3]`: `log1p` energy release total MW
 
 The model does not apply sigmoid to the mask channel.
+
+The default target is a 10-frame horizon after the last input frame. With input frames `s..s+4`, the model predicts target frame `s+14`. Surface and canopy consumed-fuel targets are computed between frame `s+4` and frame `s+14`; the mask and energy target come from frame `s+14`.
 
 ## CAWFE-Latte-Lite Architecture
 

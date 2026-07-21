@@ -15,7 +15,7 @@ from src.training.losses import get_loss_function
 def _config() -> dict:
 	return {
 		"task_type": "multitask",
-		"input_sequence_length": 6,
+		"input_sequence_length": 5,
 		"model": {
 			"architecture": "weatherformer_lite",
 			"name": "weatherformer_lite",
@@ -23,7 +23,7 @@ def _config() -> dict:
 			"output_channels": 4,
 		},
 		"weatherformer_lite": {
-			"input_sequence_length": 6,
+			"input_sequence_length": 5,
 			"patch_size": 64,
 			"embed_dim": 32,
 			"encoder_channels": [32, 64],
@@ -85,7 +85,7 @@ def _config() -> dict:
 
 def test_weatherformer_lite_forward_shape() -> None:
 	model = build_model_from_config(_config(), input_channels=129)
-	x = torch.randn(2, 6, 129, 64, 64)
+	x = torch.randn(2, 5, 129, 64, 64)
 	y = model(x)
 	assert tuple(y.shape) == (2, 4, 64, 64)
 
@@ -104,7 +104,7 @@ def test_factorized_weatherformer_block_preserves_shape() -> None:
 		drop_path=0.0,
 		gradient_checkpointing=False,
 	)
-	x = torch.randn(2, 6, 64, 16, 16)
+	x = torch.randn(2, 5, 64, 16, 16)
 	y = block(x)
 	assert tuple(y.shape) == tuple(x.shape)
 
@@ -121,7 +121,7 @@ def test_patch_size_divisibility_validation() -> None:
 		WeatherFormerLite(
 			input_channels=129,
 			output_channels=4,
-			input_sequence_length=6,
+			input_sequence_length=5,
 			patch_size=72,
 			embed_dim=32,
 			encoder_channels=[32, 64],
@@ -154,7 +154,7 @@ def test_model_factory_returns_weatherformer_lite() -> None:
 
 
 def test_input_adapter_returns_unchanged_sequence() -> None:
-	x = torch.randn(2, 6, 129, 64, 64)
+	x = torch.randn(2, 5, 129, 64, 64)
 	y = adapt_input_for_architecture(x, "weatherformer_lite")
 	assert y is x
 
@@ -163,7 +163,7 @@ def test_one_training_step_has_finite_gradients() -> None:
 	config = _config()
 	model = build_model_from_config(config, input_channels=129)
 	criterion = get_loss_function(config)
-	x = torch.randn(2, 6, 129, 64, 64)
+	x = torch.randn(2, 5, 129, 64, 64)
 	target = torch.randn(2, 4, 64, 64)
 	target[:, 2] = torch.randint(0, 2, size=(2, 64, 64)).to(torch.float32)
 	prediction = model(x)

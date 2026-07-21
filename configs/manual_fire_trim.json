@@ -1,0 +1,259 @@
+{
+  "fires": {
+    "ARCHIECREEK": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 140,
+      "updated_at": "2026-07-21T04:46:35+00:00"
+    },
+    "CALWOOD": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 121,
+      "updated_at": "2026-07-21T04:47:12+00:00"
+    },
+    "CAMP": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 14,
+      "updated_at": "2026-07-21T04:47:54+00:00"
+    },
+    "CARR_FIRENADO": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 8,
+      "updated_at": "2026-07-21T04:48:14+00:00"
+    },
+    "CARR_GROWTHDAY": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 25,
+      "updated_at": "2026-07-21T04:48:27+00:00"
+    },
+    "CHIMNEYTOPS2": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 172,
+      "updated_at": "2026-07-21T04:48:51+00:00"
+    },
+    "CREEK": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 4,
+      "updated_at": "2026-07-21T04:49:04+00:00"
+    },
+    "EASTTROUBLESOME": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 45,
+      "updated_at": "2026-07-21T04:49:19+00:00"
+    },
+    "ESPERANZA": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 0,
+      "updated_at": "2026-07-21T04:49:34+00:00"
+    },
+    "GLASS": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 33,
+      "updated_at": "2026-07-21T04:49:55+00:00"
+    },
+    "KING__period1__keepz_08": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 378,
+      "updated_at": "2026-07-21T04:50:28+00:00"
+    },
+    "KING__period2__keepz_08": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 3,
+      "updated_at": "2026-07-21T04:50:41+00:00"
+    },
+    "KING__period3__keepz_08": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 2,
+      "updated_at": "2026-07-21T04:50:53+00:00"
+    },
+    "LITTLEBEAR__lbvaa__keepz_08": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 2,
+      "updated_at": "2026-07-21T04:51:04+00:00"
+    },
+    "LITTLEBEAR__lbvab__keepz_08": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 13,
+      "updated_at": "2026-07-21T04:51:15+00:00"
+    },
+    "LITTLEBEAR__lbvac__keepz_08": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 1,
+      "updated_at": "2026-07-21T04:51:23+00:00"
+    },
+    "MARSHALL": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 91,
+      "updated_at": "2026-07-21T04:51:36+00:00"
+    },
+    "MCKINNEY": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 31,
+      "updated_at": "2026-07-21T04:51:46+00:00"
+    },
+    "MOSQUITO": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 6,
+      "updated_at": "2026-07-21T04:52:04+00:00"
+    },
+    "NORTHCOMPLX": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 10,
+      "updated_at": "2026-07-21T04:52:19+00:00"
+    },
+    "PARKCTY_HYPOTHETICAL": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 60,
+      "updated_at": "2026-07-21T04:52:37+00:00"
+    },
+    "REDWOODVALLEY": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 155,
+      "updated_at": "2026-07-21T04:52:59+00:00"
+    },
+    "RIM__0820__keepz_08": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 30,
+      "updated_at": "2026-07-21T04:53:14+00:00"
+    },
+    "RIM__0822__keepz_08": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 30,
+      "updated_at": "2026-07-21T04:53:26+00:00"
+    },
+    "SLATER": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 223,
+      "updated_at": "2026-07-21T04:53:51+00:00"
+    },
+    "SPRINGS": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 1,
+      "updated_at": "2026-07-21T04:54:03+00:00"
+    },
+    "THOMAS__1204__keepz_08": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 56,
+      "updated_at": "2026-07-21T04:54:20+00:00"
+    },
+    "THOMAS__1208__keepz_08": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 3,
+      "updated_at": "2026-07-21T04:54:31+00:00"
+    },
+    "THOMAS__1209__keepz_08": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 0,
+      "updated_at": "2026-07-21T04:54:54+00:00"
+    },
+    "THOMAS__1210__keepz_08": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 33,
+      "updated_at": "2026-07-21T04:55:04+00:00"
+    },
+    "TRUCKEE_HYPOTHETICAL": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 60,
+      "updated_at": "2026-07-21T04:55:20+00:00"
+    },
+    "TUOLUMNE_65": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 64,
+      "updated_at": "2026-07-21T04:55:33+00:00"
+    },
+    "Tubbs": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 73,
+      "updated_at": "2026-07-21T04:55:46+00:00"
+    },
+    "WITCHCREEK": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 50,
+      "updated_at": "2026-07-21T04:56:01+00:00"
+    },
+    "WOOLSEY": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 142,
+      "updated_at": "2026-07-21T04:56:19+00:00"
+    },
+    "YUBA_HYPOTHETICAL": {
+      "notes": "",
+      "selected_with": "manual_trim_fire_datasets.py",
+      "trim_end_index": null,
+      "trim_start_index": 10,
+      "updated_at": "2026-07-21T04:57:14+00:00"
+    }
+  },
+  "source_index": "/home/mhabibp/fire_forecasting/fire_dataset_index.json",
+  "updated_at": "2026-07-21T04:57:14+00:00",
+  "version": "manual_fire_trim_v1"
+}

@@ -6,7 +6,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from src.data.cache import MANIFEST_FILENAME, _compute_legacy_cache_config_hash, compute_cache_config_hash, validate_patch_cache
+from src.data.cache import (
+	MANIFEST_FILENAME,
+	_compute_legacy_cache_config_hash,
+	compute_cache_config_hash,
+	target_definition_version,
+	temporal_target_offsets,
+	validate_patch_cache,
+)
 
 
 def _config(cache_dir: Path) -> dict:
@@ -58,11 +65,16 @@ def _write_minimal_cache(cache_dir: Path, config: dict, *, train_stride: int = 6
 			X=np.zeros((1, 2, 3, 4, 4), dtype=np.float32),
 			y=np.zeros((1, 2, 4, 4), dtype=np.float32),
 		)
+	offsets = temporal_target_offsets(config)
 	manifest = {
-		"cache_version": "v2_sliding_stride60",
+		"cache_version": config["cache"]["cache_version"],
 		"created_at": "2026-07-10T00:00:00+00:00",
 		"config_hash": compute_cache_config_hash(config),
-		"input_sequence_length": 2,
+		"input_sequence_length": int(config["input_sequence_length"]),
+		"prediction_horizon": int(config["prediction_horizon"]),
+		"target_offset_from_start": int(offsets["target_offset_from_start"]),
+		"target_offset_from_last_input": int(offsets["target_offset_from_last_input"]),
+		"target_definition_version": target_definition_version(config),
 		"input_channels": 3,
 		"output_channels": 2,
 		"patch_height": 4,
@@ -170,4 +182,30 @@ def test_cache_validation_fails_on_train_patch_mode_mismatch(tmp_path: Path) -> 
 	config = _config(cache_dir)
 	_write_minimal_cache(cache_dir, config, train_patch_mode="single_sampled")
 	with pytest.raises(RuntimeError, match="different patch settings"):
+		validate_patch_cache(config, split="train")
+
+
+def test_cache_validation_fails_on_prediction_horizon_mismatch(tmp_path: Path) -> None:
+	cache_dir = tmp_path / "cache"
+	config = _config(cache_dir)
+	_write_minimal_cache(cache_dir, config)
+	manifest_path = cache_dir / MANIFEST_FILENAME
+	manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+	manifest["prediction_horizon"] = 10
+	manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+	with pytest.raises(RuntimeError, match="prediction_horizon mismatch"):
+		validate_patch_cache(config, split="train")
+
+
+def test_cache_validation_fails_on_target_definition_mismatch(tmp_path: Path) -> None:
+	cache_dir = tmp_path / "cache"
+	config = _config(cache_dir)
+	_write_minimal_cache(cache_dir, config)
+	manifest_path = cache_dir / MANIFEST_FILENAME
+	manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+	manifest["target_definition_version"] = "next_frame_target_v0"
+	manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+	with pytest.raises(RuntimeError, match="target_definition_version mismatch"):
 		validate_patch_cache(config, split="train")

@@ -151,6 +151,11 @@ def test_resume_uses_complete_shards_when_checkpoint_is_ahead(tmp_path: Path) ->
 		if line.strip()
 	]
 	assert [row["sample_index"] for row in metadata_rows] == [0, 1, 2, 3, 4]
+	assert metadata_rows[0]["input_indices"] == [0, 1]
+	assert metadata_rows[0]["last_input_idx"] == 1
+	assert metadata_rows[0]["target_idx"] == 2
+	assert metadata_rows[0]["prediction_horizon"] == 1
+	assert metadata_rows[0]["target_offset_from_start"] == 2
 
 	shard_sample_indices: list[int] = []
 	for shard_path in sorted(split_dir.glob("shard_*.npz")):
@@ -185,6 +190,8 @@ def test_resume_materializes_legacy_split_metadata(tmp_path: Path) -> None:
 		if line.strip()
 	]
 	assert [row["sample_index"] for row in metadata_rows] == [0, 1, 2, 3, 4]
+	assert all(row["input_sequence_length"] == 2 for row in metadata_rows)
+	assert all(row["prediction_horizon"] == 1 for row in metadata_rows)
 
 
 def test_resume_reconstructs_partial_legacy_shard_metadata(tmp_path: Path) -> None:
@@ -208,6 +215,9 @@ def test_resume_reconstructs_partial_legacy_shard_metadata(tmp_path: Path) -> No
 	]
 	assert [row["sample_index"] for row in metadata_rows] == [0, 1]
 	assert metadata_rows[1]["patch_type"] == "reconstructed"
+	assert metadata_rows[1]["input_indices"] == [1, 2]
+	assert metadata_rows[1]["last_input_idx"] == 2
+	assert metadata_rows[1]["target_idx"] == 3
 	assert [entry["num_samples"] for entry in manifest["shards"]["train"]] == [2, 2, 1]
 
 

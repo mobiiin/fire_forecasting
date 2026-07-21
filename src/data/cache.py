@@ -15,6 +15,7 @@ from src.data.stored_npz import stored_npz_array_info
 
 DEFAULT_CACHE_DIR = Path("/scratch/mhabibp/fire_forecasting_patch_cache")
 MANIFEST_FILENAME = "cache_manifest.json"
+TARGET_DEFINITION_VERSION = "interval_consumed_current_to_horizon_target_v1"
 
 
 def _get_section(config: Mapping[str, Any] | None, name: str) -> dict[str, Any]:
@@ -22,6 +23,28 @@ def _get_section(config: Mapping[str, Any] | None, name: str) -> dict[str, Any]:
 		return {}
 	section = config.get(name)
 	return dict(section) if isinstance(section, Mapping) else {}
+
+
+def target_definition_version(config: Mapping[str, Any] | None = None) -> str:
+	"""Return the semantic version for how y is built from current/target frames."""
+
+	if isinstance(config, Mapping):
+		cache_config = _get_section(config, "cache")
+		configured = cache_config.get("target_definition_version", config.get("target_definition_version"))
+		if configured not in (None, "", "null"):
+			return str(configured)
+	return TARGET_DEFINITION_VERSION
+
+
+def temporal_target_offsets(config: Mapping[str, Any]) -> dict[str, int]:
+	"""Return target offsets from sample start and from the last input frame."""
+
+	input_sequence_length = int(config["input_sequence_length"])
+	prediction_horizon = int(config["prediction_horizon"])
+	return {
+		"target_offset_from_start": input_sequence_length - 1 + prediction_horizon,
+		"target_offset_from_last_input": prediction_horizon,
+	}
 
 
 def _resolve_path(config: Mapping[str, Any], configured_path: str | Path) -> Path:
@@ -86,6 +109,7 @@ def compute_cache_config_hash(config: Mapping[str, Any]) -> str:
 		"data_dir",
 		"data_dirs",
 		"fire_dataset_index_json",
+		"temporal_trim",
 		"data_discovery",
 		"fire_filter",
 		"manual_fire_split",
@@ -115,6 +139,7 @@ def compute_cache_config_hash(config: Mapping[str, Any]) -> str:
 	cache_section = _get_section(config, "cache")
 	payload["cache"] = {
 		"save_normalized_inputs": bool(cache_section.get("save_normalized_inputs", False)),
+		"target_definition_version": target_definition_version(config),
 	}
 	multitask_section = _get_section(config, "multitask")
 	payload["multitask"] = {
@@ -132,6 +157,99 @@ def compute_cache_config_hash(config: Mapping[str, Any]) -> str:
 		)
 		if key in multitask_section
 	}
+	encoded = json.dumps(_jsonable(payload), sort_keys=True, separators=(",", ":"), default=str)
+	return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _resolve_config_relative_path(config: Mapping[str, Any], configured_path: str | Path) -> Path:
+	path = Path(configured_path).expanduser()
+	if path.is_absolute():
+		return path.resolve()
+	config_path_value = config.get("config_path", config.get("_config_path"))
+	if config_path_value:
+		return (Path(config_path_value).expanduser().resolve().parent / path).resolve()
+	return path.resolve()
+
+
+def resolve_dataset_index_path(config: Mapping[str, Any]) -> Path | None:
+	"""Resolve the configured fire dataset index path, if one is configured."""
+
+	index_path = config.get("fire_dataset_index_json")
+	if index_path in (None, "", "null"):
+		return None
+	return _resolve_config_relative_path(config, index_path)
+
+
+def _sha256_file(path: Path) -> str:
+	hasher = hashlib.sha256()
+	with path.open("rb") as handle:
+		for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+			hasher.update(chunk)
+	return hasher.hexdigest()
+
+
+def compute_dataset_index_hash(config: Mapping[str, Any]) -> str | None:
+	"""Hash the configured dataset index file so cache validation sees index edits."""
+
+	index_path = resolve_dataset_index_path(config)
+	if index_path is None or not index_path.exists():
+		return None
+	return _sha256_file(index_path)
+
+
+def extract_temporal_trim_manifest(dataset_records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+	"""Build compact per-fire trim metadata for cache manifests."""
+
+	fires: dict[str, dict[str, Any]] = {}
+	enabled = False
+	for record in dataset_records:
+		trim = dict(record.get("temporal_trim", {})) if isinstance(record.get("temporal_trim"), Mapping) else {}
+		fire_name = str(record.get("dataset_name", record.get("data_dir", "")))
+		fire_enabled = bool(trim.get("enabled", False))
+		enabled = enabled or fire_enabled
+		fires[fire_name] = {
+			"enabled": fire_enabled,
+			"trim_start_index": int(trim.get("trim_start_index", 0)),
+			"trim_end_index": int(trim.get("trim_end_index", max(int(record.get("num_files", 1)) - 1, 0))),
+			"trimmed_num_frames": int(trim.get("trimmed_num_frames", record.get("effective_num_files", record.get("num_files", 0)))),
+			"original_num_frames": int(trim.get("original_num_frames", record.get("num_files", 0))),
+		}
+	return {"temporal_trim_enabled": enabled, "fires": fires}
+
+
+def compute_trim_metadata_hash(dataset_records: Sequence[Mapping[str, Any]]) -> str:
+	"""Hash compact trim metadata from discovered dataset records."""
+
+	payload = extract_temporal_trim_manifest(dataset_records)
+	encoded = json.dumps(_jsonable(payload), sort_keys=True, separators=(",", ":"), default=str)
+	return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def compute_current_trim_metadata_hash(config: Mapping[str, Any]) -> str | None:
+	"""Hash temporal_trim metadata from the configured dataset index file."""
+
+	index_path = resolve_dataset_index_path(config)
+	if index_path is None or not index_path.exists():
+		return None
+	with index_path.open("r", encoding="utf-8") as handle:
+		index = json.load(handle)
+	fires = index.get("fires", {}) if isinstance(index, Mapping) else {}
+	if not isinstance(fires, Mapping):
+		return None
+	payload: dict[str, Any] = {"temporal_trim_enabled": False, "fires": {}}
+	for fire_name, record in sorted(fires.items()):
+		if not isinstance(record, Mapping):
+			continue
+		trim = dict(record.get("temporal_trim", {})) if isinstance(record.get("temporal_trim"), Mapping) else {}
+		enabled = bool(trim.get("enabled", False))
+		payload["temporal_trim_enabled"] = bool(payload["temporal_trim_enabled"] or enabled)
+		payload["fires"][str(fire_name)] = {
+			"enabled": enabled,
+			"trim_start_index": trim.get("trim_start_index"),
+			"trim_end_index": trim.get("trim_end_index"),
+			"trimmed_num_frames": trim.get("trimmed_num_frames"),
+			"original_num_frames": trim.get("original_num_frames"),
+		}
 	encoded = json.dumps(_jsonable(payload), sort_keys=True, separators=(",", ":"), default=str)
 	return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -282,12 +400,62 @@ def validate_patch_cache(config: Mapping[str, Any], split: str | Sequence[str] |
 			"Rerun precompute, or set cache.allow_config_hash_mismatch=true only if the cache-affecting config change is intentional."
 		)
 
+	expected_index_hash = compute_dataset_index_hash(config)
+	actual_index_hash = manifest.get("dataset_index_hash")
+	if actual_index_hash not in (None, "", "null") and expected_index_hash not in (None, "", "null"):
+		if str(actual_index_hash) != str(expected_index_hash):
+			index_path = resolve_dataset_index_path(config)
+			raise RuntimeError(
+				f"Patch-cache dataset index hash mismatch under {cache_dir}.\n"
+				f"manifest dataset_index_hash={actual_index_hash}\n"
+				f"current  dataset_index_hash={expected_index_hash}\n"
+				f"index={index_path}\n"
+				"Rerun:\n"
+				"python scripts/precompute_patch_cache.py --config configs/default.yaml --split all --overwrite"
+			)
+
+	expected_trim_hash = compute_current_trim_metadata_hash(config)
+	actual_trim_hash = manifest.get("trim_metadata_hash")
+	if actual_trim_hash not in (None, "", "null") and expected_trim_hash not in (None, "", "null"):
+		if str(actual_trim_hash) != str(expected_trim_hash):
+			raise RuntimeError(
+				f"Patch-cache temporal trim metadata hash mismatch under {cache_dir}.\n"
+				f"manifest trim_metadata_hash={actual_trim_hash}\n"
+				f"current  trim_metadata_hash={expected_trim_hash}\n"
+				"Rerun:\n"
+				"python scripts/precompute_patch_cache.py --config configs/default.yaml --split all --overwrite"
+			)
+
 	patching = resolve_patching_config(config)
 	expected_t = int(config["input_sequence_length"])
+	expected_horizon = int(config["prediction_horizon"])
 	expected_c = int(_get_section(config, "model").get("input_channels", manifest.get("input_channels", 0)))
 	expected_yc = int(_get_section(config, "model").get("output_channels", manifest.get("output_channels", 1)))
 	expected_h = int(patching["patch_height"])
 	expected_w = int(patching["patch_width"])
+	expected_target_definition = target_definition_version(config)
+	expected_offsets = temporal_target_offsets(config)
+	for manifest_key, expected_value in (
+		("input_sequence_length", expected_t),
+		("prediction_horizon", expected_horizon),
+		("target_offset_from_start", expected_offsets["target_offset_from_start"]),
+		("target_offset_from_last_input", expected_offsets["target_offset_from_last_input"]),
+	):
+		if manifest_key not in manifest:
+			raise RuntimeError(
+				f"Patch-cache manifest is missing {manifest_key!r}; old caches must be rebuilt for the current sequence definition."
+			)
+		if int(manifest.get(manifest_key)) != int(expected_value):
+			raise RuntimeError(
+				f"Patch-cache {manifest_key} mismatch under {cache_dir}: "
+				f"manifest={manifest.get(manifest_key)!r}, config={expected_value!r}. Rerun precompute."
+			)
+	actual_target_definition = str(manifest.get("target_definition_version", ""))
+	if actual_target_definition != expected_target_definition:
+		raise RuntimeError(
+			f"Patch-cache target_definition_version mismatch under {cache_dir}: "
+			f"manifest={actual_target_definition!r}, config={expected_target_definition!r}. Rerun precompute."
+		)
 	if expected_h != int(manifest.get("patch_height", expected_h)) or expected_w != int(manifest.get("patch_width", expected_w)):
 		raise RuntimeError(
 			"Patch-cache spatial shape does not match config: "

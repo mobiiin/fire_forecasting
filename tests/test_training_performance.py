@@ -65,7 +65,7 @@ def test_host_memory_cap_uses_split_specific_dataloader_workers(monkeypatch: pyt
 	monkeypatch.setenv("SLURM_CPUS_PER_TASK", "16")
 	monkeypatch.setenv("SLURM_MEM_PER_NODE", "163840")
 	config = {
-		"input_sequence_length": 6,
+		"input_sequence_length": 5,
 		"patching": {"patch_size": 64, "patch_height": 64, "patch_width": 64},
 		"model": {"input_channels": 129, "output_channels": 4},
 		"training": {"num_workers": 2, "pin_memory": True, "prefetch_factor": 1},

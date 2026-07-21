@@ -101,6 +101,10 @@ ARCHITECTURE_REGISTRY: dict[str, ArchitectureSpec] = {
 	),
 }
 
+ARCHITECTURE_ALIASES = {
+	"cawfe_st_mamba": "st_mamba_lite",
+}
+
 
 def resolve_model_architecture(config: Mapping[str, Any]) -> str:
 	"""Resolve the configured model architecture name."""
@@ -110,13 +114,15 @@ def resolve_model_architecture(config: Mapping[str, Any]) -> str:
 		architecture = model_config.get("architecture", model_config.get("name", "convlstm_unet"))
 	else:
 		architecture = "convlstm_unet"
-	return str(architecture).lower()
+	key = str(architecture).lower()
+	return ARCHITECTURE_ALIASES.get(key, key)
 
 
 def get_architecture_spec(name: str) -> ArchitectureSpec:
 	"""Return the registry spec for a supported architecture."""
 
 	key = str(name).lower()
+	key = ARCHITECTURE_ALIASES.get(key, key)
 	if key not in ARCHITECTURE_REGISTRY:
 		raise KeyError(f"Unsupported model architecture: {name!r}.")
 	return ARCHITECTURE_REGISTRY[key]

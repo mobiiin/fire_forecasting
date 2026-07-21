@@ -13,6 +13,7 @@ except ImportError:  # pragma: no cover - environment-specific fallback
 	torch = None
 
 from src.config import load_config
+from src.data.cache import target_definition_version, temporal_target_offsets
 from src.data.dataset import create_dataloaders, metadata_batch_to_list
 from src.models.model_factory import build_model_from_config
 from src.training.checkpoints import load_checkpoint, validate_checkpoint_model_compatibility
@@ -75,6 +76,59 @@ def _validate_checkpoint_architecture(checkpoint: Mapping[str, Any], expected_ar
 		)
 
 
+def _expected_sequence_metadata(config: Mapping[str, Any]) -> dict[str, Any]:
+	input_sequence_length = int(config["input_sequence_length"])
+	prediction_horizon = int(config["prediction_horizon"])
+	offsets = temporal_target_offsets(config)
+	return {
+		"input_sequence_length": input_sequence_length,
+		"prediction_horizon": prediction_horizon,
+		"target_offset_from_start": int(offsets["target_offset_from_start"]),
+		"target_offset_from_last_input": int(offsets["target_offset_from_last_input"]),
+		"target_definition_version": target_definition_version(config),
+	}
+
+
+def _validate_checkpoint_sequence(
+	checkpoint: Mapping[str, Any],
+	config: Mapping[str, Any],
+	checkpoint_path: Path,
+	allow_sequence_mismatch: bool = False,
+) -> None:
+	"""Raise if checkpoint temporal-target metadata does not match the evaluation config."""
+
+	expected = _expected_sequence_metadata(config)
+	mismatches: list[str] = []
+	for key in ("input_sequence_length", "prediction_horizon", "target_offset_from_start", "target_offset_from_last_input"):
+		if key not in checkpoint:
+			mismatches.append(f"{key}: checkpoint=<missing>, expected={expected[key]!r}")
+			continue
+		try:
+			checkpoint_value = int(checkpoint[key])
+		except (TypeError, ValueError):
+			mismatches.append(f"{key}: checkpoint={checkpoint.get(key)!r}, expected={expected[key]!r}")
+			continue
+		if checkpoint_value != int(expected[key]):
+			mismatches.append(f"{key}: checkpoint={checkpoint_value!r}, expected={expected[key]!r}")
+	target_key = "target_definition_version"
+	checkpoint_target_definition = checkpoint.get(target_key)
+	if checkpoint_target_definition in (None, ""):
+		mismatches.append(f"{target_key}: checkpoint=<missing>, expected={expected[target_key]!r}")
+	elif str(checkpoint_target_definition) != str(expected[target_key]):
+		mismatches.append(f"{target_key}: checkpoint={checkpoint_target_definition!r}, expected={expected[target_key]!r}")
+
+	if not mismatches:
+		return
+	message = (
+		f"Checkpoint sequence metadata mismatch for {checkpoint_path}:\n"
+		+ "\n".join(f"  - {item}" for item in mismatches)
+	)
+	if allow_sequence_mismatch:
+		warnings.warn(message, RuntimeWarning, stacklevel=2)
+		return
+	raise ValueError(message + "\nPass --allow_sequence_mismatch only for intentional compatibility/debug runs.")
+
+
 def evaluate_checkpoint_on_split(
 	config_path: str | Path,
 	split: str = "test",
@@ -83,6 +137,7 @@ def evaluate_checkpoint_on_split(
 	config_override: Mapping[str, Any] | None = None,
 	max_batches: int | None = None,
 	expected_architecture: str | None = None,
+	allow_sequence_mismatch: bool = False,
 ) -> dict[str, Any]:
 	"""Evaluate one checkpoint on the requested split using existing metrics/losses."""
 
@@ -116,6 +171,7 @@ def evaluate_checkpoint_on_split(
 
 	checkpoint = load_checkpoint(resolved_checkpoint_path, map_location=device)
 	_validate_checkpoint_architecture(checkpoint, expected_architecture, resolved_checkpoint_path)
+	_validate_checkpoint_sequence(checkpoint, config, resolved_checkpoint_path, allow_sequence_mismatch=allow_sequence_mismatch)
 	validate_checkpoint_model_compatibility(model, checkpoint, resolved_checkpoint_path)
 	model.load_state_dict(checkpoint["model_state_dict"])
 	model.eval()
@@ -190,6 +246,7 @@ def evaluate_checkpoint_on_split(
 		"checkpoint_path": str(resolved_checkpoint_path),
 		"split": str(split).lower(),
 		"num_samples": int(aggregate_samples),
+		"sequence": _expected_sequence_metadata(config),
 		"aggregate_results": aggregate_results,
 		"per_dataset_results": per_dataset_results,
 	}

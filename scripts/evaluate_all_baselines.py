@@ -27,6 +27,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--checkpoint", default=None, help="Optional explicit model checkpoint when --include_model is used.")
 	parser.add_argument("--checkpoint_kind", choices=("best", "latest"), default="best", help="Which configured checkpoint to use when --checkpoint is omitted.")
 	parser.add_argument("--model_architecture", default="earthformer_lite", help="Architecture name for the optional model evaluation.")
+	parser.add_argument(
+		"--allow_sequence_mismatch",
+		action="store_true",
+		help="Allow the optional model checkpoint T/horizon metadata to differ from the config.",
+	)
 	parser.add_argument("--output_csv", default="artifacts/logs/all_baselines.csv", help="Combined CSV output path.")
 	return parser
 
@@ -103,7 +108,11 @@ def main() -> None:
 			)
 			all_rows.extend(result["rows"])
 			aggregate = result["aggregate_results"]
-			print(f"{method_name} | {split} | samples={result['num_samples']}")
+			sequence = result.get("sequence", {})
+			print(
+				f"{method_name} | {split} | samples={result['num_samples']} "
+				f"T={sequence.get('input_sequence_length')} H={sequence.get('prediction_horizon')}"
+			)
 			for metric_name, metric_value in sorted(aggregate.items()):
 				print(f"  {metric_name}: {metric_value:.6f}")
 		if args.include_model:
@@ -114,6 +123,7 @@ def main() -> None:
 				checkpoint_path=args.checkpoint,
 				checkpoint_kind=args.checkpoint_kind,
 				config_override=config_override,
+				allow_sequence_mismatch=bool(args.allow_sequence_mismatch),
 			)
 			aggregate = result["aggregate_results"]
 			all_rows.append(

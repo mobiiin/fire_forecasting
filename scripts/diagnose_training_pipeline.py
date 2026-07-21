@@ -122,6 +122,8 @@ def main() -> None:
 	)
 	print(f"gpu: {get_cuda_device_info()}")
 	print(f"precision: {amp_dtype or 'fp32'}")
+	print(f"input_sequence_length: {int(config['input_sequence_length'])}")
+	print(f"prediction_horizon: {int(config['prediction_horizon'])}")
 	print(f"batch_size: {training_config.get('batch_size', config.get('batch_size'))}")
 	print(f"effective_batch_size: {effective_batch}")
 	print(f"train_loader: {_loader_summary(train_loader)}")

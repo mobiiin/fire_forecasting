@@ -51,6 +51,10 @@ def main() -> None:
 		print(f"cache_dir: {Path(dataset.cache_dir)}")
 	if hasattr(dataset, "manifest"):
 		print(f"cache_format: {getattr(dataset, 'manifest', {}).get('shard_format', 'unknown')}")
+	if hasattr(dataset, "input_sequence_length"):
+		print(f"input_sequence_length: {getattr(dataset, 'input_sequence_length')}")
+	if hasattr(dataset, "prediction_horizon"):
+		print(f"prediction_horizon: {getattr(dataset, 'prediction_horizon')}")
 
 	measured_batches = 0
 	measured_samples = 0

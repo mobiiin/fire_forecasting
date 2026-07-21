@@ -109,7 +109,16 @@ def main() -> None:
 		if age_days > 25.0:
 			print("WARNING: cache is older than 25 days; /scratch files may be close to purge age.")
 	print(f"config_hash: {manifest.get('config_hash')}")
-	print(f"input: T={manifest.get('input_sequence_length')} C={manifest.get('input_channels')}")
+	print(
+		f"input: T={manifest.get('input_sequence_length')} C={manifest.get('input_channels')} "
+		f"horizon={manifest.get('prediction_horizon')}"
+	)
+	print(
+		"target offsets: "
+		f"from_start={manifest.get('target_offset_from_start')} "
+		f"from_last_input={manifest.get('target_offset_from_last_input')}"
+	)
+	print(f"target_definition_version: {manifest.get('target_definition_version')}")
 	print(f"target channels: {manifest.get('output_channels')}")
 	print(f"patch: {manifest.get('patch_height')}x{manifest.get('patch_width')}")
 	print(f"include_border_patches: {manifest.get('include_border_patches')}")

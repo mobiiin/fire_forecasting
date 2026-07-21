@@ -64,14 +64,16 @@ def _dataset_record(tmp_path: Path) -> dict[str, object]:
 	frame0 = tmp_path / "frame_000.npy"
 	frame1 = tmp_path / "frame_001.npy"
 	frame2 = tmp_path / "frame_002.npy"
+	frame3 = tmp_path / "frame_003.npy"
 	_write_frame(frame0, surface_flux=1.0e6, surface_fuel=10.0, canopy_fuel=5.0)
 	_write_frame(frame1, surface_flux=2.0e6, surface_fuel=8.0, canopy_fuel=4.0)
 	_write_frame(frame2, surface_flux=3.0e6, surface_fuel=6.0, canopy_fuel=3.0)
+	_write_frame(frame3, surface_flux=4.0e6, surface_fuel=4.0, canopy_fuel=2.0)
 	return {
 		"dataset_id": 0,
 		"dataset_name": "toy",
 		"data_dir": tmp_path,
-		"file_paths": [frame0, frame1, frame2],
+		"file_paths": [frame0, frame1, frame2, frame3],
 		"raw_shape": (2, 2, 86),
 		"geometry": {
 			"area_2d_m2": np.ones((2, 2), dtype=np.float32),
@@ -135,4 +137,21 @@ def test_linear_extrapolation_scales_last_consumption_trend_and_energy(tmp_path:
 	assert np.allclose(prediction[1], 1.0)
 	assert prediction[2, 0, 0] > 0.0
 	expected_energy = np.log1p(np.asarray([[3.0]], dtype=np.float32))
+	assert np.allclose(prediction[3], expected_energy)
+
+
+def test_linear_extrapolation_scales_by_prediction_horizon(tmp_path: Path) -> None:
+	config = _config()
+	config["prediction_horizon"] = 2
+	record = _dataset_record(tmp_path)
+	prediction = predict_linear_extrapolation_for_sample(
+		dataset_record=record,
+		sample_ref={"sample_index": 0},
+		config=config,
+		patch={"y0": 0, "y1": 1, "x0": 0, "x1": 1},
+	)
+	assert prediction.shape == (4, 1, 1)
+	assert np.allclose(prediction[0], 4.0)
+	assert np.allclose(prediction[1], 2.0)
+	expected_energy = np.log1p(np.asarray([[4.0]], dtype=np.float32))
 	assert np.allclose(prediction[3], expected_energy)

@@ -16,6 +16,7 @@ from src.data.fire_index import (
 	save_fire_dataset_index,
 )
 from src.data.geometry import load_fire_geometry
+from src.data.temporal_trim import resolve_temporal_trim
 
 
 def _extract_numeric_suffix(name: str) -> int | None:
@@ -52,6 +53,17 @@ def discover_dataset_files(data_dir: Path, file_pattern: str) -> list[Path]:
 	if not files:
 		raise FileNotFoundError(f"No files found in '{data_dir}' using pattern '{file_pattern}'.")
 	return files
+
+
+def _explicit_frame_paths_from_record(record: Mapping[str, Any]) -> list[Path] | None:
+	"""Return explicit frame paths from a fire-index record when available."""
+
+	for key in ("trimmed_frame_paths", "frame_paths", "file_paths"):
+		value = record.get(key)
+		if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+			paths = [Path(str(item)).expanduser().resolve() for item in value if str(item).strip()]
+			return paths if paths else None
+	return None
 
 
 def _resolve_discovery_config(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -186,17 +198,23 @@ def _records_from_fire_index(config: Mapping[str, Any]) -> list[dict[str, Any]]:
 			continue
 		if not bool(record.get("valid_for_energy_release", False)):
 			continue
-		records.append(
-			{
-				"dataset_name": str(record.get("fire_name", fire_name)),
-				"data_dir": Path(str(record["data_dir"])).expanduser().resolve(),
-				"geom_path": Path(str(record["geom_path"])).expanduser().resolve() if record.get("geom_path") else None,
-				"terrain_path": Path(str(record["terrain_path"])).expanduser().resolve() if record.get("terrain_path") else None,
-				"fire_root_dir": Path(str(record.get("fire_root_dir", record["data_dir"]))).expanduser().resolve(),
-				"geom_requires_transpose": bool(record.get("geom_requires_transpose", False)),
-				"geom_tensor_orientation": record.get("geom_tensor_orientation"),
-			}
-		)
+		resolved_record = {
+			"dataset_name": str(record.get("fire_name", fire_name)),
+			"data_dir": Path(str(record["data_dir"])).expanduser().resolve(),
+			"geom_path": Path(str(record["geom_path"])).expanduser().resolve() if record.get("geom_path") else None,
+			"terrain_path": Path(str(record["terrain_path"])).expanduser().resolve() if record.get("terrain_path") else None,
+			"fire_root_dir": Path(str(record.get("fire_root_dir", record["data_dir"]))).expanduser().resolve(),
+			"geom_requires_transpose": bool(record.get("geom_requires_transpose", False)),
+			"geom_tensor_orientation": record.get("geom_tensor_orientation"),
+		}
+		explicit_frame_paths = _explicit_frame_paths_from_record(record)
+		if explicit_frame_paths is not None:
+			resolved_record["frame_paths"] = explicit_frame_paths
+		if isinstance(record.get("prefire_trim"), Mapping):
+			resolved_record["prefire_trim"] = dict(record["prefire_trim"])
+		if isinstance(record.get("temporal_trim"), Mapping):
+			resolved_record["temporal_trim"] = dict(record["temporal_trim"])
+		records.append(resolved_record)
 	return records
 
 
@@ -259,16 +277,23 @@ def discover_data_dir_records(config: Mapping[str, Any]) -> list[dict[str, Any]]
 			if str(item).strip():
 				data_dir = _resolve_path(config_path, item)
 				index_record = index_lookup.get(str(data_dir.resolve()))
-				resolved.append(
-					{
-						"dataset_name": str(index_record.get("fire_name", data_dir.name)) if index_record is not None else data_dir.name,
-						"data_dir": data_dir,
-						"geom_path": Path(str(index_record["geom_path"])).expanduser().resolve() if index_record is not None and index_record.get("geom_path") else None,
-						"terrain_path": Path(str(index_record["terrain_path"])).expanduser().resolve() if index_record is not None and index_record.get("terrain_path") else None,
-						"geom_requires_transpose": bool(index_record.get("geom_requires_transpose", False)) if index_record is not None else False,
-						"geom_tensor_orientation": index_record.get("geom_tensor_orientation") if index_record is not None else None,
-					}
-				)
+				resolved_record = {
+					"dataset_name": str(index_record.get("fire_name", data_dir.name)) if index_record is not None else data_dir.name,
+					"data_dir": data_dir,
+					"geom_path": Path(str(index_record["geom_path"])).expanduser().resolve() if index_record is not None and index_record.get("geom_path") else None,
+					"terrain_path": Path(str(index_record["terrain_path"])).expanduser().resolve() if index_record is not None and index_record.get("terrain_path") else None,
+					"geom_requires_transpose": bool(index_record.get("geom_requires_transpose", False)) if index_record is not None else False,
+					"geom_tensor_orientation": index_record.get("geom_tensor_orientation") if index_record is not None else None,
+				}
+				if index_record is not None:
+					explicit_frame_paths = _explicit_frame_paths_from_record(index_record)
+					if explicit_frame_paths is not None:
+						resolved_record["frame_paths"] = explicit_frame_paths
+					if isinstance(index_record.get("prefire_trim"), Mapping):
+						resolved_record["prefire_trim"] = dict(index_record["prefire_trim"])
+					if isinstance(index_record.get("temporal_trim"), Mapping):
+						resolved_record["temporal_trim"] = dict(index_record["temporal_trim"])
+				resolved.append(resolved_record)
 		if resolved:
 			return resolved
 
@@ -317,7 +342,19 @@ def discover_multiple_datasets(config: Mapping[str, Any]) -> list[dict[str, Any]
 				"If this path came from fire_dataset_index.json, refresh the index with "
 				"'python scripts/discover_fire_datasets.py --main_data_dir /media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/'."
 			)
-		file_paths = discover_dataset_files(data_dir, file_pattern)
+		explicit_frame_paths = source_record.get("frame_paths")
+		if isinstance(explicit_frame_paths, Sequence) and not isinstance(explicit_frame_paths, (str, bytes)):
+			file_paths = [Path(str(path)).expanduser().resolve() for path in explicit_frame_paths]
+			if not file_paths:
+				raise FileNotFoundError(f"Explicit frame path list is empty for dataset {source_record.get('dataset_name', data_dir.name)!r}.")
+			missing_paths = [path for path in file_paths if not path.exists()]
+			if missing_paths:
+				raise FileNotFoundError(
+					f"Explicit frame path list for dataset {source_record.get('dataset_name', data_dir.name)!r} contains missing files. "
+					f"First missing path: {missing_paths[0]}"
+				)
+		else:
+			file_paths = discover_dataset_files(data_dir, file_pattern)
 		first_tensor = np.load(file_paths[0], mmap_mode="r", allow_pickle=False)
 		if first_tensor.ndim != 3:
 			raise ValueError(
@@ -348,6 +385,14 @@ def discover_multiple_datasets(config: Mapping[str, Any]) -> list[dict[str, Any]
 			"geom_requires_transpose": bool(source_record.get("geom_requires_transpose", False)),
 			"geom_tensor_orientation": source_record.get("geom_tensor_orientation"),
 		}
+		if isinstance(source_record.get("prefire_trim"), Mapping):
+			record["prefire_trim"] = dict(source_record["prefire_trim"])
+		if isinstance(source_record.get("temporal_trim"), Mapping):
+			record["temporal_trim"] = resolve_temporal_trim({**dict(source_record), "file_paths": file_paths})
+			record["effective_num_files"] = int(record["temporal_trim"]["trimmed_num_frames"])
+		else:
+			record["temporal_trim"] = resolve_temporal_trim({"file_paths": file_paths})
+			record["effective_num_files"] = int(record["temporal_trim"]["trimmed_num_frames"])
 		if energy_enabled:
 			geometry_config = dict(config)
 			if bool(source_record.get("geom_requires_transpose", False)):

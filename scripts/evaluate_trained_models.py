@@ -94,6 +94,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--max_batches", type=int, default=None, help="Optional debug cap on evaluated batches.")
 	parser.add_argument("--num_workers", type=int, default=None, help="Override train/val/test DataLoader workers during evaluation.")
 	parser.add_argument("--save_predictions", action="store_true", help="Save raw predictions when the selected evaluator supports it.")
+	parser.add_argument(
+		"--allow_sequence_mismatch",
+		action="store_true",
+		help="Allow evaluating a checkpoint whose saved T/horizon metadata does not match the evaluation config.",
+	)
 	parser.add_argument("--overwrite", action="store_true", help="Allow writing into an existing timestamped evaluation directory.")
 	parser.add_argument(
 		"--include_baselines",
@@ -596,6 +601,7 @@ def _result_rows(
 	)
 	metadata = {
 		"identity": dict(identity),
+		"sequence": dict(result.get("sequence", {})) if isinstance(result.get("sequence", {}), Mapping) else {},
 		"paper_values": values,
 		"metric_sources": sources,
 		"num_samples": int(result.get("num_samples", 0)),
@@ -728,6 +734,7 @@ def run_quantitative(args: argparse.Namespace) -> Path:
 				config_override=_model_config_override(architecture, best_run.checkpoint_path, args.num_workers, run_dir=best_run.run_dir),
 				max_batches=args.max_batches,
 				expected_architecture=architecture,
+				allow_sequence_mismatch=bool(args.allow_sequence_mismatch),
 			)
 			identity = _result_identity(architecture, best_run.run_name, best_run.checkpoint_path)
 			paper_row, wide_row, model_per_fire, model_long, metadata = _result_rows(
@@ -769,6 +776,7 @@ def run_quantitative(args: argparse.Namespace) -> Path:
 		"output_dir": str(output_dir),
 		"selection_metric": args.selection_metric,
 		"selection_mode": args.selection_mode,
+		"allow_sequence_mismatch": bool(args.allow_sequence_mismatch),
 		"successful_models": successful_models,
 		"skipped_models": skipped_models,
 		"failed_models": failed_models,

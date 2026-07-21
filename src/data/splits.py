@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence
 
 from src.data.patching import build_sliding_window_patches, resolve_patching_config, resolve_split_patch_mode, resolve_split_patch_stride
+from src.data.temporal_trim import effective_num_frames, resolve_temporal_trim
 
 
 def _validate_nonnegative_fraction(name: str, fraction: float) -> None:
@@ -68,6 +69,18 @@ def _sample_starts_for_segment(
 	if latest_start < segment_start:
 		return []
 	return list(range(segment_start, latest_start + 1))
+
+
+def _record_effective_num_timesteps(record: Mapping[str, Any]) -> int:
+	"""Return frame count used for temporal sample construction."""
+
+	return effective_num_frames(record)
+
+
+def _record_trim_summary(record: Mapping[str, Any]) -> dict[str, Any]:
+	"""Return compact trim metadata for split summaries."""
+
+	return resolve_temporal_trim(record)
 
 
 def chronological_train_val_split_indices(
@@ -149,7 +162,7 @@ def multi_dataset_chronological_splits(
 	rows: list[tuple[str, int, int, int, int]] = []
 
 	for dataset_record in dataset_records:
-		file_count = int(dataset_record["num_files"])
+		file_count = _record_effective_num_timesteps(dataset_record)
 		dataset_id = int(dataset_record["dataset_id"])
 		dataset_name = str(dataset_record["dataset_name"])
 		splits = chronological_split_indices_for_dataset(
@@ -165,7 +178,7 @@ def multi_dataset_chronological_splits(
 			for sample_index in splits[split_name]:
 				combined[split_name].append({"dataset_id": dataset_id, "sample_index": int(sample_index)})
 
-	print("dataset_name       files    train_samples    val_samples    test_samples")
+	print("dataset_name       trimmed_files train_samples    val_samples    test_samples")
 	for dataset_name, file_count, train_count, val_count, test_count in rows:
 		print(f"{dataset_name:<18} {file_count:<8} {train_count:<16} {val_count:<13} {test_count:<12}")
 	print(
@@ -287,9 +300,18 @@ def _validate_manual_fire_lists(
 def _print_manual_split_summary(
 	rows: Sequence[tuple[str, str, str, int, int, int]],
 	totals: Mapping[str, int],
+	input_sequence_length: int,
+	prediction_horizon: int,
 ) -> None:
 	"""Print one manual split summary table."""
 
+	target_offset_from_start = int(input_sequence_length) - 1 + int(prediction_horizon)
+	print(
+		"Temporal target | "
+		f"input_sequence_length={int(input_sequence_length)} "
+		f"prediction_horizon={int(prediction_horizon)} "
+		f"target_offset_from_start={target_offset_from_start}"
+	)
 	print("Split | Fire name | HxW | files | valid temporal samples")
 	for split_name, fire_name, spatial_text, file_count, sample_count, patches_per_sample in rows:
 		if patches_per_sample > 0:
@@ -379,6 +401,8 @@ def _save_manual_split_json(
 	dataset_records: Sequence[Mapping[str, Any]],
 	config: Mapping[str, Any],
 	split_refs: Mapping[str, Sequence[Mapping[str, Any]]],
+	input_sequence_length: int,
+	prediction_horizon: int,
 ) -> None:
 	"""Persist the resolved manual split metadata when enabled."""
 
@@ -393,6 +417,10 @@ def _save_manual_split_json(
 	payload: dict[str, Any] = {
 		"split_mode": "manual_fire_holdout",
 		"created_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+		"input_sequence_length": int(input_sequence_length),
+		"prediction_horizon": int(prediction_horizon),
+		"target_offset_from_start": int(input_sequence_length) - 1 + int(prediction_horizon),
+		"target_offset_from_last_input": int(prediction_horizon),
 		"splits": {},
 	}
 	for split_name in ("train", "val", "test"):
@@ -408,6 +436,8 @@ def _save_manual_split_json(
 					"geom_path": str(record.get("geom_path")) if record.get("geom_path") is not None else None,
 					"terrain_path": str(record.get("terrain_path")) if record.get("terrain_path") is not None else None,
 					"num_files": int(record["num_files"]),
+					"effective_num_files": _record_effective_num_timesteps(record),
+					"temporal_trim": _record_trim_summary(record),
 					"raw_shape": [int(value) for value in record["raw_shape"]],
 					"valid_temporal_samples": int(sample_count),
 				}
@@ -452,7 +482,7 @@ def manual_fire_holdout_splits(
 		split_name = next((name for name, names in assignments.items() if dataset_name in names), None)
 		if split_name is None:
 			continue
-		num_timesteps = int(record["num_files"])
+		num_timesteps = _record_effective_num_timesteps(record)
 		valid_indices = _sample_starts_for_segment(
 			segment_start=0,
 			segment_end=num_timesteps,
@@ -484,7 +514,7 @@ def manual_fire_holdout_splits(
 				split_name,
 				dataset_name,
 				f"{height}x{width}",
-				int(record["num_files"]),
+				int(num_timesteps),
 				int(len(valid_indices)),
 				int(patches_per_sample),
 			)
@@ -505,14 +535,14 @@ def manual_fire_holdout_splits(
 		"val_samples": len(split_refs["val"]),
 		"test_samples": len(split_refs["test"]),
 	}
-	_print_manual_split_summary(rows, totals)
+	_print_manual_split_summary(rows, totals, input_sequence_length, prediction_horizon)
 	_maybe_warn_manual_fraction_drift(
 		config,
 		train_count=len(split_refs["train"]),
 		val_count=len(split_refs["val"]),
 		test_count=len(split_refs["test"]),
 	)
-	_save_manual_split_json(dataset_records, config, split_refs)
+	_save_manual_split_json(dataset_records, config, split_refs, input_sequence_length, prediction_horizon)
 	return split_refs
 
 
@@ -559,6 +589,15 @@ def build_sliding_patch_refs_for_split(
 				}
 			)
 
+	if "input_sequence_length" in config and "prediction_horizon" in config:
+		input_sequence_length = int(config["input_sequence_length"])
+		prediction_horizon = int(config["prediction_horizon"])
+		print(
+			"Temporal target | "
+			f"input_sequence_length={input_sequence_length} "
+			f"prediction_horizon={prediction_horizon} "
+			f"target_offset_from_start={input_sequence_length - 1 + prediction_horizon}"
+		)
 	print("Split | Fire name | HxW | temporal samples | patch mode | stride | patches/sample | total patch samples")
 	stride = resolve_split_patch_stride(config, split_name)
 	for dataset_name, row in sorted(summary_rows.items()):
@@ -644,8 +683,8 @@ def chronological_split_indices(
 if __name__ == "__main__":
 	splits = chronological_train_val_split_indices(
 		num_timesteps=100,
-		input_sequence_length=6,
-		prediction_horizon=1,
+		input_sequence_length=5,
+		prediction_horizon=10,
 		train_fraction=0.85,
 		val_fraction=0.15,
 	)

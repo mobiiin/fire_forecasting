@@ -16,7 +16,7 @@ from src.training.losses import get_loss_function
 def _config() -> dict:
 	return {
 		"task_type": "multitask",
-		"input_sequence_length": 6,
+		"input_sequence_length": 5,
 		"model": {
 			"architecture": "cawfe_latte",
 			"name": "cawfe_latte",
@@ -24,7 +24,7 @@ def _config() -> dict:
 			"output_channels": 4,
 		},
 		"cawfe_latte": {
-			"input_sequence_length": 6,
+			"input_sequence_length": 5,
 			"patch_size": 64,
 			"embed_dim": 32,
 			"atm_embed_dim": 16,
@@ -121,7 +121,7 @@ def _config() -> dict:
 
 def test_cawfe_latte_forward_shape() -> None:
 	model = build_model_from_config(_config(), input_channels=129)
-	x = torch.randn(2, 6, 129, 64, 64)
+	x = torch.randn(2, 5, 129, 64, 64)
 	y = model(x)
 	assert tuple(y.shape) == (2, 4, 64, 64)
 
@@ -134,8 +134,8 @@ def test_wind_guided_directional_module_preserves_shape_and_has_finite_wind() ->
 		guidance_strength=1.0,
 		mode="feature_modulation",
 	)
-	fused = torch.randn(2, 6, 32, 16, 16)
-	raw = torch.randn(2, 6, 129, 16, 16)
+	fused = torch.randn(2, 5, 32, 16, 16)
+	raw = torch.randn(2, 5, 129, 16, 16)
 	guided, aux = module(fused, raw)
 	assert tuple(guided.shape) == tuple(fused.shape)
 	for key in ("wind_speed", "wind_cos", "wind_sin"):
@@ -150,7 +150,7 @@ def test_neural_operator_bottleneck_preserves_shape() -> None:
 		num_blocks=4,
 		force_float32_fft=True,
 	)
-	x = torch.randn(2, 6, 64, 32, 32)
+	x = torch.randn(2, 5, 64, 32, 32)
 	y = operator(x)
 	assert tuple(y.shape) == tuple(x.shape)
 
@@ -187,7 +187,7 @@ def test_neural_operator_bottleneck_accepts_bfloat16_autocast() -> None:
 
 def test_cawfe_latte_forward_return_aux() -> None:
 	model = build_model_from_config(_config(), input_channels=129)
-	x = torch.randn(2, 6, 129, 64, 64)
+	x = torch.randn(2, 5, 129, 64, 64)
 	pred, aux = model(x, return_aux=True)
 	assert tuple(pred.shape) == (2, 4, 64, 64)
 	assert aux["fire_gate_map"] is not None
@@ -202,7 +202,7 @@ def test_model_factory_returns_cawfe_latte() -> None:
 
 
 def test_input_adapter_returns_unchanged_sequence() -> None:
-	x = torch.randn(2, 6, 129, 64, 64)
+	x = torch.randn(2, 5, 129, 64, 64)
 	y = adapt_input_for_architecture(x, "cawfe_latte")
 	assert y is x
 
@@ -225,7 +225,7 @@ def test_one_training_step_has_finite_gradients() -> None:
 	config = _config()
 	model = build_model_from_config(config, input_channels=129)
 	criterion = get_loss_function(config)
-	x = torch.randn(2, 6, 129, 64, 64)
+	x = torch.randn(2, 5, 129, 64, 64)
 	target = torch.randn(2, 4, 64, 64)
 	target[:, 2] = torch.randint(0, 2, size=(2, 64, 64)).to(torch.float32)
 	prediction = model(x)

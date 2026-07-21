@@ -30,7 +30,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
 def main() -> None:
 	args = build_argument_parser().parse_args()
 	config = _config_override(args.config)
-	sequence_length = int(config.get("earthformer_lite", {}).get("input_sequence_length", config.get("input_sequence_length", 6)))
+	sequence_length = int(config.get("earthformer_lite", {}).get("input_sequence_length", config.get("input_sequence_length", 5)))
 	input_channels = int(config.get("model", {}).get("input_channels", config.get("input_channel_count", 129)))
 	output_channels = int(config.get("model", {}).get("output_channels", 4))
 	patch_size = int(config.get("earthformer_lite", {}).get("patch_size", config.get("patch_size", 64)))

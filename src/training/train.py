@@ -52,6 +52,7 @@ except ImportError:  # pragma: no cover - environment-specific fallback
 	cuda_autocast = None
 
 from src.config import load_config
+from src.data.cache import target_definition_version, temporal_target_offsets
 from src.data.dataset import create_dataloaders
 from src.data.spatial_transforms import infer_with_external_test_spatial_handling
 from src.models.architecture_registry import resolve_model_architecture
@@ -1160,6 +1161,25 @@ def _output_shape_metadata(config: Mapping[str, Any], output_channels: int) -> l
 	return ["batch", int(output_channels), patch_height, patch_width]
 
 
+def _sequence_target_metadata(config: Mapping[str, Any]) -> dict[str, Any]:
+	training_config = _get_section(config, "training")
+	input_sequence_length = int(config.get("input_sequence_length", training_config.get("input_sequence_length", 1)))
+	prediction_horizon = int(config.get("prediction_horizon", training_config.get("prediction_horizon", 10)))
+	offsets = temporal_target_offsets(
+		{
+			"input_sequence_length": input_sequence_length,
+			"prediction_horizon": prediction_horizon,
+		}
+	)
+	return {
+		"input_sequence_length": input_sequence_length,
+		"prediction_horizon": prediction_horizon,
+		"target_offset_from_start": int(offsets["target_offset_from_start"]),
+		"target_offset_from_last_input": int(offsets["target_offset_from_last_input"]),
+		"target_definition_version": target_definition_version(config),
+	}
+
+
 def _save_resolved_run_artifacts(
 	config: Mapping[str, Any],
 	original_config: Mapping[str, Any],
@@ -1185,6 +1205,7 @@ def _save_resolved_run_artifacts(
 		"normalization_stats_path": str(normalization_stats_path) if normalization_stats_path is not None else None,
 		"model_parameter_count": _model_parameter_count(model),
 		"cuda": get_cuda_device_info(),
+		"sequence": _sequence_target_metadata(config),
 		"input_shape": _input_shape_metadata(config, input_channels),
 		"output_shape": _output_shape_metadata(config, output_channels),
 		"loader_summaries": dict(loader_summaries),
@@ -1194,6 +1215,7 @@ def _save_resolved_run_artifacts(
 		hardware_summary = _build_hardware_summary(config, backend_summary, amp_dtype)
 		hardware_summary["git_commit"] = payload["resolved_run"]["git_commit"]
 		hardware_summary["model_parameter_count"] = payload["resolved_run"]["model_parameter_count"]
+		hardware_summary["sequence"] = payload["resolved_run"]["sequence"]
 		hardware_summary["input_shape"] = payload["resolved_run"]["input_shape"]
 		hardware_summary["output_shape"] = payload["resolved_run"]["output_shape"]
 		hardware_summary_path = run_manager.save_metadata("hardware_summary.json", hardware_summary)
@@ -1582,6 +1604,7 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 		"figure_dir": str(run_manager.figure_dir),
 		"input_channels": input_channels,
 		"output_channels": output_channels,
+		"sequence": _sequence_target_metadata(config),
 		"input_shape": _input_shape_metadata(config, input_channels),
 		"output_shape": _output_shape_metadata(config, output_channels),
 		"effective_batch_size": int(training_config.get("batch_size", config.get("batch_size", 1)))
@@ -1612,6 +1635,13 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 	logger.info("Inferred input channels: %s", input_channels)
 	logger.info("Model architecture: %s", architecture)
 	logger.info("Model output channels: %s", output_channels)
+	logger.info(
+		"Temporal target | input_sequence_length=%s prediction_horizon=%s target_offset_from_start=%s target_definition_version=%s",
+		input_sequence_length,
+		int(config.get("prediction_horizon", training_config.get("prediction_horizon", 10))),
+		input_sequence_length - 1 + int(config.get("prediction_horizon", training_config.get("prediction_horizon", 10))),
+		target_definition_version(config),
+	)
 	logger.info(
 		"Input normalization | train=%s | val=%s | test=%s",
 		_input_normalization_status(train_loader),
@@ -1645,6 +1675,7 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 		"run_name": run_manager.run_name,
 		"architecture": architecture,
 		"run_artifact_paths": run_artifact_paths,
+		"sequence": _sequence_target_metadata(config),
 		"history_rows": history_rows,
 		"final_epoch_summary": {},
 		"num_epochs_completed": start_epoch,
@@ -1675,6 +1706,7 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 			"best_metric_name": str(checkpointing_config.get("monitor", checkpoint_config.get("monitor", "val_loss"))),
 			"best_epoch": best_epoch,
 			"input_channels": input_channels,
+			**_sequence_target_metadata(config),
 			"input_shape": _input_shape_metadata(config, input_channels),
 			"output_shape": _output_shape_metadata(config, output_channels),
 			"normalization_stats": str(normalization_stats_path) if normalization_stats_path is not None else None,

@@ -22,7 +22,7 @@ except ImportError:  # pragma: no cover - environment-specific fallback
 	class Sampler:  # type: ignore[too-many-ancestors]
 		pass
 
-from src.data.cache import get_patch_cache_dir, load_cache_manifest
+from src.data.cache import get_patch_cache_dir, load_cache_manifest, target_definition_version, temporal_target_offsets
 from src.data.preprocessing import input_normalization_runs_on_device, load_normalization_stats, normalize_tensor
 from src.data.stored_npz import open_stored_npz_array, stored_npz_array_info
 
@@ -243,6 +243,16 @@ class CachedPatchDataset(Dataset):
 
 		self._shard_cache: OrderedDict[str, dict[str, np.ndarray]] = OrderedDict()
 		self.input_sequence_length = int(self.manifest.get("input_sequence_length", config.get("input_sequence_length", 0)))
+		self.prediction_horizon = int(self.manifest.get("prediction_horizon", config.get("prediction_horizon", 0)))
+		self.target_definition_version = str(
+			self.manifest.get("target_definition_version", target_definition_version(config))
+		)
+		self.target_offsets = temporal_target_offsets(
+			{
+				"input_sequence_length": self.input_sequence_length,
+				"prediction_horizon": self.prediction_horizon,
+			}
+		)
 		self.total_input_channels = int(self.manifest.get("input_channels", _get_section(config, "model").get("input_channels", 0)))
 		self.input_channels_after_engineering = self.total_input_channels
 		self.num_channels = self.total_input_channels
@@ -358,9 +368,32 @@ class CachedPatchDataset(Dataset):
 			return x_tensor, y_tensor
 
 		metadata = dict(self.metadata[index]) if self.metadata else {}
+		self._ensure_sequence_metadata(metadata)
 		metadata["cache_shard_path"] = str(self.shards[shard_index]["path"])
 		metadata["cache_local_index"] = int(local_index)
 		return x_tensor, y_tensor, metadata
+
+	def _ensure_sequence_metadata(self, metadata: dict[str, Any]) -> None:
+		sample_index_value = metadata.get("sample_index", metadata.get("start_idx"))
+		try:
+			start_idx = int(sample_index_value)
+		except (TypeError, ValueError):
+			return
+		last_input_idx = start_idx + self.input_sequence_length - 1
+		target_idx = last_input_idx + self.prediction_horizon
+		metadata.setdefault("start_idx", int(start_idx))
+		metadata.setdefault("input_indices", list(range(start_idx, start_idx + self.input_sequence_length)))
+		metadata.setdefault("last_input_idx", int(last_input_idx))
+		metadata.setdefault("target_idx", int(target_idx))
+		metadata.setdefault("current_idx", int(last_input_idx))
+		metadata.setdefault("future_idx", int(target_idx))
+		metadata.setdefault("current_index", int(last_input_idx))
+		metadata.setdefault("future_index", int(target_idx))
+		metadata.setdefault("input_sequence_length", int(self.input_sequence_length))
+		metadata.setdefault("prediction_horizon", int(self.prediction_horizon))
+		metadata.setdefault("target_offset_from_start", int(self.target_offsets["target_offset_from_start"]))
+		metadata.setdefault("target_offset_from_last_input", int(self.target_offsets["target_offset_from_last_input"]))
+		metadata.setdefault("target_definition_version", self.target_definition_version)
 
 	def get_batch(self, indices: list[int]):
 		"""Load a batch of indices, vectorizing reads when they are shard-local."""
@@ -385,6 +418,7 @@ class CachedPatchDataset(Dataset):
 			y_tensor = _to_float_tensor(y_array[batch_offset])
 			if self.return_metadata:
 				metadata = dict(self.metadata[original_index]) if self.metadata else {}
+				self._ensure_sequence_metadata(metadata)
 				metadata["cache_shard_path"] = str(self.shards[shard_index]["path"])
 				metadata["cache_local_index"] = int(local_indices[batch_offset])
 				items.append((x_tensor, y_tensor, metadata))

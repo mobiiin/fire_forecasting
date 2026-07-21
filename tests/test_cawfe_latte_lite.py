@@ -17,7 +17,7 @@ from src.training.losses import get_loss_function
 def _config() -> dict:
 	return {
 		"task_type": "multitask",
-		"input_sequence_length": 6,
+		"input_sequence_length": 5,
 		"model": {
 			"architecture": "cawfe_latte_lite",
 			"name": "cawfe_latte_lite",
@@ -25,7 +25,7 @@ def _config() -> dict:
 			"output_channels": 4,
 		},
 		"cawfe_latte_lite": {
-			"input_sequence_length": 6,
+			"input_sequence_length": 5,
 			"patch_size": 64,
 			"embed_dim": 32,
 			"atm_embed_dim": 16,
@@ -103,7 +103,7 @@ def _config() -> dict:
 
 def test_cawfe_latte_lite_forward_shape() -> None:
 	model = build_model_from_config(_config(), input_channels=129)
-	x = torch.randn(2, 6, 129, 64, 64)
+	x = torch.randn(2, 5, 129, 64, 64)
 	y = model(x)
 	assert tuple(y.shape) == (2, 4, 64, 64)
 
@@ -116,9 +116,9 @@ def test_vertical_atmosphere_encoder_shape() -> None:
 		encoder_type="attention",
 		num_heads=4,
 	)
-	x = torch.randn(2, 6, 80, 16, 16)
+	x = torch.randn(2, 5, 80, 16, 16)
 	y = encoder(x)
-	assert tuple(y.shape) == (2, 6, 16, 16, 16)
+	assert tuple(y.shape) == (2, 5, 16, 16, 16)
 
 
 def test_vertical_atmosphere_attention_chunking_matches_unchunked() -> None:
@@ -160,9 +160,9 @@ def test_fire_fuel_state_encoder_shape() -> None:
 		engineered_start_channel=86,
 		engineered_end_channel=128,
 	)
-	x = torch.randn(2, 6, 129, 16, 16)
+	x = torch.randn(2, 5, 129, 16, 16)
 	y = encoder(x)
-	assert tuple(y.shape) == (2, 6, 16, 16, 16)
+	assert tuple(y.shape) == (2, 5, 16, 16, 16)
 
 
 def test_fire_front_attention_gate_shapes() -> None:
@@ -173,11 +173,11 @@ def test_fire_front_attention_gate_shapes() -> None:
 		gate_strength=1.0,
 		gate_mode="multiplicative",
 	)
-	fused = torch.randn(2, 6, 32, 16, 16)
-	gate_input = torch.randn(2, 6, 49, 16, 16)
+	fused = torch.randn(2, 5, 32, 16, 16)
+	gate_input = torch.randn(2, 5, 49, 16, 16)
 	gated, a_fire = gate(fused, gate_input)
 	assert tuple(gated.shape) == tuple(fused.shape)
-	assert tuple(a_fire.shape) == (2, 6, 1, 16, 16)
+	assert tuple(a_fire.shape) == (2, 5, 1, 16, 16)
 
 
 def test_latte_hybrid_block_preserves_shape() -> None:
@@ -197,7 +197,7 @@ def test_latte_hybrid_block_preserves_shape() -> None:
 		attention_dropout=0.0,
 		drop_path=0.0,
 	)
-	x = torch.randn(2, 6, 32, 16, 16)
+	x = torch.randn(2, 5, 32, 16, 16)
 	y = block(x)
 	assert tuple(y.shape) == tuple(x.shape)
 
@@ -208,7 +208,7 @@ def test_model_factory_returns_cawfe_latte_lite() -> None:
 
 
 def test_input_adapter_returns_unchanged_sequence() -> None:
-	x = torch.randn(2, 6, 129, 64, 64)
+	x = torch.randn(2, 5, 129, 64, 64)
 	y = adapt_input_for_architecture(x, "cawfe_latte_lite")
 	assert y is x
 
@@ -229,7 +229,7 @@ def test_physical_constraints_leave_mask_unconstrained() -> None:
 
 def test_forward_return_aux() -> None:
 	model = build_model_from_config(_config(), input_channels=129)
-	x = torch.randn(2, 6, 129, 64, 64)
+	x = torch.randn(2, 5, 129, 64, 64)
 	pred, aux = model(x, return_aux=True)
 	assert tuple(pred.shape) == (2, 4, 64, 64)
 	assert aux["fire_gate_map"] is not None
@@ -241,7 +241,7 @@ def test_one_training_step_has_finite_gradients() -> None:
 	config = _config()
 	model = build_model_from_config(config, input_channels=129)
 	criterion = get_loss_function(config)
-	x = torch.randn(2, 6, 129, 64, 64)
+	x = torch.randn(2, 5, 129, 64, 64)
 	target = torch.randn(2, 4, 64, 64)
 	target[:, 2] = torch.randint(0, 2, size=(2, 64, 64)).to(torch.float32)
 	prediction = model(x)

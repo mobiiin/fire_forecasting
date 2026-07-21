@@ -21,6 +21,7 @@ except ImportError:  # pragma: no cover - environment-specific fallback
 		pass
 
 from src.data.discovery import discover_dataset_files, discover_multiple_datasets, resolve_data_dirs, sort_chronologically
+from src.data.cache import target_definition_version, temporal_target_offsets
 from src.data.energy_release import (
 	compute_energy_release_maps,
 	resolve_energy_output_channel_names,
@@ -51,6 +52,7 @@ from src.data.splits import (
 	multi_dataset_chronological_splits,
 	multi_fire_chronological_splits,
 )
+from src.data.temporal_trim import effective_num_frames, resolve_temporal_trim, temporal_sample_metadata
 from src.training.hardware import cap_num_workers_by_slurm, get_performance_config
 
 
@@ -544,7 +546,7 @@ def resolve_engineered_feature_slices(config: Mapping[str, Any], base_input_chan
 	return slices
 
 
-def _load_initial_fuel_map(file_paths: Sequence[Path], config: Mapping[str, Any]) -> np.ndarray:
+def _load_initial_fuel_map(file_paths: Sequence[Path], config: Mapping[str, Any], initial_index: int = 0) -> np.ndarray:
 	"""Load the initial surface/canopy fuel map used for cumulative consumed-fuel features."""
 
 	engineered = _resolve_engineered_features_config(config)
@@ -554,7 +556,8 @@ def _load_initial_fuel_map(file_paths: Sequence[Path], config: Mapping[str, Any]
 			"Only 'first_dataset_frame' is currently supported."
 		)
 	layout = _resolve_channel_layout(config)
-	first_frame = np.load(file_paths[0], mmap_mode="r", allow_pickle=False)
+	initial_index = max(0, min(int(initial_index), len(file_paths) - 1))
+	first_frame = np.load(file_paths[initial_index], mmap_mode="r", allow_pickle=False)
 	return _slice_channels(first_frame, layout["fuel_channels"])
 
 
@@ -564,6 +567,7 @@ def build_engineered_features(
 	start_index: int,
 	config: Mapping[str, Any],
 	energy_geometry: Mapping[str, Any] | None = None,
+	initial_fuel_index: int = 0,
 ) -> np.ndarray:
 	"""Build leakage-safe engineered features from current and previous frames only."""
 
@@ -584,7 +588,7 @@ def build_engineered_features(
 
 	initial_fuel = None
 	if engineered["enabled"] and engineered["add_cumulative_consumed_fuel"]:
-		initial_fuel = _load_initial_fuel_map(resolved_paths, config)
+		initial_fuel = _load_initial_fuel_map(resolved_paths, config, initial_index=initial_fuel_index)
 	feature_frames: list[np.ndarray] = []
 	for timestep_index in range(raw_frames.shape[0]):
 		global_frame_index = int(start_index) + timestep_index
@@ -1285,10 +1289,28 @@ class FireSequenceDataset(Dataset):
 			y_tensor = self.target_transform(y_tensor)
 
 		if self.return_metadata:
+			input_indices = list(range(sample_start, sample_start + self.input_sequence_length))
+			target_offsets = temporal_target_offsets(
+				{
+					"input_sequence_length": self.input_sequence_length,
+					"prediction_horizon": self.prediction_horizon,
+				}
+			)
 			metadata = {
 				"sample_index": sample_start,
+				"start_idx": sample_start,
+				"input_indices": input_indices,
+				"last_input_idx": current_index,
+				"target_idx": future_index,
+				"current_idx": current_index,
+				"future_idx": future_index,
 				"current_index": current_index,
 				"future_index": future_index,
+				"input_sequence_length": int(self.input_sequence_length),
+				"prediction_horizon": int(self.prediction_horizon),
+				"target_offset_from_start": int(target_offsets["target_offset_from_start"]),
+				"target_offset_from_last_input": int(target_offsets["target_offset_from_last_input"]),
+				"target_definition_version": target_definition_version(self.config),
 				"current_file_path": str(current_file_path),
 				"target_file_path": str(target_file_path),
 				"input_channel_count_base": int(self.base_input_channel_count),
@@ -1411,6 +1433,8 @@ class MultiFireSequenceDataset(FireSequenceDataset):
 		first_record = self.dataset_records[0]
 		self.expected_height, self.expected_width, self.num_channels = first_record["raw_shape"]
 		for record in self.dataset_records:
+			record["temporal_trim"] = resolve_temporal_trim(record)
+			record["effective_num_files"] = effective_num_frames(record)
 			record_height, record_width, record_channels = record["raw_shape"]
 			if record_channels != self.num_channels:
 				raise ValueError(
@@ -1471,7 +1495,7 @@ class MultiFireSequenceDataset(FireSequenceDataset):
 			if dataset_id < 0 or dataset_id >= len(self.dataset_records):
 				raise ValueError(f"sample_refs contain invalid dataset_id={dataset_id}.")
 			record = self.dataset_records[dataset_id]
-			max_valid_start = len(record["file_paths"]) - self.input_sequence_length - self.prediction_horizon
+			max_valid_start = int(record["effective_num_files"]) - self.input_sequence_length - self.prediction_horizon
 			if ref["sample_index"] < 0 or ref["sample_index"] > max_valid_start:
 				raise ValueError(
 					"sample_refs contain invalid sample start positions. "
@@ -1503,7 +1527,11 @@ class MultiFireSequenceDataset(FireSequenceDataset):
 		)
 		self.target_mean, self.target_std = FireSequenceDataset._resolve_target_normalization_stats(self)
 		self.initial_fuel_maps = {
-			int(record["dataset_id"]): _load_initial_fuel_map(record["file_paths"], self.config)
+			int(record["dataset_id"]): _load_initial_fuel_map(
+				record["file_paths"],
+				self.config,
+				initial_index=int(record["temporal_trim"]["trim_start_index"]),
+			)
 			for record in self.dataset_records
 			if self.task_type == "multitask" or _resolve_engineered_features_config(self.config)["enabled"]
 		}
@@ -1632,10 +1660,17 @@ class MultiFireSequenceDataset(FireSequenceDataset):
 		ref = self.sample_refs[index]
 		dataset_record = self.dataset_records[int(ref["dataset_id"])]
 		file_paths = dataset_record["file_paths"]
-		sample_start = int(ref["sample_index"])
-		current_index = sample_start + self.input_sequence_length - 1
-		future_index = current_index + self.prediction_horizon
-		input_file_paths = file_paths[sample_start : sample_start + self.input_sequence_length]
+		local_sample_start = int(ref["sample_index"])
+		sample_meta = temporal_sample_metadata(
+			dataset_record,
+			local_start_idx=local_sample_start,
+			input_sequence_length=self.input_sequence_length,
+			prediction_horizon=self.prediction_horizon,
+		)
+		sample_start = int(sample_meta["original_start_idx"])
+		current_index = int(sample_meta["original_last_input_idx"])
+		future_index = int(sample_meta["original_target_idx"])
+		input_file_paths = [file_paths[original_index] for original_index in sample_meta["original_input_indices"]]
 		current_file_path = file_paths[current_index]
 		target_file_path = file_paths[future_index]
 
@@ -1680,6 +1715,7 @@ class MultiFireSequenceDataset(FireSequenceDataset):
 			start_index=sample_start,
 			config=self.config,
 			energy_geometry=energy_geometry,
+			initial_fuel_index=int(sample_meta["trim_start_index"]),
 		)
 		if engineered_inputs.shape[:3] != stacked_inputs.shape[:3]:
 			raise ValueError(
@@ -1728,15 +1764,44 @@ class MultiFireSequenceDataset(FireSequenceDataset):
 			y_tensor = self.target_transform(y_tensor)
 
 		if self.return_metadata:
+			input_indices = list(range(sample_start, sample_start + self.input_sequence_length))
+			target_offsets = temporal_target_offsets(
+				{
+					"input_sequence_length": self.input_sequence_length,
+					"prediction_horizon": self.prediction_horizon,
+				}
+			)
 			metadata = {
 				"dataset_id": int(dataset_record["dataset_id"]),
 				"dataset_name": str(dataset_record["dataset_name"]),
 				"data_dir": str(dataset_record["data_dir"]),
-				"sample_index": sample_start,
+				"sample_index": local_sample_start,
+				"start_idx": local_sample_start,
+				"input_indices": input_indices,
+				"last_input_idx": current_index,
+				"target_idx": future_index,
 				"current_idx": current_index,
 				"future_idx": future_index,
 				"current_index": current_index,
 				"future_index": future_index,
+				"input_sequence_length": int(self.input_sequence_length),
+				"prediction_horizon": int(self.prediction_horizon),
+				"target_offset_from_start": int(target_offsets["target_offset_from_start"]),
+				"target_offset_from_last_input": int(target_offsets["target_offset_from_last_input"]),
+				"target_definition_version": target_definition_version(self.config),
+				"local_start_idx": int(sample_meta["local_start_idx"]),
+				"local_input_indices": list(sample_meta["local_input_indices"]),
+				"local_last_input_idx": int(sample_meta["local_last_input_idx"]),
+				"local_target_idx": int(sample_meta["local_target_idx"]),
+				"original_start_idx": int(sample_meta["original_start_idx"]),
+				"original_input_indices": list(sample_meta["original_input_indices"]),
+				"original_last_input_idx": int(sample_meta["original_last_input_idx"]),
+				"original_target_idx": int(sample_meta["original_target_idx"]),
+				"trim_start_index": int(sample_meta["trim_start_index"]),
+				"trim_end_index": int(sample_meta["trim_end_index"]),
+				"trimmed_num_frames": int(sample_meta["trimmed_num_frames"]),
+				"original_num_frames": int(sample_meta["original_num_frames"]),
+				"temporal_trim_enabled": bool(sample_meta["temporal_trim_enabled"]),
 				"current_file": str(current_file_path),
 				"future_file": str(target_file_path),
 				"current_file_path": str(current_file_path),

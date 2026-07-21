@@ -31,6 +31,7 @@ from src.config import load_config
 from src.data.cache import MANIFEST_FILENAME, get_patch_cache_dir
 from src.data.dataset import create_dataloaders, metadata_batch_to_list
 from src.data.patching import resolve_patching_config
+from src.models.evaluation import _validate_checkpoint_sequence
 from src.models.model_factory import build_model_from_config
 from src.training.checkpoints import load_checkpoint, validate_checkpoint_model_compatibility
 from src.training.hardware import autocast_context, choose_amp_dtype
@@ -116,6 +117,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--save_npz", action="store_true", help="Save raw y/pred arrays for plotted samples.")
 	parser.add_argument("--device", default="auto", help="Device to use: auto, cpu, cuda, cuda:0, etc.")
 	parser.add_argument("--allow_architecture_mismatch", action="store_true", help="Continue despite checkpoint architecture mismatch.")
+	parser.add_argument(
+		"--allow_sequence_mismatch",
+		action="store_true",
+		help="Continue despite checkpoint T/horizon metadata mismatch with the config.",
+	)
 	return parser
 
 
@@ -446,6 +452,11 @@ def checkpoint_metadata_payload(
 		"best_epoch": checkpoint.get("best_epoch"),
 		"best_metric": checkpoint.get("best_metric", checkpoint.get("best_val_loss")),
 		"global_step": checkpoint.get("global_step"),
+		"input_sequence_length": checkpoint.get("input_sequence_length"),
+		"prediction_horizon": checkpoint.get("prediction_horizon"),
+		"target_offset_from_start": checkpoint.get("target_offset_from_start"),
+		"target_offset_from_last_input": checkpoint.get("target_offset_from_last_input"),
+		"target_definition_version": checkpoint.get("target_definition_version"),
 		"file_size_bytes": int(stat.st_size),
 		"modified_time": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
 	}
@@ -533,6 +544,15 @@ def _metadata_csv_fields(metadata: Mapping[str, Any]) -> dict[str, Any]:
 		"current_index",
 		"future_idx",
 		"future_index",
+		"start_idx",
+		"input_indices",
+		"last_input_idx",
+		"target_idx",
+		"input_sequence_length",
+		"prediction_horizon",
+		"target_offset_from_start",
+		"target_offset_from_last_input",
+		"target_definition_version",
 		"patch",
 		"patch_top",
 		"patch_left",
@@ -557,7 +577,10 @@ def _metadata_title(metadata: Mapping[str, Any]) -> str:
 		)
 	else:
 		patch_text = "patch=unknown"
-	return f"fire={fire_name} | sample={sample_index} | {patch_text}"
+	target_text = ""
+	if "target_idx" in metadata or "prediction_horizon" in metadata:
+		target_text = f" | target={metadata.get('target_idx', 'unknown')} H={metadata.get('prediction_horizon', 'unknown')}"
+	return f"fire={fire_name} | sample={sample_index}{target_text} | {patch_text}"
 
 
 def _robust_vmax(*arrays: Any, percentile: float = 99.0, minimum: float = 1.0) -> float:
@@ -836,6 +859,7 @@ def _normalization_debug(config: Mapping[str, Any], loader, input_channels: int,
 		"cache_manifest_path": cache_manifest_path,
 		"patch_size": patching.get("patch_size"),
 		"input_sequence_length": config.get("input_sequence_length"),
+		"prediction_horizon": config.get("prediction_horizon"),
 		"input_channels": int(input_channels),
 		"output_channels": int(model_config.get("output_channels", 4)),
 		"split": str(split),
@@ -915,7 +939,20 @@ def _print_checkpoint_metadata(metadata: Mapping[str, Any]) -> None:
 	print("-------------------")
 	print(f"path: {metadata.get('checkpoint_path')}")
 	print(f"keys: {metadata.get('checkpoint_keys')}")
-	for key in ("architecture", "requested_architecture", "run_name", "epoch", "best_epoch", "best_metric", "global_step"):
+	for key in (
+		"architecture",
+		"requested_architecture",
+		"run_name",
+		"epoch",
+		"best_epoch",
+		"best_metric",
+		"global_step",
+		"input_sequence_length",
+		"prediction_horizon",
+		"target_offset_from_start",
+		"target_offset_from_last_input",
+		"target_definition_version",
+	):
 		print(f"{key}: {metadata.get(key)}")
 
 
@@ -957,6 +994,12 @@ def main() -> None:
 		checkpoint_path,
 		requested_architecture=args.model_architecture,
 		allow_architecture_mismatch=bool(args.allow_architecture_mismatch),
+	)
+	_validate_checkpoint_sequence(
+		checkpoint,
+		config,
+		checkpoint_path,
+		allow_sequence_mismatch=bool(args.allow_sequence_mismatch),
 	)
 	_print_checkpoint_metadata(checkpoint_metadata)
 	save_json(output_dir / "checkpoint_metadata.json", checkpoint_metadata)
