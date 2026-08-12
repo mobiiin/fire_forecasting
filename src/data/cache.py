@@ -176,6 +176,9 @@ def resolve_dataset_index_path(config: Mapping[str, Any]) -> Path | None:
 
 	index_path = config.get("fire_dataset_index_json")
 	if index_path in (None, "", "null"):
+		data_config = _get_section(config, "data")
+		index_path = data_config.get("fire_dataset_index_json", data_config.get("fire_dataset_index"))
+	if index_path in (None, "", "null"):
 		return None
 	return _resolve_config_relative_path(config, index_path)
 

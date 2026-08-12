@@ -20,6 +20,7 @@ from src.config import load_config
 from src.data.spatial_transforms import infer_with_external_test_spatial_handling
 from src.models.convlstm_unet import build_model_from_config
 from src.training.checkpoints import load_checkpoint, validate_checkpoint_model_compatibility
+from src.training.input_normalization import apply_input_normalization, build_input_normalizer_for_loader
 from src.training.losses import get_loss_function
 from src.training.metrics import compute_metrics
 from src.training.train import (
@@ -67,6 +68,8 @@ def generate_scale_diagnostics(model, test_loader, device: torch.device, diagnos
     dataset = test_loader.dataset
     target_channel = int(getattr(dataset, "target_channel", -1))
     input_channel_count = int(getattr(dataset, "input_channel_count", -1))
+    input_channels = int(getattr(dataset, "total_input_channels", input_channel_count))
+    input_normalizer = build_input_normalizer_for_loader(test_loader, device, input_channels, config)
 
     lines = []
     lines.append("Test Scale Diagnostics")
@@ -87,6 +90,7 @@ def generate_scale_diagnostics(model, test_loader, device: torch.device, diagnos
 
             x_batch = batch[0].to(device)
             y_batch = batch[1].to(device)
+            x_batch = apply_input_normalization(x_batch, input_normalizer, config)
             spatial_result = infer_with_external_test_spatial_handling(model, x_batch, config)
             y_pred = spatial_result["y_pred"]
             x_model_input = spatial_result["x_model_input"]
@@ -129,6 +133,9 @@ def evaluate_external_test_loader(model, test_loader, criterion, config, device:
     mode_counts: dict[str, int] = defaultdict(int)
     first_batch_summary: dict[str, Any] | None = None
     warning_message: str | None = None
+    dataset = getattr(test_loader, "dataset", None)
+    input_channels = int(getattr(dataset, "total_input_channels", getattr(dataset, "input_channel_count", 0)))
+    input_normalizer = build_input_normalizer_for_loader(test_loader, device, input_channels, config) if input_channels > 0 else None
 
     with torch.no_grad():
         for batch_index, batch in enumerate(test_loader):
@@ -136,6 +143,7 @@ def evaluate_external_test_loader(model, test_loader, criterion, config, device:
                 raise TypeError("Expected external test batches to contain input and target tensors.")
             x_batch = batch[0].to(device)
             y_batch = batch[1].to(device)
+            x_batch = apply_input_normalization(x_batch, input_normalizer, config)
 
             spatial_result = infer_with_external_test_spatial_handling(model, x_batch, config)
             y_pred = spatial_result["y_pred"]
@@ -199,6 +207,9 @@ def evaluate_multi_dataset_test_loader(model, test_loader, criterion, config, de
     aggregate_loss_component_totals: dict[str, float] = defaultdict(float)
     aggregate_samples = 0
     per_dataset: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    dataset = getattr(test_loader, "dataset", None)
+    input_channels = int(getattr(dataset, "total_input_channels", getattr(dataset, "input_channel_count", 0)))
+    input_normalizer = build_input_normalizer_for_loader(test_loader, device, input_channels, config) if input_channels > 0 else None
 
     with torch.no_grad():
         for batch in test_loader:
@@ -208,6 +219,7 @@ def evaluate_multi_dataset_test_loader(model, test_loader, criterion, config, de
                 )
             x_batch = batch[0].to(device)
             y_batch = batch[1].to(device)
+            x_batch = apply_input_normalization(x_batch, input_normalizer, config)
             metadata_items = metadata_batch_to_list(batch[2])
             y_pred = model(x_batch)
             if tuple(y_pred.shape) != tuple(y_batch.shape):

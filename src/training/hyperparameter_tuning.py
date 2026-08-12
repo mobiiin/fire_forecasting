@@ -263,9 +263,16 @@ def make_trial_config(
 	if max_train_batches_per_epoch is not None:
 		performance["max_train_batches_per_epoch"] = int(max_train_batches_per_epoch)
 	if max_val_batches_per_epoch is not None:
-		performance["max_val_batches_per_epoch"] = int(max_val_batches_per_epoch)
-	if "full_validation_every_n_epochs" in performance:
-		training["full_validation_every_n_epochs"] = performance["full_validation_every_n_epochs"]
+		validation = training.setdefault("validation", {})
+		if not isinstance(validation, dict):
+			validation = {}
+			training["validation"] = validation
+		validation.setdefault("mode", "fixed_subset_every_epoch")
+		validation["max_val_batches_per_epoch"] = int(max_val_batches_per_epoch)
+		validation.setdefault("fixed_subset_seed", 42)
+		validation.setdefault("fixed_subset_shuffle", False)
+		validation.setdefault("use_same_metric_for_checkpointing", True)
+	performance.pop("full_validation_every_n_epochs", None)
 
 	root = repo_root()
 	checkpoint = config.setdefault("checkpoint", {})
@@ -417,9 +424,12 @@ def make_final_config_from_best_params(
 	performance = training.setdefault("performance", {})
 	performance["max_train_batches_per_epoch"] = None
 	delete_nested(config, "training.performance.max_val_batches_per_epoch")
+	delete_nested(config, "training.performance.full_validation_every_n_epochs")
 	base_training = base_config.get("training", {})
-	if isinstance(base_training, Mapping) and "max_val_batches_per_epoch" in base_training:
-		training["max_val_batches_per_epoch"] = base_config["training"]["max_val_batches_per_epoch"]
+	if isinstance(base_training, Mapping):
+		base_validation = base_training.get("validation", {})
+		if isinstance(base_validation, Mapping):
+			training["validation"] = deepcopy(dict(base_validation))
 	training.pop("early_stopping_patience", None)
 
 	cache = config.setdefault("cache", {})

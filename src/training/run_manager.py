@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+from src.config import compute_file_sha256, compute_text_sha256
+
 try:
 	import yaml  # type: ignore[import-not-found]
 except ImportError:  # pragma: no cover - dependency is already required by config.py
@@ -38,6 +40,7 @@ DEFAULT_OUTPUT_CONFIG: dict[str, Any] = {
 	"save_hardware_summary": True,
 	"save_cache_manifest_copy": True,
 	"save_normalization_stats_copy": True,
+	"copy_normalization_npz": False,
 }
 
 DEFAULT_CHECKPOINTING_CONFIG: dict[str, Any] = {
@@ -119,6 +122,19 @@ def generated_run_name(architecture: str) -> str:
 	return f"{sanitize_run_component(architecture)}_{timestamp}_{suffix}"
 
 
+def generated_experiment_run_name(architecture: str, experiment_name: str | None = None) -> str:
+	"""Build the default run name, including experiment name when configured."""
+
+	timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+	slurm_job_id = os.environ.get("SLURM_JOB_ID")
+	suffix = f"slurm{sanitize_run_component(slurm_job_id, 'job')}" if slurm_job_id else f"local{os.getpid()}"
+	parts = [sanitize_run_component(architecture)]
+	if experiment_name not in (None, "", "null"):
+		parts.append(sanitize_run_component(str(experiment_name), "experiment"))
+	parts.extend([timestamp, suffix])
+	return "_".join(parts)
+
+
 def _write_json(path: Path, payload: Mapping[str, Any]) -> Path:
 	path.parent.mkdir(parents=True, exist_ok=True)
 	with path.open("w", encoding="utf-8") as handle:
@@ -177,7 +193,8 @@ class RunManager:
 		training_config = _section(config, "training")
 		explicit_run_name = run_name if run_name not in (None, "", "null") else training_config.get("run_name")
 		if explicit_run_name in (None, "", "null"):
-			self.requested_run_name = generated_run_name(self.architecture)
+			experiment = _section(config, "experiment")
+			self.requested_run_name = generated_experiment_run_name(self.architecture, experiment.get("name"))
 		else:
 			self.requested_run_name = sanitize_run_component(explicit_run_name, fallback=self.architecture)
 		self.overwrite_run = bool(training_config.get("overwrite_run", False))
@@ -296,13 +313,45 @@ class RunManager:
 
 		self.create_run_dir()
 		paths: dict[str, str] = {}
-		if original_config is not None and bool(self.output_config.get("save_original_config", True)):
+		config_path_value = self.config.get("config_path", self.config.get("_config_path"))
+		if bool(self.output_config.get("save_original_config", True)) and config_path_value not in (None, "", "null"):
+			source = Path(str(config_path_value)).expanduser().resolve()
+			path = self.config_path("original_config.yaml")
+			shutil.copyfile(source, path)
+			paths["original_config_path"] = str(path)
+		elif original_config is not None and bool(self.output_config.get("save_original_config", True)):
 			path = _write_yaml_or_json(self.config_path("original_config.yaml"), dict(original_config))
 			paths["original_config_path"] = str(path)
 		if resolved_config is not None and bool(self.output_config.get("save_resolved_config", True)):
 			path = _write_yaml_or_json(self.config_path("resolved_config.yaml"), dict(resolved_config))
 			paths["resolved_config_path"] = str(path)
+			config_used_path = _write_yaml_or_json(self.config_path("config_used.yaml"), dict(resolved_config))
+			paths["config_used_path"] = str(config_used_path)
+		self.save_config_metadata(paths, resolved_config)
 		return paths
+
+	def save_config_metadata(self, config_paths: Mapping[str, str], resolved_config: Mapping[str, Any] | None) -> Path:
+		"""Save config provenance metadata for the run."""
+
+		config_path_value = self.config.get("config_path", self.config.get("_config_path"))
+		config_path = None if config_path_value in (None, "", "null") else Path(str(config_path_value)).expanduser().resolve()
+		resolved_text = ""
+		if yaml is not None and resolved_config is not None:
+			resolved_text = yaml.safe_dump(_to_builtin(dict(resolved_config)), sort_keys=False)
+		elif resolved_config is not None:
+			resolved_text = json.dumps(_to_builtin(dict(resolved_config)), sort_keys=True)
+		payload = {
+			"config_path_passed": str(config_path) if config_path is not None else None,
+			"config_file_name": config_path.name if config_path is not None else None,
+			"config_sha256": compute_file_sha256(config_path) if config_path is not None and config_path.exists() else None,
+			"resolved_config_sha256": compute_text_sha256(resolved_text) if resolved_text else None,
+			"base_config_path": self.config.get("_base_config_path", self.config.get("base_config")),
+			"base_config_sha256": self.config.get("_base_config_sha256"),
+			"experiment_name": _section(self.config, "experiment").get("name"),
+			"created_at": datetime.now(timezone.utc).isoformat(),
+			"artifact_paths": dict(config_paths),
+		}
+		return self.save_metadata("config_metadata.json", payload)
 
 	def save_metadata(self, name: str, payload: Mapping[str, Any]) -> Path:
 		"""Save one JSON metadata payload."""
@@ -422,6 +471,7 @@ class RunManager:
 			"num_epochs_completed": training_result.get("num_epochs_completed"),
 			"global_steps": training_result.get("global_step"),
 			"config_path": self.config.get("config_path", self.config.get("_config_path")),
+			"experiment_name": _section(self.config, "experiment").get("name"),
 			"resolved_config_path": training_result.get("run_artifact_paths", {}).get("resolved_config_path")
 			if isinstance(training_result.get("run_artifact_paths"), Mapping)
 			else None,
@@ -433,5 +483,5 @@ class RunManager:
 			"python": sys.version,
 			"notes": notes,
 		}
-		summary.update({key: value for key, value in training_result.items() if key in {"test_results", "training_curve_paths"}})
+		summary.update({key: value for key, value in training_result.items() if key in {"test_results", "training_curve_paths", "normalization", "validation", "early_stopping", "stopped_early", "stop_reason", "stop_epoch", "epochs_completed"}})
 		return self.save_metadata("run_summary.json", summary)

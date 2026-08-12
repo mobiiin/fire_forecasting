@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import csv
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import shutil
+import socket
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -17,7 +20,7 @@ try:
 except ImportError:  # pragma: no cover - optional .pt shards
 	torch = None
 
-from src.config import load_config
+from src.config import compute_file_sha256, compute_text_sha256, load_config
 from src.data.cache import (
 	MANIFEST_FILENAME,
 	compute_cache_config_hash,
@@ -60,6 +63,64 @@ def _ensure_config_path(config: dict[str, Any], config_path: str | Path) -> dict
 	config["config_path"] = str(resolved_path)
 	config["_config_path"] = str(resolved_path)
 	return config
+
+
+def _resolved_config_sha256(config: Mapping[str, Any]) -> str:
+	encoded = json.dumps(config, sort_keys=True, default=str)
+	return compute_text_sha256(encoded)
+
+
+def _config_provenance(config: Mapping[str, Any]) -> dict[str, Any]:
+	config_path_value = config.get("config_path", config.get("_config_path"))
+	config_path = None if config_path_value in (None, "", "null") else Path(str(config_path_value)).expanduser().resolve()
+	return {
+		"config_path": str(config_path) if config_path is not None else None,
+		"config_file_name": config_path.name if config_path is not None else None,
+		"config_sha256": compute_file_sha256(config_path) if config_path is not None and config_path.exists() else None,
+		"resolved_config_sha256": _resolved_config_sha256(config),
+		"base_config_path": config.get("_base_config_path", config.get("base_config")),
+		"base_config_sha256": config.get("_base_config_sha256"),
+		"experiment_name": _get_section(config, "experiment").get("name"),
+	}
+
+
+def _acquire_cache_lock(cache_dir: Path, config: Mapping[str, Any], *, force: bool = False, ignore_stale_lock: bool = False) -> Path:
+	lock_path = cache_dir / ".precompute_lock"
+	lock_payload = {
+		"created_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+		"hostname": socket.gethostname(),
+		"pid": os.getpid(),
+		"slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+		"cache_dir": str(cache_dir),
+		"config_path": config.get("config_path", config.get("_config_path")),
+	}
+	if lock_path.exists() and not (force or ignore_stale_lock):
+		try:
+			existing = json.loads(lock_path.read_text(encoding="utf-8"))
+		except Exception:
+			existing = {"raw": lock_path.read_text(encoding="utf-8", errors="replace")}
+		raise RuntimeError(
+			f"Patch cache lock already exists: {lock_path}\n"
+			f"Existing lock: {json.dumps(existing, sort_keys=True, default=str)}\n"
+			"Use --ignore_stale_lock for an abandoned lock, or --force when intentionally taking ownership."
+		)
+	if not (force or ignore_stale_lock):
+		try:
+			fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+		except FileExistsError as exc:
+			raise RuntimeError(f"Patch cache lock already exists: {lock_path}") from exc
+		with os.fdopen(fd, "w", encoding="utf-8") as handle:
+			json.dump(lock_payload, handle, indent=2, sort_keys=True)
+			handle.write("\n")
+		return lock_path
+	temp_path = lock_path.with_name(f".{lock_path.name}.tmp.{os.getpid()}")
+	temp_path.write_text(json.dumps(lock_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+	os.replace(temp_path, lock_path)
+	return lock_path
+
+
+def _release_cache_lock(lock_path: Path) -> None:
+	lock_path.unlink(missing_ok=True)
 
 
 def _selected_splits(split: str) -> list[str]:
@@ -544,10 +605,18 @@ def _base_manifest(
 	target_offsets = temporal_target_offsets(config)
 	dataset_index_path = resolve_dataset_index_path(config)
 	trim_manifest = extract_temporal_trim_manifest(dataset_records)
+	config_provenance = _config_provenance(config)
 	return {
 		"cache_version": str(cache_config.get("cache_version", "v1")),
 		"created_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
 		"config_hash": compute_cache_config_hash(config),
+		"config_provenance": config_provenance,
+		"config_path": config_provenance["config_path"],
+		"config_sha256": config_provenance["config_sha256"],
+		"resolved_config_sha256": config_provenance["resolved_config_sha256"],
+		"base_config_path": config_provenance["base_config_path"],
+		"base_config_sha256": config_provenance["base_config_sha256"],
+		"experiment_name": config_provenance["experiment_name"],
 		"dataset_index_path": str(dataset_index_path) if dataset_index_path is not None else None,
 		"trimmed_index_path": str(dataset_index_path) if dataset_index_path is not None else None,
 		"dataset_index_hash": compute_dataset_index_hash(config),
@@ -1072,6 +1141,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 		help="Resume at or after this episode/sample index within the selected split.",
 	)
 	parser.add_argument("--overwrite", action="store_true", help="Overwrite existing shard files for the selected split(s).")
+	parser.add_argument("--force", action="store_true", help="Overwrite existing shards and take ownership of an existing cache lock.")
+	parser.add_argument("--ignore_stale_lock", action="store_true", help="Replace an abandoned cache lock before precomputing.")
 	return parser
 
 
@@ -1085,8 +1156,15 @@ def main() -> None:
 
 	cache_dir = get_patch_cache_dir(config)
 	selected = _selected_splits(args.split)
-	overwrite = bool(args.overwrite or cache_config.get("overwrite_existing", False))
+	overwrite = bool(args.overwrite or args.force or cache_config.get("overwrite_existing", False))
 	cache_dir.mkdir(parents=True, exist_ok=True)
+	lock_path = _acquire_cache_lock(
+		cache_dir,
+		config,
+		force=bool(args.force),
+		ignore_stale_lock=bool(args.ignore_stale_lock),
+	)
+	atexit.register(_release_cache_lock, lock_path)
 
 	for split in selected:
 		split_dir = cache_dir / split
@@ -1128,6 +1206,13 @@ def main() -> None:
 			)
 		for key in (
 			"cache_version",
+			"config_provenance",
+			"config_path",
+			"config_sha256",
+			"resolved_config_sha256",
+			"base_config_path",
+			"base_config_sha256",
+			"experiment_name",
 			"dataset_index_path",
 			"trimmed_index_path",
 			"dataset_index_hash",
@@ -1200,10 +1285,19 @@ def main() -> None:
 
 	manifest["created_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 	manifest["config_hash"] = compute_cache_config_hash(config)
+	config_provenance = _config_provenance(config)
+	manifest["config_provenance"] = config_provenance
+	manifest["config_path"] = config_provenance["config_path"]
+	manifest["config_sha256"] = config_provenance["config_sha256"]
+	manifest["resolved_config_sha256"] = config_provenance["resolved_config_sha256"]
+	manifest["base_config_path"] = config_provenance["base_config_path"]
+	manifest["base_config_sha256"] = config_provenance["base_config_sha256"]
+	manifest["experiment_name"] = config_provenance["experiment_name"]
 	with manifest_path.open("w", encoding="utf-8") as handle:
 		json.dump(manifest, handle, indent=2, sort_keys=True)
 		handle.write("\n")
 	_rebuild_summary_csv(cache_dir)
+	_release_cache_lock(lock_path)
 	print(f"Patch cache manifest: {manifest_path}")
 	print(f"Patch summary CSV: {cache_dir / 'patch_summary.csv'}")
 

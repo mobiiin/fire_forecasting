@@ -35,6 +35,8 @@ from src.models.evaluation import _validate_checkpoint_sequence
 from src.models.model_factory import build_model_from_config
 from src.training.checkpoints import load_checkpoint, validate_checkpoint_model_compatibility
 from src.training.hardware import autocast_context, choose_amp_dtype
+from src.training.input_normalization import input_batch_summary
+from src.training.metrics import compute_metrics
 from src.training.train import (
 	_apply_input_normalizer,
 	_build_input_normalizer,
@@ -101,7 +103,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
 	)
 	parser.add_argument("--config", required=True, help="YAML config used to build the dataloader/model.")
 	parser.add_argument("--model_architecture", required=True, help="Requested model architecture.")
-	parser.add_argument("--checkpoint", required=True, help="Path to checkpoint, usually checkpoints/best_model.pt.")
+	parser.add_argument("--checkpoint", default=None, help="Path to checkpoint, usually checkpoints/best_model.pt.")
 	parser.add_argument("--split", choices=("train", "val", "test"), default="test", help="Dataset split to inspect.")
 	parser.add_argument("--num_batches", type=int, default=2, help="Number of batches to run.")
 	parser.add_argument("--num_samples_to_plot", type=int, default=4, help="Maximum sample figures to save.")
@@ -115,6 +117,37 @@ def build_argument_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--energy_active_threshold_mw", type=float, default=1.0e-3)
 	parser.add_argument("--consumed_active_threshold", type=float, default=1.0e-3)
 	parser.add_argument("--save_npz", action="store_true", help="Save raw y/pred arrays for plotted samples.")
+	parser.add_argument("--run_background_diagnostics", action="store_true", help="Compute inactive-vs-active prediction diagnostics.")
+	parser.add_argument("--run_mask_gating_diagnostics", action="store_true", help="Evaluate diagnostic predicted-mask gating of regression outputs.")
+	parser.add_argument("--run_oracle_gating_diagnostics", action="store_true", help="Evaluate diagnostic target-mask oracle gating of regression outputs.")
+	parser.add_argument("--mask_gating_thresholds", type=float, nargs="+", default=[0.3, 0.5, 0.7])
+	parser.add_argument(
+		"--active_definition",
+		choices=("combined", "mask_only", "consumed_only", "energy_only"),
+		default="combined",
+		help="Target-based active-pixel definition for background/oracle diagnostics.",
+	)
+	parser.add_argument("--inactive_threshold", type=float, default=1.0e-6)
+	parser.add_argument(
+		"--compare_checkpoints",
+		nargs=2,
+		default=None,
+		metavar=("CHECKPOINT_A", "CHECKPOINT_B"),
+		help="Run checkpoint diagnostics on two checkpoints using the same selected batches.",
+	)
+	parser.add_argument(
+		"--checkpoint_labels",
+		nargs=2,
+		default=["checkpoint_a", "checkpoint_b"],
+		metavar=("LABEL_A", "LABEL_B"),
+		help="Labels for --compare_checkpoints outputs.",
+	)
+	parser.add_argument("--max_samples_for_diagnostics", type=int, default=None)
+	parser.add_argument(
+		"--compare_without_normalization",
+		action="store_true",
+		help="Also run each debug batch once without input normalization and record prediction-scale differences.",
+	)
 	parser.add_argument("--device", default="auto", help="Device to use: auto, cpu, cuda, cuda:0, etc.")
 	parser.add_argument("--allow_architecture_mismatch", action="store_true", help="Continue despite checkpoint architecture mismatch.")
 	parser.add_argument(
@@ -370,6 +403,343 @@ def compute_debug_metrics(
 	else:
 		metrics["active_energy_mw_mae_safe"] = math.nan
 	return {key: float(value) for key, value in metrics.items()}
+
+
+def _threshold_payload(
+	energy_active_threshold_mw: float,
+	consumed_active_threshold: float,
+	inactive_threshold: float,
+) -> dict[str, float]:
+	energy_mw = max(float(energy_active_threshold_mw), 0.0)
+	return {
+		"energy_active_threshold_mw": energy_mw,
+		"energy_active_threshold_log": float(math.log1p(energy_mw)),
+		"consumed_active_threshold": float(consumed_active_threshold),
+		"inactive_threshold": float(inactive_threshold),
+	}
+
+
+def build_active_mask(
+	y: torch.Tensor,
+	active_definition: str = "combined",
+	energy_active_threshold_mw: float = 1.0e-3,
+	consumed_active_threshold: float = 1.0e-3,
+) -> torch.Tensor:
+	"""Return target-defined active pixels shaped (B,H,W)."""
+
+	if y.ndim != 4 or int(y.shape[1]) != 4:
+		raise ValueError(f"Expected target y shape (B,4,H,W), got {tuple(y.shape)}.")
+	thresholds = _threshold_payload(energy_active_threshold_mw, consumed_active_threshold, inactive_threshold=1.0e-6)
+	y_surface = y[:, 0]
+	y_canopy = y[:, 1]
+	y_mask = y[:, 2]
+	y_energy_log = y[:, 3]
+	mask_active = y_mask > 0.5
+	consumed_active = (y_surface > thresholds["consumed_active_threshold"]) | (y_canopy > thresholds["consumed_active_threshold"])
+	energy_active = y_energy_log > thresholds["energy_active_threshold_log"]
+	mode = str(active_definition).lower()
+	if mode == "combined":
+		return mask_active | consumed_active | energy_active
+	if mode == "mask_only":
+		return mask_active
+	if mode == "consumed_only":
+		return consumed_active
+	if mode == "energy_only":
+		return energy_active
+	raise ValueError(f"Unsupported active_definition: {active_definition!r}.")
+
+
+def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> float:
+	selected = values.detach().float()[mask]
+	selected = selected[torch.isfinite(selected)]
+	return float(selected.mean().item()) if selected.numel() else math.nan
+
+
+def _masked_quantiles(values: torch.Tensor, mask: torch.Tensor) -> dict[str, float]:
+	selected = values.detach().float()[mask]
+	selected = selected[torch.isfinite(selected)]
+	if selected.numel() == 0:
+		return {"mean": math.nan, "median": math.nan, "p90": math.nan, "p95": math.nan, "max": math.nan}
+	quantiles = torch.quantile(selected, torch.tensor([0.5, 0.9, 0.95], dtype=torch.float32, device=selected.device))
+	return {
+		"mean": float(selected.mean().item()),
+		"median": float(quantiles[0].item()),
+		"p90": float(quantiles[1].item()),
+		"p95": float(quantiles[2].item()),
+		"max": float(selected.max().item()),
+	}
+
+
+def _safe_ratio(numerator: float, denominator: float) -> float:
+	if not math.isfinite(numerator) or not math.isfinite(denominator) or abs(denominator) <= 1.0e-12:
+		return math.nan
+	return float(numerator / denominator)
+
+
+def _metadata_sample_key(metadata: Mapping[str, Any], fallback_index: int) -> str:
+	parts = [
+		metadata.get("dataset_name"),
+		metadata.get("fire_name"),
+		metadata.get("sample_index", metadata.get("cache_local_index")),
+		metadata.get("target_idx", metadata.get("future_idx", metadata.get("future_index"))),
+		metadata.get("patch", None),
+		metadata.get("patch_top", None),
+		metadata.get("patch_left", None),
+	]
+	compact = [str(_to_jsonable(part)) for part in parts if part not in (None, "")]
+	return "|".join(compact) if compact else f"sample_{fallback_index}"
+
+
+def compute_background_diagnostics(
+	pred: torch.Tensor,
+	y: torch.Tensor,
+	metadata_items: Sequence[Mapping[str, Any]] | None = None,
+	active_definition: str = "combined",
+	energy_active_threshold_mw: float = 1.0e-3,
+	consumed_active_threshold: float = 1.0e-3,
+	inactive_threshold: float = 1.0e-6,
+	checkpoint_label: str | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+	"""Compute per-sample inactive/active prediction statistics."""
+
+	if pred.shape != y.shape or pred.ndim != 4 or int(pred.shape[1]) != 4:
+		raise ValueError(f"Expected pred/y tensors shaped (B,4,H,W), got pred={tuple(pred.shape)} y={tuple(y.shape)}.")
+	pred_cpu = pred.detach().float().cpu()
+	y_cpu = y.detach().float().cpu()
+	metadata_items = list(metadata_items or [{} for _ in range(int(pred_cpu.shape[0]))])
+	if len(metadata_items) < int(pred_cpu.shape[0]):
+		metadata_items.extend({} for _ in range(int(pred_cpu.shape[0]) - len(metadata_items)))
+
+	tensors = _prediction_tensors(pred_cpu, y_cpu)
+	active = build_active_mask(
+		y_cpu,
+		active_definition=active_definition,
+		energy_active_threshold_mw=energy_active_threshold_mw,
+		consumed_active_threshold=consumed_active_threshold,
+	)
+	rows: list[dict[str, Any]] = []
+	total_pixels = int(active.numel())
+	for sample_index in range(int(pred_cpu.shape[0])):
+		sample_active = active[sample_index]
+		sample_inactive = torch.logical_not(sample_active)
+		metadata = metadata_items[sample_index]
+		row: dict[str, Any] = {
+			"checkpoint_label": checkpoint_label or "",
+			"sample_global_index": int(sample_index),
+			"sample_key": _metadata_sample_key(metadata, sample_index),
+			"active_definition": str(active_definition),
+			"active_pixel_count": int(sample_active.sum().item()),
+			"inactive_pixel_count": int(sample_inactive.sum().item()),
+			"active_fraction": float(sample_active.float().mean().item()),
+			"inactive_fraction": float(sample_inactive.float().mean().item()),
+			**_metadata_csv_fields(metadata),
+		}
+		for prefix, mask in (("active", sample_active), ("inactive", sample_inactive)):
+			for source, key in (
+				("true_surface", "y_surface"),
+				("pred_surface", "pred_surface"),
+				("abs_surface", "abs_error_surface"),
+				("true_canopy", "y_canopy"),
+				("pred_canopy", "pred_canopy"),
+				("abs_canopy", "abs_error_canopy"),
+				("true_energy_log", "y_energy_log"),
+				("pred_energy_log", "pred_energy_log"),
+				("abs_energy_log", "abs_error_energy_log"),
+				("true_mask", "y_mask"),
+				("pred_mask_prob", "pred_mask_prob"),
+			):
+				row[f"{prefix}_{source}_mean"] = _masked_mean(tensors[key][sample_index], mask)
+		for prefix in ("active", "inactive"):
+			row[f"mean_pred_surface_{prefix}"] = row[f"{prefix}_pred_surface_mean"]
+			row[f"mean_true_surface_{prefix}"] = row[f"{prefix}_true_surface_mean"]
+			row[f"mean_abs_surface_{prefix}"] = row[f"{prefix}_abs_surface_mean"]
+			row[f"mean_pred_canopy_{prefix}"] = row[f"{prefix}_pred_canopy_mean"]
+			row[f"mean_true_canopy_{prefix}"] = row[f"{prefix}_true_canopy_mean"]
+			row[f"mean_abs_canopy_{prefix}"] = row[f"{prefix}_abs_canopy_mean"]
+			row[f"mean_pred_energy_log_{prefix}"] = row[f"{prefix}_pred_energy_log_mean"]
+			row[f"mean_true_energy_log_{prefix}"] = row[f"{prefix}_true_energy_log_mean"]
+			row[f"mean_abs_energy_log_{prefix}"] = row[f"{prefix}_abs_energy_log_mean"]
+			row[f"mean_pred_mask_prob_{prefix}"] = row[f"{prefix}_pred_mask_prob_mean"]
+			row[f"mean_true_mask_{prefix}"] = row[f"{prefix}_true_mask_mean"]
+		row["inactive_pred_surface_to_true_active_surface_mean_ratio"] = _safe_ratio(
+			row["inactive_pred_surface_mean"], row["active_true_surface_mean"]
+		)
+		row["inactive_pred_canopy_to_true_active_canopy_mean_ratio"] = _safe_ratio(
+			row["inactive_pred_canopy_mean"], row["active_true_canopy_mean"]
+		)
+		row["inactive_pred_energy_log_to_true_active_energy_log_mean_ratio"] = _safe_ratio(
+			row["inactive_pred_energy_log_mean"], row["active_true_energy_log_mean"]
+		)
+		row["inactive_pred_surface_to_active_true_surface_ratio"] = row["inactive_pred_surface_to_true_active_surface_mean_ratio"]
+		row["inactive_pred_canopy_to_active_true_canopy_ratio"] = row["inactive_pred_canopy_to_true_active_canopy_mean_ratio"]
+		row["inactive_pred_energy_to_active_true_energy_ratio"] = row["inactive_pred_energy_log_to_true_active_energy_log_mean_ratio"]
+		row["inactive_mask_prob_mean"] = row["inactive_pred_mask_prob_mean"]
+		rows.append(row)
+
+	inactive = torch.logical_not(active)
+	summary: dict[str, Any] = {
+		"validation_samples_used": int(pred_cpu.shape[0]),
+		"total_pixels": total_pixels,
+		"active_pixels": int(active.sum().item()),
+		"inactive_pixels": int(inactive.sum().item()),
+		"active_fraction": float(active.float().mean().item()) if total_pixels else math.nan,
+		"inactive_fraction": float(inactive.float().mean().item()) if total_pixels else math.nan,
+		"active_definition": str(active_definition),
+		"thresholds": _threshold_payload(energy_active_threshold_mw, consumed_active_threshold, inactive_threshold),
+		"checkpoint_label": checkpoint_label or "",
+		"warnings": [],
+	}
+	for name, key in (
+		("inactive_pred_surface", "pred_surface"),
+		("inactive_pred_canopy", "pred_canopy"),
+		("inactive_pred_energy_log", "pred_energy_log"),
+		("inactive_pred_mask_prob", "pred_mask_prob"),
+		("active_pred_surface", "pred_surface"),
+		("active_pred_canopy", "pred_canopy"),
+		("active_pred_energy_log", "pred_energy_log"),
+	):
+		mask = inactive if name.startswith("inactive") else active
+		summary[name] = _masked_quantiles(tensors[key], mask)
+	inactive_floor = float(inactive_threshold)
+	if summary["inactive_pred_surface"]["mean"] > inactive_floor:
+		summary["warnings"].append("Background surface overprediction detected.")
+	if summary["inactive_pred_canopy"]["mean"] > inactive_floor:
+		summary["warnings"].append("Background canopy overprediction detected.")
+	if summary["inactive_pred_energy_log"]["mean"] > inactive_floor:
+		summary["warnings"].append("Background energy overprediction detected.")
+	if summary["inactive_pred_mask_prob"]["mean"] > 0.1:
+		summary["warnings"].append("Mask probability is high in inactive background.")
+	return rows, summary
+
+
+def apply_predicted_mask_gating(pred: torch.Tensor, threshold: float) -> torch.Tensor:
+	"""Diagnostic-only gate: multiply regression channels by predicted mask probability threshold."""
+
+	pred_gated = pred.detach().clone()
+	gate = (torch.sigmoid(pred_gated[:, 2:3]) > float(threshold)).to(dtype=pred_gated.dtype)
+	pred_gated[:, 0:1] = pred_gated[:, 0:1] * gate
+	pred_gated[:, 1:2] = pred_gated[:, 1:2] * gate
+	pred_gated[:, 3:4] = pred_gated[:, 3:4] * gate
+	return pred_gated
+
+
+def apply_oracle_gating(
+	pred: torch.Tensor,
+	y: torch.Tensor,
+	active_definition: str = "combined",
+	energy_active_threshold_mw: float = 1.0e-3,
+	consumed_active_threshold: float = 1.0e-3,
+) -> torch.Tensor:
+	"""Diagnostic-only gate: multiply regression channels by the target-defined active support."""
+
+	pred_gated = pred.detach().clone()
+	gate = build_active_mask(
+		y,
+		active_definition=active_definition,
+		energy_active_threshold_mw=energy_active_threshold_mw,
+		consumed_active_threshold=consumed_active_threshold,
+	).unsqueeze(1).to(dtype=pred_gated.dtype, device=pred_gated.device)
+	pred_gated[:, 0:1] = pred_gated[:, 0:1] * gate
+	pred_gated[:, 1:2] = pred_gated[:, 1:2] * gate
+	pred_gated[:, 3:4] = pred_gated[:, 3:4] * gate
+	return pred_gated
+
+
+def _metric_row(prefix: str, metrics: Mapping[str, float]) -> dict[str, float]:
+	return {f"{prefix}_{key}": float(value) for key, value in metrics.items()}
+
+
+def _improvement(raw: float, gated: float) -> float:
+	if not math.isfinite(raw) or not math.isfinite(gated) or abs(raw) <= 1.0e-12:
+		return math.nan
+	return float((raw - gated) / abs(raw))
+
+
+def compute_mask_gating_diagnostics(
+	pred: torch.Tensor,
+	y: torch.Tensor,
+	config: Mapping[str, Any],
+	thresholds: Sequence[float],
+	checkpoint_label: str | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+	raw_metrics = compute_metrics(pred.detach(), y.detach(), config)
+	rows: list[dict[str, Any]] = []
+	for threshold in thresholds:
+		gated_pred = apply_predicted_mask_gating(pred, float(threshold))
+		gated_metrics = compute_metrics(gated_pred, y.detach(), config)
+		row: dict[str, Any] = {"checkpoint_label": checkpoint_label or "", "threshold": float(threshold)}
+		row.update(_metric_row("raw", raw_metrics))
+		row.update(_metric_row("gated", gated_metrics))
+		for key, raw_value in raw_metrics.items():
+			gated_value = gated_metrics.get(key, math.nan)
+			row[f"{key}_relative_improvement"] = _improvement(float(raw_value), float(gated_value))
+		rows.append(row)
+	summary = {
+		"checkpoint_label": checkpoint_label or "",
+		"raw_metrics": raw_metrics,
+		"best_by_energy_log_mae": min(rows, key=lambda row: float(row.get("gated_energy_log_mae", math.inf))) if rows else {},
+		"best_by_surface_consumed_mae": min(rows, key=lambda row: float(row.get("gated_surface_consumed_mae", math.inf))) if rows else {},
+		"note": "Diagnostic only: regression channels were multiplied by predicted mask threshold; model weights are unchanged.",
+	}
+	return rows, summary
+
+
+def compute_oracle_gating_diagnostics(
+	pred: torch.Tensor,
+	y: torch.Tensor,
+	config: Mapping[str, Any],
+	active_definition: str = "combined",
+	energy_active_threshold_mw: float = 1.0e-3,
+	consumed_active_threshold: float = 1.0e-3,
+	checkpoint_label: str | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+	raw_metrics = compute_metrics(pred.detach(), y.detach(), config)
+	oracle_pred = apply_oracle_gating(
+		pred,
+		y,
+		active_definition=active_definition,
+		energy_active_threshold_mw=energy_active_threshold_mw,
+		consumed_active_threshold=consumed_active_threshold,
+	)
+	oracle_metrics = compute_metrics(oracle_pred, y.detach(), config)
+	row: dict[str, Any] = {"checkpoint_label": checkpoint_label or "", "active_definition": str(active_definition)}
+	row.update(_metric_row("raw", raw_metrics))
+	row.update(_metric_row("oracle", oracle_metrics))
+	for key, raw_value in raw_metrics.items():
+		row[f"{key}_relative_improvement"] = _improvement(float(raw_value), float(oracle_metrics.get(key, math.nan)))
+	summary = {
+		"checkpoint_label": checkpoint_label or "",
+		"active_definition": str(active_definition),
+		"raw_metrics": raw_metrics,
+		"oracle_metrics": oracle_metrics,
+		"relative_improvements": {
+			key: _improvement(float(raw_value), float(oracle_metrics.get(key, math.nan))) for key, raw_value in raw_metrics.items()
+		},
+		"note": "Diagnostic only and not deployable: regression channels were multiplied by target-defined active support.",
+	}
+	return [row], summary
+
+
+def _summarize_numeric_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+	keys: list[str] = []
+	for row in rows:
+		for key, value in row.items():
+			if isinstance(value, (int, float)) and not isinstance(value, bool) and key not in keys:
+				keys.append(str(key))
+	summary: dict[str, Any] = {}
+	for key in keys:
+		values = [float(row[key]) for row in rows if key in row and math.isfinite(float(row[key]))]
+		if not values:
+			continue
+		array = np.asarray(values, dtype=np.float64)
+		summary[key] = {
+			"mean": float(array.mean()),
+			"median": float(np.median(array)),
+			"p90": float(np.percentile(array, 90)),
+			"p95": float(np.percentile(array, 95)),
+			"max": float(array.max()),
+		}
+	return summary
 
 
 def _select_loader(train_loader, val_loader, test_loader, split: str):
@@ -838,7 +1208,7 @@ def _normalization_debug(config: Mapping[str, Any], loader, input_channels: int,
 		if "mean" in stats and "std" in stats:
 			mean_count = int(np.asarray(stats["mean"]).reshape(-1).shape[0])
 			std_count = int(np.asarray(stats["std"]).reshape(-1).shape[0])
-			channel_count_matches = bool(mean_count >= int(input_channels) and std_count >= int(input_channels))
+			channel_count_matches = bool(mean_count == int(input_channels) and std_count == int(input_channels))
 
 	normalization_stats_path = _resolve_existing_normalization_stats_path(config)
 	cache_manifest_path = None
@@ -865,6 +1235,240 @@ def _normalization_debug(config: Mapping[str, Any], loader, input_channels: int,
 		"split": str(split),
 		"dataloader": _loader_summary(loader),
 	}
+
+
+def inspect_output_activation(model: torch.nn.Module, config: Mapping[str, Any]) -> dict[str, Any]:
+	"""Inspect output activation/config hints and the final Conv2d parameters when present."""
+
+	model_config = config.get("model", {}) if isinstance(config.get("model"), Mapping) else {}
+	training_config = config.get("training", {}) if isinstance(config.get("training"), Mapping) else {}
+	convlstm_config = config.get("convlstm_unet", {}) if isinstance(config.get("convlstm_unet"), Mapping) else {}
+	inspection: dict[str, Any] = {
+		"config_fields": {
+			"model.output_activation": model_config.get("output_activation"),
+			"model.final_activation": model_config.get("final_activation"),
+			"model.use_physical_output_constraints": model_config.get("use_physical_output_constraints"),
+			"model.regression_activation": model_config.get("regression_activation"),
+			"model.output_bias_init": model_config.get("output_bias_init"),
+			"convlstm_unet.use_mask_gated_regression": convlstm_config.get("use_mask_gated_regression"),
+			"convlstm_unet.regression_activation": convlstm_config.get("regression_activation"),
+			"convlstm_unet.mask_gate_mode": convlstm_config.get("mask_gate_mode"),
+			"convlstm_unet.detach_mask_gate": convlstm_config.get("detach_mask_gate"),
+			"convlstm_unet.mask_gate_min": convlstm_config.get("mask_gate_min"),
+			"convlstm_unet.output_bias_init": convlstm_config.get("output_bias_init"),
+			"training.output_activation": training_config.get("output_activation"),
+			"training.final_activation": training_config.get("final_activation"),
+			"training.use_physical_output_constraints": training_config.get("use_physical_output_constraints"),
+			"training.regression_activation": training_config.get("regression_activation"),
+			"training.output_bias_init": training_config.get("output_bias_init"),
+		},
+		"model_attributes": {},
+		"final_conv": {},
+		"softplus_zero_output_floor": float(torch.nn.functional.softplus(torch.zeros(())).item()),
+		"warnings": [],
+	}
+	for attr in ("output_activation", "final_activation", "use_physical_output_constraints", "physical_constraints"):
+		if hasattr(model, attr):
+			inspection["model_attributes"][attr] = _to_jsonable(getattr(model, attr))
+
+	final_conv = None
+	final_conv_name = None
+	for name, module in model.named_modules():
+		if isinstance(module, torch.nn.Conv2d):
+			final_conv = module
+			final_conv_name = name
+	if final_conv is not None:
+		inspection["final_conv"]["name"] = final_conv_name
+		inspection["final_conv"]["out_channels"] = int(final_conv.out_channels)
+		inspection["final_conv"]["in_channels"] = int(final_conv.in_channels)
+		with torch.no_grad():
+			weight = final_conv.weight.detach().float().cpu()
+			inspection["final_conv"]["weight"] = {
+				"min": float(weight.min().item()),
+				"mean": float(weight.mean().item()),
+				"max": float(weight.max().item()),
+				"std": float(weight.std(unbiased=False).item()) if weight.numel() > 1 else 0.0,
+			}
+			if final_conv.bias is not None:
+				bias = final_conv.bias.detach().float().cpu()
+				inspection["final_conv"]["bias"] = {
+					"min": float(bias.min().item()),
+					"mean": float(bias.mean().item()),
+					"max": float(bias.max().item()),
+				}
+				if abs(float(bias.mean().item())) < 0.1:
+					inspection["warnings"].append("final Conv2d bias is near zero; softplus(0) is about 0.693 if softplus is used.")
+
+	activation_values = [str(value).lower() for value in inspection["config_fields"].values() if value not in (None, "")]
+	activation_values.extend(str(value).lower() for value in inspection["model_attributes"].values() if value not in (None, ""))
+	if any("softplus" in value for value in activation_values):
+		inspection["warnings"].append("softplus(0)=0.693, which can create positive background predictions if final-layer bias is near zero.")
+	if not any(("softplus" in value or "relu" in value or "physical" in value or "constraint" in value) for value in activation_values):
+		inspection["warnings"].append("ConvLSTM regression channels are unconstrained; negative and large positive outputs are possible.")
+	return inspection
+
+
+def _diagnostic_conclusions(diagnostics: Mapping[str, Any]) -> list[str]:
+	conclusions: list[str] = []
+	background = diagnostics.get("background_summary")
+	if isinstance(background, Mapping):
+		inactive_surface = background.get("inactive_pred_surface", {})
+		inactive_canopy = background.get("inactive_pred_canopy", {})
+		inactive_energy = background.get("inactive_pred_energy_log", {})
+		if any(
+			float(section.get("mean", 0.0)) > 1.0e-6
+			for section in (inactive_surface, inactive_canopy, inactive_energy)
+			if isinstance(section, Mapping) and math.isfinite(float(section.get("mean", math.nan)))
+		):
+			conclusions.append("Background overprediction is likely if inactive-region means are materially above zero.")
+	mask_summary = diagnostics.get("mask_gating_summary")
+	if isinstance(mask_summary, Mapping):
+		best = mask_summary.get("best_by_energy_log_mae", {})
+		if isinstance(best, Mapping) and float(best.get("energy_log_mae_relative_improvement", 0.0)) > 0.20:
+			conclusions.append("Predicted-mask gating improved energy log MAE by more than 20%; regression outputs may be diffuse outside predicted active support.")
+	oracle_summary = diagnostics.get("oracle_gating_summary")
+	if isinstance(oracle_summary, Mapping):
+		improvements = oracle_summary.get("relative_improvements", {})
+		if isinstance(improvements, Mapping) and float(improvements.get("energy_log_mae", 0.0)) > 0.40:
+			conclusions.append("Oracle target gating improved energy log MAE by more than 40%; false positives outside true active support may dominate error.")
+	activation = diagnostics.get("output_activation_inspection")
+	if isinstance(activation, Mapping):
+		for warning in activation.get("warnings", []):
+			warning_text = str(warning)
+			if "softplus" in warning_text.lower() or "unconstrained" in warning_text.lower():
+				conclusions.append(warning_text)
+	comparison = diagnostics.get("checkpoint_comparison_summary")
+	if isinstance(comparison, Mapping):
+		warnings = comparison.get("warnings", [])
+		if warnings:
+			conclusions.extend(str(warning) for warning in warnings)
+	if not conclusions:
+		conclusions.append("No single diagnostic trigger crossed its heuristic threshold; inspect the CSV/JSON files for smaller effects.")
+	return conclusions
+
+
+def _diagnostics_summary_text(diagnostics: Mapping[str, Any]) -> str:
+	lines = ["", "Additional ConvLSTM Diagnostics", "-------------------------------"]
+	activation = diagnostics.get("output_activation_inspection")
+	if isinstance(activation, Mapping):
+		config_fields = activation.get("config_fields", {})
+		if isinstance(config_fields, Mapping):
+			lines.extend(
+				[
+					"ConvLSTM output gating:",
+					f"  enabled: {config_fields.get('convlstm_unet.use_mask_gated_regression')}",
+					f"  regression_activation: {config_fields.get('convlstm_unet.regression_activation')}",
+					f"  gate_mode: {config_fields.get('convlstm_unet.mask_gate_mode')}",
+					f"  detach_gate: {config_fields.get('convlstm_unet.detach_mask_gate')}",
+					f"  gate_min: {config_fields.get('convlstm_unet.mask_gate_min')}",
+				]
+			)
+	background = diagnostics.get("background_summary")
+	if isinstance(background, Mapping):
+		lines.append(
+			"background: "
+			f"inactive surface mean={_format_float(background.get('inactive_pred_surface', {}).get('mean', math.nan))}, "
+			f"inactive canopy mean={_format_float(background.get('inactive_pred_canopy', {}).get('mean', math.nan))}, "
+			f"inactive energy_log mean={_format_float(background.get('inactive_pred_energy_log', {}).get('mean', math.nan))}, "
+			f"inactive mask prob mean={_format_float(background.get('inactive_pred_mask_prob', {}).get('mean', math.nan))}"
+		)
+	mask_summary = diagnostics.get("mask_gating_summary")
+	if isinstance(mask_summary, Mapping):
+		best = mask_summary.get("best_by_energy_log_mae", {})
+		if isinstance(best, Mapping):
+			lines.append(
+				"predicted-mask gating: "
+				f"best threshold={best.get('threshold')}, "
+				f"energy_log_mae improvement={_format_float(best.get('energy_log_mae_relative_improvement', math.nan))}"
+			)
+	oracle_summary = diagnostics.get("oracle_gating_summary")
+	if isinstance(oracle_summary, Mapping):
+		improvements = oracle_summary.get("relative_improvements", {})
+		if isinstance(improvements, Mapping):
+			lines.append(f"oracle gating: energy_log_mae improvement={_format_float(improvements.get('energy_log_mae', math.nan))}")
+	if isinstance(activation, Mapping):
+		for warning in activation.get("warnings", []):
+			lines.append(f"activation warning: {warning}")
+	comparison = diagnostics.get("checkpoint_comparison_summary")
+	if isinstance(comparison, Mapping):
+		for warning in comparison.get("warnings", []):
+			lines.append(f"checkpoint comparison: {warning}")
+	lines.extend(["", "Main Diagnostic Conclusions", "---------------------------"])
+	for conclusion in _diagnostic_conclusions(diagnostics):
+		lines.append(f"- {conclusion}")
+	return "\n".join(lines) + "\n"
+
+
+def _diagnostic_sample_slice(
+	pred: torch.Tensor,
+	y: torch.Tensor,
+	metadata_items: Sequence[Mapping[str, Any]],
+	max_samples: int | None,
+) -> tuple[torch.Tensor, torch.Tensor, list[Mapping[str, Any]]]:
+	if max_samples is None:
+		return pred, y, list(metadata_items)
+	limit = max(0, min(int(max_samples), int(pred.shape[0])))
+	return pred[:limit], y[:limit], list(metadata_items)[:limit]
+
+
+def run_requested_diagnostics(
+	output_dir: Path,
+	pred: torch.Tensor,
+	y: torch.Tensor,
+	metadata_items: Sequence[Mapping[str, Any]],
+	config: Mapping[str, Any],
+	args: argparse.Namespace,
+	model: torch.nn.Module | None = None,
+	checkpoint_label: str | None = None,
+) -> dict[str, Any]:
+	diagnostics: dict[str, Any] = {}
+	pred_diag, y_diag, metadata_diag = _diagnostic_sample_slice(pred, y, metadata_items, args.max_samples_for_diagnostics)
+	if pred_diag.numel() == 0:
+		raise ValueError("--max_samples_for_diagnostics selected zero samples.")
+	if bool(args.run_background_diagnostics):
+		rows, summary = compute_background_diagnostics(
+			pred_diag,
+			y_diag,
+			metadata_diag,
+			active_definition=args.active_definition,
+			energy_active_threshold_mw=float(args.energy_active_threshold_mw),
+			consumed_active_threshold=float(args.consumed_active_threshold),
+			inactive_threshold=float(args.inactive_threshold),
+			checkpoint_label=checkpoint_label,
+		)
+		summary["per_sample_numeric_summary"] = _summarize_numeric_rows(rows)
+		_write_csv(output_dir / "background_diagnostics.csv", rows)
+		save_json(output_dir / "background_diagnostics_summary.json", summary)
+		diagnostics["background_summary"] = summary
+	if bool(args.run_mask_gating_diagnostics):
+		rows, summary = compute_mask_gating_diagnostics(
+			pred_diag,
+			y_diag,
+			config,
+			thresholds=args.mask_gating_thresholds,
+			checkpoint_label=checkpoint_label,
+		)
+		_write_csv(output_dir / "mask_gating_diagnostics.csv", rows)
+		save_json(output_dir / "mask_gating_diagnostics_summary.json", summary)
+		diagnostics["mask_gating_summary"] = summary
+	if bool(args.run_oracle_gating_diagnostics):
+		rows, summary = compute_oracle_gating_diagnostics(
+			pred_diag,
+			y_diag,
+			config,
+			active_definition=args.active_definition,
+			energy_active_threshold_mw=float(args.energy_active_threshold_mw),
+			consumed_active_threshold=float(args.consumed_active_threshold),
+			checkpoint_label=checkpoint_label,
+		)
+		_write_csv(output_dir / "oracle_gating_diagnostics.csv", rows)
+		save_json(output_dir / "oracle_gating_diagnostics_summary.json", summary)
+		diagnostics["oracle_gating_summary"] = summary
+	if model is not None:
+		inspection = inspect_output_activation(model, config)
+		save_json(output_dir / "output_activation_inspection.json", inspection)
+		diagnostics["output_activation_inspection"] = inspection
+	return diagnostics
 
 
 def _summary_text(
@@ -970,12 +1574,193 @@ def _print_stats(scope: str, rows: Sequence[Mapping[str, Any]]) -> None:
 		)
 
 
+def _collect_checkpoint_predictions(
+	checkpoint_path: str | Path,
+	checkpoint_label: str,
+	config: Mapping[str, Any],
+	args: argparse.Namespace,
+	selected_loader,
+	input_channels: int,
+	device: torch.device,
+	normalizer: Any,
+	amp_dtype: torch.dtype | None,
+) -> dict[str, Any]:
+	resolved_checkpoint_path = Path(checkpoint_path).expanduser().resolve()
+	checkpoint = load_checkpoint(resolved_checkpoint_path, map_location="cpu")
+	checkpoint_metadata = checkpoint_metadata_payload(
+		checkpoint,
+		resolved_checkpoint_path,
+		requested_architecture=args.model_architecture,
+		allow_architecture_mismatch=bool(args.allow_architecture_mismatch),
+	)
+	_validate_checkpoint_sequence(
+		checkpoint,
+		config,
+		resolved_checkpoint_path,
+		allow_sequence_mismatch=bool(args.allow_sequence_mismatch),
+	)
+	model = build_model_from_config(config, input_channels=input_channels).to(device)
+	validate_checkpoint_model_compatibility(model, checkpoint, resolved_checkpoint_path)
+	model.load_state_dict(_state_dict_from_checkpoint(checkpoint))
+	model.eval()
+
+	pred_batches: list[torch.Tensor] = []
+	y_batches: list[torch.Tensor] = []
+	metadata_items: list[dict[str, Any]] = []
+	metrics_by_batch: list[dict[str, Any]] = []
+	with torch.inference_mode():
+		for batch_index, batch in enumerate(selected_loader):
+			if batch_index >= int(args.num_batches):
+				break
+			if not isinstance(batch, (tuple, list)) or len(batch) < 2:
+				raise TypeError("Expected DataLoader batches with at least input and target tensors.")
+			x_batch = batch[0].to(device, non_blocking=True)
+			y_batch = batch[1].to(device, non_blocking=True).float()
+			x_batch = _apply_input_normalizer(x_batch, normalizer)
+			with autocast_context(device, amp_dtype):
+				model_output = model(x_batch)
+			pred, _aux = _extract_prediction_and_aux(model_output)
+			pred = pred.float()
+			_validate_shapes(x_batch, y_batch, pred)
+			pred_batches.append(pred.detach().cpu())
+			y_batches.append(y_batch.detach().cpu())
+			metadata_items.extend(_metadata_items(batch, int(pred.shape[0])))
+			row: dict[str, Any] = {"checkpoint_label": checkpoint_label, "batch_index": int(batch_index), "batch_size": int(pred.shape[0])}
+			row.update(compute_metrics(pred.detach().cpu(), y_batch.detach().cpu(), config))
+			metrics_by_batch.append(row)
+	if not pred_batches:
+		raise ValueError(f"Selected split {args.split!r} produced no batches for {resolved_checkpoint_path}.")
+	pred_all = torch.cat(pred_batches, dim=0)
+	y_all = torch.cat(y_batches, dim=0)
+	return {
+		"checkpoint_label": checkpoint_label,
+		"checkpoint_metadata": checkpoint_metadata,
+		"model": model,
+		"pred": pred_all,
+		"y": y_all,
+		"metadata_items": metadata_items,
+		"sample_keys": [_metadata_sample_key(metadata, index) for index, metadata in enumerate(metadata_items)],
+		"raw_metrics": compute_metrics(pred_all, y_all, config),
+		"metrics_by_batch": metrics_by_batch,
+	}
+
+
+def run_checkpoint_comparison(
+	output_dir: Path,
+	config: Mapping[str, Any],
+	args: argparse.Namespace,
+	selected_loader,
+	input_channels: int,
+	device: torch.device,
+	normalizer: Any,
+	amp_dtype: torch.dtype | None,
+) -> dict[str, Any]:
+	paths = list(args.compare_checkpoints or [])
+	labels = list(args.checkpoint_labels or ["checkpoint_a", "checkpoint_b"])
+	if len(paths) != 2 or len(labels) != 2:
+		raise ValueError("--compare_checkpoints and --checkpoint_labels must each contain exactly two values.")
+	results = [
+		_collect_checkpoint_predictions(paths[index], labels[index], config, args, selected_loader, input_channels, device, normalizer, amp_dtype)
+		for index in range(2)
+	]
+	sample_keys_match = results[0]["sample_keys"] == results[1]["sample_keys"]
+	rows: list[dict[str, Any]] = []
+	for result in results:
+		pred_diag, y_diag, metadata_diag = _diagnostic_sample_slice(
+			result["pred"], result["y"], result["metadata_items"], args.max_samples_for_diagnostics
+		)
+		background_rows, background_summary = compute_background_diagnostics(
+			pred_diag,
+			y_diag,
+			metadata_diag,
+			active_definition=args.active_definition,
+			energy_active_threshold_mw=float(args.energy_active_threshold_mw),
+			consumed_active_threshold=float(args.consumed_active_threshold),
+			inactive_threshold=float(args.inactive_threshold),
+			checkpoint_label=result["checkpoint_label"],
+		)
+		mask_rows, mask_summary = compute_mask_gating_diagnostics(
+			pred_diag,
+			y_diag,
+			config,
+			thresholds=args.mask_gating_thresholds,
+			checkpoint_label=result["checkpoint_label"],
+		)
+		oracle_rows, oracle_summary = compute_oracle_gating_diagnostics(
+			pred_diag,
+			y_diag,
+			config,
+			active_definition=args.active_definition,
+			energy_active_threshold_mw=float(args.energy_active_threshold_mw),
+			consumed_active_threshold=float(args.consumed_active_threshold),
+			checkpoint_label=result["checkpoint_label"],
+		)
+		row: dict[str, Any] = {
+			"checkpoint_label": result["checkpoint_label"],
+			"checkpoint_path": result["checkpoint_metadata"].get("checkpoint_path"),
+			"sample_keys_match_other_checkpoint": bool(sample_keys_match),
+			"num_samples": int(pred_diag.shape[0]),
+			"inactive_pred_surface_mean": background_summary["inactive_pred_surface"]["mean"],
+			"inactive_pred_canopy_mean": background_summary["inactive_pred_canopy"]["mean"],
+			"inactive_pred_energy_log_mean": background_summary["inactive_pred_energy_log"]["mean"],
+			"inactive_pred_mask_prob_mean": background_summary["inactive_pred_mask_prob"]["mean"],
+		}
+		row.update(_metric_row("raw", result["raw_metrics"]))
+		best_mask = mask_summary.get("best_by_energy_log_mae", {}) if isinstance(mask_summary, Mapping) else {}
+		if isinstance(best_mask, Mapping):
+			row["best_mask_gating_threshold"] = best_mask.get("threshold")
+			row["best_mask_gating_energy_log_mae_improvement"] = best_mask.get("energy_log_mae_relative_improvement")
+			row["best_mask_gating_surface_mae_improvement"] = best_mask.get("surface_consumed_mae_relative_improvement")
+		oracle_improvements = oracle_summary.get("relative_improvements", {}) if isinstance(oracle_summary, Mapping) else {}
+		if isinstance(oracle_improvements, Mapping):
+			row["oracle_energy_log_mae_improvement"] = oracle_improvements.get("energy_log_mae")
+			row["oracle_surface_mae_improvement"] = oracle_improvements.get("surface_consumed_mae")
+		rows.append(row)
+		_write_csv(output_dir / f"{result['checkpoint_label']}_background_diagnostics.csv", background_rows)
+		_write_csv(output_dir / f"{result['checkpoint_label']}_mask_gating_diagnostics.csv", mask_rows)
+		_write_csv(output_dir / f"{result['checkpoint_label']}_oracle_gating_diagnostics.csv", oracle_rows)
+
+	warnings: list[str] = []
+	if not sample_keys_match:
+		warnings.append("Checkpoint comparison did not use identical sample keys; check dataloader determinism.")
+	first, second = rows[0], rows[1]
+	for metric_key in ("raw_energy_log_mae", "raw_surface_consumed_mae", "raw_canopy_consumed_mae"):
+		a = float(first.get(metric_key, math.nan))
+		b = float(second.get(metric_key, math.nan))
+		if math.isfinite(a) and math.isfinite(b) and b > a * 1.05:
+			warnings.append(f"{labels[1]} is worse than {labels[0]} on {metric_key}.")
+	for diffuse_key in ("inactive_pred_surface_mean", "inactive_pred_canopy_mean", "inactive_pred_energy_log_mean", "inactive_pred_mask_prob_mean"):
+		a = float(first.get(diffuse_key, math.nan))
+		b = float(second.get(diffuse_key, math.nan))
+		if math.isfinite(a) and math.isfinite(b) and b > max(a * 1.25, a + 1.0e-6):
+			warnings.append(f"{labels[1]} appears more diffuse than {labels[0]} for {diffuse_key}.")
+	if warnings and labels[0].lower() == "best" and labels[1].lower() == "latest":
+		warnings.append("Latest checkpoint appears more diffuse/overfit than best checkpoint.")
+	summary = {
+		"labels": labels,
+		"checkpoint_paths": [str(Path(path).expanduser().resolve()) for path in paths],
+		"sample_keys_match": bool(sample_keys_match),
+		"num_samples_compared": int(min(len(results[0]["sample_keys"]), len(results[1]["sample_keys"]))),
+		"rows": rows,
+		"warnings": warnings,
+	}
+	_write_csv(output_dir / "checkpoint_comparison.csv", rows)
+	save_json(output_dir / "checkpoint_comparison_summary.json", summary)
+	return summary
+
+
 def main() -> None:
 	args = build_argument_parser().parse_args()
 	if int(args.num_batches) <= 0:
 		raise ValueError("--num_batches must be positive.")
 	if int(args.num_samples_to_plot) < 0:
 		raise ValueError("--num_samples_to_plot must be nonnegative.")
+	if args.max_samples_for_diagnostics is not None and int(args.max_samples_for_diagnostics) <= 0:
+		raise ValueError("--max_samples_for_diagnostics must be positive when provided.")
+	if args.checkpoint is None and not args.compare_checkpoints:
+		raise ValueError("Provide --checkpoint or --compare_checkpoints.")
+	if args.checkpoint is None and args.compare_checkpoints:
+		args.checkpoint = args.compare_checkpoints[0]
 
 	output_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir else _default_output_dir(args.model_architecture)
 	figures_dir = output_dir / "figures"
@@ -1027,11 +1812,14 @@ def main() -> None:
 		print(f"{key}: {_to_jsonable(value)}")
 
 	stats_rows: list[dict[str, Any]] = []
+	normalization_rows: list[dict[str, Any]] = []
+	normalization_comparison_rows: list[dict[str, Any]] = []
 	metrics_by_batch: list[dict[str, Any]] = []
 	pred_batches: list[torch.Tensor] = []
 	y_batches: list[torch.Tensor] = []
 	aux_summaries: list[dict[str, Any]] = []
 	metadata_rows: list[dict[str, Any]] = []
+	all_metadata_items: list[dict[str, Any]] = []
 	plotted_count = 0
 
 	with torch.inference_mode():
@@ -1042,11 +1830,26 @@ def main() -> None:
 				raise TypeError("Expected DataLoader batches with at least input and target tensors.")
 			x_batch = batch[0].to(device, non_blocking=True)
 			y_batch = batch[1].to(device, non_blocking=True)
+			raw_x_for_comparison = x_batch.clone() if bool(args.compare_without_normalization) and normalizer is not None else None
+			normalization_row: dict[str, Any] = {"batch_index": int(batch_index), "normalizer_applied": normalizer is not None}
+			normalization_row.update(input_batch_summary(x_batch, prefix="raw_x"))
 			x_batch = _apply_input_normalizer(x_batch, normalizer)
+			normalization_row.update(input_batch_summary(x_batch, prefix="model_x"))
+			normalization_rows.append(normalization_row)
 			with autocast_context(device, amp_dtype):
 				model_output = model(x_batch)
 			pred, aux = _extract_prediction_and_aux(model_output)
 			pred = pred.float()
+			if raw_x_for_comparison is not None:
+				with autocast_context(device, amp_dtype):
+					raw_model_output = model(raw_x_for_comparison)
+				raw_pred, _raw_aux = _extract_prediction_and_aux(raw_model_output)
+				raw_pred = raw_pred.float()
+				comparison_row: dict[str, Any] = {"batch_index": int(batch_index)}
+				comparison_row.update(input_batch_summary(raw_pred, prefix="pred_without_norm"))
+				comparison_row.update(input_batch_summary(pred, prefix="pred_with_norm"))
+				comparison_row["mean_abs_prediction_delta"] = float((raw_pred - pred).detach().abs().mean().item())
+				normalization_comparison_rows.append(comparison_row)
 			y_batch = y_batch.float()
 			_validate_shapes(x_batch, y_batch, pred)
 
@@ -1075,6 +1878,7 @@ def main() -> None:
 			y_batches.append(y_cpu)
 
 			items = _metadata_items(batch, int(pred.shape[0]))
+			all_metadata_items.extend(items)
 			for sample_index, metadata in enumerate(items):
 				metadata_rows.append(
 					{
@@ -1125,11 +1929,47 @@ def main() -> None:
 	for warning in warnings:
 		print(warning)
 
+	diagnostic_outputs: dict[str, Any] = {}
+	should_run_extra_diagnostics = bool(
+		args.run_background_diagnostics
+		or args.run_mask_gating_diagnostics
+		or args.run_oracle_gating_diagnostics
+		or args.compare_checkpoints
+	)
+	if should_run_extra_diagnostics:
+		diagnostic_outputs.update(
+			run_requested_diagnostics(
+				output_dir,
+				pred_all,
+				y_all,
+				all_metadata_items,
+				config,
+				args,
+				model=model,
+				checkpoint_label=Path(str(args.checkpoint)).stem if args.checkpoint else None,
+			)
+		)
+	if args.compare_checkpoints:
+		comparison_summary = run_checkpoint_comparison(
+			output_dir,
+			config,
+			args,
+			selected_loader,
+			input_channels,
+			device,
+			normalizer,
+			amp_dtype,
+		)
+		diagnostic_outputs["checkpoint_comparison_summary"] = comparison_summary
+
 	_write_csv(
 		output_dir / "channel_stats.csv",
 		flatten_stats_to_csv(stats_rows),
 		fieldnames=["scope", "batch_index", "name", "numel", *STATS_FIELDS],
 	)
+	_write_csv(output_dir / "input_normalization_stats.csv", normalization_rows)
+	if normalization_comparison_rows:
+		_write_csv(output_dir / "normalization_comparison.csv", normalization_comparison_rows)
 	_write_csv(output_dir / "metrics_by_batch.csv", metrics_by_batch, fieldnames=["batch_index", "batch_size", *METRIC_FIELDS])
 	_write_csv(output_dir / "sample_metadata.csv", metadata_rows)
 	save_json(output_dir / "metrics_summary.json", metrics_summary)
@@ -1137,6 +1977,9 @@ def main() -> None:
 	_save_histograms(figures_dir, aggregate_tensors)
 
 	summary = _summary_text(output_dir, checkpoint_metadata, config_debug, aggregate_stats, metrics_summary, warnings)
+	if diagnostic_outputs:
+		save_json(output_dir / "extra_diagnostics_summary.json", diagnostic_outputs)
+		summary += _diagnostics_summary_text(diagnostic_outputs)
 	(output_dir / "diagnostics_summary.txt").write_text(summary, encoding="utf-8")
 	print("\n" + summary)
 

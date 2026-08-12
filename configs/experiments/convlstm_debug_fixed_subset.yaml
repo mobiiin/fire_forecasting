@@ -1,0 +1,34 @@
+base_config: ../default.yaml
+
+experiment:
+  name: convlstm_debug_fixed_subset
+  description: ConvLSTM debug run with isolated cache, normalization, and run artifacts.
+
+paths:
+  patch_cache_root: ${paths.scratch_root}/fire_forecasting_patch_cache/convlstm_debug_fixed_subset
+  artifacts_root: artifacts/experiments/convlstm_debug_fixed_subset
+  runs_root: ${paths.artifacts_root}/runs
+  results_root: ${paths.artifacts_root}/results
+  logs_root: ${paths.artifacts_root}/logs
+
+cache:
+  cache_dir: ${paths.patch_cache_root}
+  cache_version: v5_manual_trim_T5_H10_stride60_convlstm_debug_fixed_subset
+
+normalization:
+  output_dir: ${paths.patch_cache_root}
+  path: ${paths.patch_cache_root}/normalization_stats.json
+  stats_path: ${paths.patch_cache_root}/normalization_stats.json
+  npz_path: ${paths.patch_cache_root}/normalization_stats.npz
+
+training:
+  validation:
+    mode: fixed_subset_every_epoch
+    max_val_batches_per_epoch: 50
+    fixed_subset_seed: 42
+    fixed_subset_shuffle: false
+    use_same_metric_for_checkpointing: true
+  output:
+    root_dir: ${paths.runs_root}
+    checkpoint_root: ${paths.artifacts_root}/checkpoints
+    log_root: ${paths.logs_root}

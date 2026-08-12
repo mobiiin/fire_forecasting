@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Mapping
+import warnings
 
 try:
 	import torch  # type: ignore[import-not-found]
@@ -90,6 +91,34 @@ def validate_checkpoint_model_compatibility(model, checkpoint: Mapping[str, Any]
 					f"checkpoint={checkpoint_output_channels}, model={model_output_channels}. "
 					"You likely need to retrain after enabling the energy_release target."
 				)
+		architecture = None
+		if isinstance(model_config, Mapping):
+			architecture = model_config.get("architecture", model_config.get("name"))
+		if str(architecture or "").lower() == "convlstm_unet":
+			checkpoint_convlstm = checkpoint_config.get("convlstm_unet", {})
+			if not isinstance(checkpoint_convlstm, Mapping):
+				checkpoint_convlstm = {}
+			comparisons = {
+				"use_mask_gated_regression": bool(getattr(model, "use_mask_gated_regression", False)),
+				"regression_activation": str(getattr(model, "regression_activation", "none")),
+				"mask_gate_mode": str(getattr(model, "mask_gate_mode", "soft")),
+				"detach_mask_gate": bool(getattr(model, "detach_mask_gate", False)),
+			}
+			for key, current_value in comparisons.items():
+				if key in checkpoint_convlstm:
+					checkpoint_value = checkpoint_convlstm.get(key)
+				elif key == "use_mask_gated_regression":
+					checkpoint_value = False
+				else:
+					continue
+				if checkpoint_value != current_value:
+					path_text = f" ({Path(checkpoint_path).expanduser().resolve()})" if checkpoint_path is not None else ""
+					warnings.warn(
+						"ConvLSTM checkpoint gating config differs from the current model config"
+						f"{path_text}: {key} checkpoint={checkpoint_value!r}, current={current_value!r}. "
+						"Evaluating an old checkpoint with new mask-gated regression settings changes outputs and is not a fair comparison.",
+						RuntimeWarning,
+					)
 
 	state_dict = checkpoint.get("model_state_dict")
 	if not isinstance(state_dict, Mapping) or model_output_channels <= 0:

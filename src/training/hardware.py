@@ -233,6 +233,7 @@ def find_max_batch_size(
 	max_memory_fraction: float | None = None,
 	logger=None,
 	max_trials: int = 12,
+	input_transform: Callable[[Any], Any] | None = None,
 ) -> int:
 	"""Probe CUDA memory using exponential growth followed by binary search."""
 
@@ -278,6 +279,8 @@ def find_max_batch_size(
 		try:
 			x_batch = _resize_batch_tensor(x_sample, batch_size).to(device, non_blocking=True)
 			y_batch = _resize_batch_tensor(y_sample, batch_size).to(device, non_blocking=True)
+			if input_transform is not None:
+				x_batch = input_transform(x_batch)
 			start = time.perf_counter()
 			with autocast_context(device, amp_dtype):
 				y_pred = model(x_batch)

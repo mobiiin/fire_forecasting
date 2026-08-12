@@ -3,12 +3,22 @@
 from __future__ import annotations
 
 import argparse
+import re
+import shutil
+from datetime import datetime, timezone
+import json
 from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
 
-from src.config import load_config
+from src.config import compute_file_sha256, compute_text_sha256, load_config
+from src.data.cache import (
+	compute_dataset_index_hash,
+	get_patch_cache_dir,
+	load_cache_manifest,
+	resolve_dataset_index_path,
+)
 from src.data.discovery import discover_dataset_files, discover_multiple_datasets
 from src.data.dataset import (
 	FireSequenceDataset,
@@ -26,6 +36,10 @@ from src.data.splits import (
 	multi_dataset_chronological_splits,
 	multi_fire_chronological_splits,
 )
+from src.training.input_normalization import normalization_config as resolve_normalization_config
+
+
+NORMALIZATION_VERSION = "v2_timestamped_config_aware"
 
 
 def _resolve_path(base_path: Path, configured_path: str | Path) -> Path:
@@ -73,20 +87,238 @@ def build_arg_parser() -> argparse.ArgumentParser:
 	parser = argparse.ArgumentParser(description="Compute normalization statistics.")
 	parser.add_argument("--config", type=str, default="configs/default.yaml", help="Path to the YAML configuration file.")
 	parser.add_argument("--from_cache", action="store_true", help="Compute stats from the precomputed train patch cache.")
+	parser.add_argument("--output_dir", default=None, help="Override normalization output directory.")
+	parser.add_argument("--config_name", default=None, help="Override config name used in timestamped filenames.")
+	parser.add_argument("--no_latest_alias", action="store_true", help="Do not update latest_train_normalization_stats aliases.")
+	parser.add_argument("--latest_as_copy", action="store_true", help="Copy latest aliases instead of symlinking them.")
 	return parser
+
+
+def _sanitize_config_name(value: Any) -> str:
+	"""Return a filesystem-safe config name for normalization filenames."""
+
+	sanitized = re.sub(r"[^A-Za-z0-9_-]+", "_", str(value).strip()).strip("_")
+	return sanitized or "config"
+
+
+def _default_config_name(config: Mapping[str, Any], config_path: Path, override: str | None = None) -> str:
+	if override not in (None, "", "null"):
+		return _sanitize_config_name(override)
+	experiment = config.get("experiment", {}) if isinstance(config.get("experiment"), Mapping) else {}
+	name = experiment.get("name")
+	if name not in (None, "", "null"):
+		return _sanitize_config_name(name)
+	return _sanitize_config_name(config_path.stem)
+
+
+def _normalization_output_dir(config_path: Path, config: Mapping[str, Any], normalization_config: Mapping[str, Any], override: str | None = None) -> Path:
+	if override not in (None, "", "null"):
+		return _resolve_path(config_path, str(override))
+	configured = normalization_config.get("output_dir")
+	if configured not in (None, "", "null"):
+		return _resolve_path(config_path, str(configured))
+	paths = config.get("paths", {}) if isinstance(config.get("paths"), Mapping) else {}
+	normalization_root = paths.get("normalization_root")
+	if normalization_root not in (None, "", "null"):
+		return _resolve_path(config_path, str(normalization_root))
+	fallback = normalization_config.get("stats_path", normalization_config.get("path"))
+	if fallback in (None, "", "null"):
+		raise KeyError("Config is missing normalization.output_dir, paths.normalization_root, and normalization.stats_path/path.")
+	return _resolve_path(config_path, str(fallback)).parent
+
+
+def _jsonable(value: Any) -> Any:
+	if isinstance(value, np.ndarray):
+		if value.ndim == 0:
+			return value.item()
+		return value.tolist()
+	if isinstance(value, np.generic):
+		return value.item()
+	if isinstance(value, Path):
+		return str(value)
+	if isinstance(value, Mapping):
+		return {str(key): _jsonable(nested) for key, nested in value.items()}
+	if isinstance(value, (list, tuple)):
+		return [_jsonable(item) for item in value]
+	return value
+
+
+def _sha256_or_none(path: Path | None) -> str | None:
+	if path is None or not path.exists() or not path.is_file():
+		return None
+	return compute_file_sha256(path)
+
+
+def _npz_safe_metadata_value(value: Any) -> np.ndarray | None:
+	if value is None:
+		return None
+	if isinstance(value, (str, int, float, bool, np.number, np.bool_)):
+		return np.asarray(value)
+	if isinstance(value, (list, tuple)):
+		array = np.asarray(value)
+		return None if array.dtype == object else array
+	if isinstance(value, np.ndarray):
+		return None if value.dtype == object else value
+	return None
+
+
+def _update_latest_alias(source: Path, alias: Path, *, as_copy: bool) -> None:
+	alias.parent.mkdir(parents=True, exist_ok=True)
+	alias.unlink(missing_ok=True)
+	if as_copy:
+		shutil.copy2(source, alias)
+		return
+	try:
+		alias.symlink_to(source)
+	except OSError:
+		shutil.copy2(source, alias)
 
 
 def _save_stats(
 	config_path: Path,
+	config: Mapping[str, Any],
 	normalization_config: Mapping[str, Any],
 	stats: dict[str, np.ndarray],
-) -> Path:
-	"""Save normalization stats to the configured archive path."""
+	metadata: Mapping[str, Any] | None = None,
+	output_dir: str | None = None,
+	config_name: str | None = None,
+	update_latest_aliases: bool = True,
+	latest_as_copy: bool = False,
+) -> dict[str, Path]:
+	"""Save timestamped normalization stats and metadata."""
 
-	output_path = _resolve_path(config_path, normalization_config["path"])
-	output_path.parent.mkdir(parents=True, exist_ok=True)
-	np.savez_compressed(output_path, **stats)
-	return output_path
+	created_at = datetime.now().astimezone()
+	timestamp = created_at.strftime("%Y%m%d_%H%M%S")
+	resolved_config_name = _default_config_name(config, config_path, config_name)
+	resolved_output_dir = _normalization_output_dir(config_path, config, normalization_config, output_dir)
+	resolved_output_dir.mkdir(parents=True, exist_ok=True)
+	npz_path = resolved_output_dir / f"train_normalization_stats_{resolved_config_name}_{timestamp}.npz"
+	json_path = resolved_output_dir / f"train_normalization_stats_{resolved_config_name}_{timestamp}.json"
+	latest_json_config = normalization_config.get("stats_path", normalization_config.get("path"))
+	latest_json_path = _resolve_path(config_path, latest_json_config) if latest_json_config not in (None, "", "null") else resolved_output_dir / "normalization_stats.json"
+	latest_npz_config = normalization_config.get("npz_path")
+	latest_npz_path = _resolve_path(config_path, latest_npz_config) if latest_npz_config not in (None, "", "null") else latest_json_path.with_suffix(".npz")
+
+	save_payload = dict(stats)
+	for key, value in dict(metadata or {}).items():
+		array_value = _npz_safe_metadata_value(value)
+		if array_value is not None:
+			save_payload[str(key)] = array_value
+	np.savez_compressed(npz_path, **save_payload)
+
+	config_path_absolute = config_path.expanduser().resolve()
+	dataset_index_path = resolve_dataset_index_path(config)
+	cache_dir = get_patch_cache_dir(config)
+	cache_manifest_path = cache_dir / "cache_manifest.json"
+	cache_manifest_hash = _sha256_or_none(cache_manifest_path)
+	cache_config = config.get("cache", {}) if isinstance(config.get("cache"), Mapping) else {}
+	resolved_config_text = json.dumps(_jsonable(dict(config)), sort_keys=True, default=str)
+	metadata_payload = dict(metadata or {})
+	json_payload = {
+		"normalization_version": NORMALIZATION_VERSION,
+		"created_at": created_at.isoformat(),
+		"timestamp": timestamp,
+		"config": {
+			"config_name": resolved_config_name,
+			"config_path": str(config_path),
+			"config_path_absolute": str(config_path_absolute),
+			"config_sha256": compute_file_sha256(config_path_absolute) if config_path_absolute.exists() else None,
+			"resolved_config_sha256": compute_text_sha256(resolved_config_text),
+			"base_config": config.get("_base_config_path", config.get("base_config")),
+			"base_config_sha256": config.get("_base_config_sha256"),
+		},
+		"paths": {
+			"output_dir": str(resolved_output_dir),
+			"json_path": str(json_path),
+			"npz_path": str(npz_path),
+			"latest_json_path": str(latest_json_path),
+			"latest_npz_path": str(latest_npz_path),
+			"cache_dir": str(cache_dir),
+			"dataset_index": str(dataset_index_path) if dataset_index_path is not None else None,
+			"dataset_index_hash": compute_dataset_index_hash(config),
+		},
+		"data": {
+			"fit_split": "train",
+			"apply_to_splits": normalization_config.get("apply_to_splits", ["train", "val", "test"]),
+			"input_sequence_length": int(config["input_sequence_length"]),
+			"prediction_horizon": int(config["prediction_horizon"]),
+			"input_channels": int(metadata_payload.get("input_channel_count", np.asarray(stats["mean"]).reshape(-1).shape[0])),
+			"num_samples_used": int(metadata_payload.get("sample_count", 0)),
+			"pixel_count": int(metadata_payload.get("pixel_count", 0)),
+		},
+		"cache": {
+			"cache_version": str(cache_config.get("cache_version", "")),
+			"cache_manifest_path": str(cache_manifest_path) if cache_manifest_path.exists() else None,
+			"cache_manifest_hash": cache_manifest_hash,
+			"cache_manifest_config_hash": metadata_payload.get("cache_manifest_config_hash"),
+			"cache_manifest_dataset_index_hash": metadata_payload.get("cache_manifest_dataset_index_hash"),
+		},
+		"stats": {
+			"format": "npz",
+			"mean_key": "mean",
+			"std_key": "std",
+			"min_key": "min" if "min" in stats else None,
+			"max_key": "max" if "max" in stats else None,
+			"count_key": "count",
+			"num_channels": int(np.asarray(stats["mean"]).reshape(-1).shape[0]),
+			"npz_sha256": compute_file_sha256(npz_path),
+		},
+		"legacy_metadata": _jsonable(metadata_payload),
+	}
+	json_path.write_text(json.dumps(_jsonable(json_payload), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+	if update_latest_aliases:
+		_update_latest_alias(json_path, latest_json_path, as_copy=latest_as_copy)
+		_update_latest_alias(npz_path, latest_npz_path, as_copy=latest_as_copy)
+	return {
+		"json_path": json_path,
+		"npz_path": npz_path,
+		"latest_json_path": latest_json_path,
+		"latest_npz_path": latest_npz_path,
+		"output_dir": resolved_output_dir,
+	}
+
+
+def _stats_metadata(config: Mapping[str, Any], *, mode: str, sample_count: int, pixel_count: int, input_channels: int) -> dict[str, Any]:
+	"""Build provenance metadata for train-only normalization stats."""
+
+	config_path_value = config.get("config_path", config.get("_config_path"))
+	config_path = None if config_path_value in (None, "", "null") else Path(str(config_path_value)).expanduser().resolve()
+	dataset_index_path = resolve_dataset_index_path(config)
+	cache_dir = get_patch_cache_dir(config)
+	cache_manifest_path = cache_dir / "cache_manifest.json"
+	cache_manifest: dict[str, Any] = {}
+	if cache_manifest_path.exists():
+		try:
+			cache_manifest = load_cache_manifest(cache_dir)
+		except Exception:
+			cache_manifest = {}
+	resolved_config_text = json.dumps(config, sort_keys=True, default=str)
+	return {
+		"created_at_utc": datetime.now(timezone.utc).isoformat(),
+		"fit_split": "train",
+		"split_used": "train",
+		"normalization_mode": mode,
+		"normalization_method": str(resolve_normalization_config(config).get("method", "zscore")),
+		"sample_count": int(sample_count),
+		"num_samples_used": int(sample_count),
+		"pixel_count": int(pixel_count),
+		"count": int(pixel_count),
+		"input_channel_count": int(input_channels),
+		"input_sequence_length": int(config["input_sequence_length"]),
+		"prediction_horizon": int(config["prediction_horizon"]),
+		"config_path": str(config_path) if config_path is not None else "",
+		"config_sha256": compute_file_sha256(config_path) if config_path is not None and config_path.exists() else None,
+		"resolved_config_sha256": compute_text_sha256(resolved_config_text),
+		"base_config_path": config.get("_base_config_path", config.get("base_config")),
+		"base_config_sha256": config.get("_base_config_sha256"),
+		"dataset_index_path": str(dataset_index_path) if dataset_index_path is not None else None,
+		"dataset_index_hash": compute_dataset_index_hash(config),
+		"cache_dir": str(cache_dir),
+		"cache_version": str(dict(config.get("cache", {})).get("cache_version", "")) if isinstance(config.get("cache"), Mapping) else "",
+		"cache_manifest_path": str(cache_manifest_path) if cache_manifest_path.exists() else None,
+		"cache_manifest_config_hash": cache_manifest.get("config_hash"),
+		"cache_manifest_dataset_index_hash": cache_manifest.get("dataset_index_hash"),
+	}
 
 
 def main() -> None:
@@ -101,13 +333,13 @@ def main() -> None:
 		if required_key not in config:
 			raise KeyError(f"Config is missing required key '{required_key}'.")
 
-	normalization_config = dict(config.get("normalization", {}))
+	normalization_config = resolve_normalization_config(config)
 	if "path" not in normalization_config:
 		raise KeyError("Config is missing normalization.path.")
 
 	compute_from_cache = bool(args.from_cache or normalization_config.get("compute_from_patch_cache", False))
 	if compute_from_cache:
-		from src.data.cache import get_patch_cache_dir, validate_patch_cache
+		from src.data.cache import validate_patch_cache
 		from src.data.cached_patch_dataset import CachedPatchDataset
 
 		cache_config = dict(config.get("cache", {})) if isinstance(config.get("cache"), dict) else {}
@@ -169,7 +401,24 @@ def main() -> None:
 			"atmospheric_engineered_channel_count": np.asarray(train_dataset.atmospheric_engineered_channel_count, dtype=np.int64),
 			"engineered_channel_count": np.asarray(train_dataset.engineered_channel_count, dtype=np.int64),
 		}
-		output_path = _save_stats(config_path, normalization_config, stats)
+		metadata = _stats_metadata(
+			config,
+			mode="patch_cache",
+			sample_count=len(train_dataset),
+			pixel_count=count,
+			input_channels=train_dataset.total_input_channels,
+		)
+		saved_paths = _save_stats(
+			config_path,
+			config,
+			normalization_config,
+			stats,
+			metadata,
+			output_dir=args.output_dir,
+			config_name=args.config_name,
+			update_latest_aliases=not bool(args.no_latest_alias),
+			latest_as_copy=bool(args.latest_as_copy),
+		)
 		channel_mean = stats["mean"]
 		channel_std = stats["std"]
 		near_zero_std = int(np.sum(channel_std <= max(eps, 1e-6) * 10.0))
@@ -184,7 +433,19 @@ def main() -> None:
 		print(f"global channel mean range: {channel_mean.min():.6g} to {channel_mean.max():.6g}")
 		print(f"global channel std range: {channel_std.min():.6g} to {channel_std.max():.6g}")
 		print(f"channels with near-zero std: {near_zero_std}")
-		print(f"output path: {output_path}")
+		print("Saved normalization JSON:")
+		print(f"  {saved_paths['json_path']}")
+		print("Saved normalization NPZ:")
+		print(f"  {saved_paths['npz_path']}")
+		if not bool(args.no_latest_alias):
+			print("Updated latest aliases:")
+			print(f"  {saved_paths['latest_json_path']}")
+			print(f"  {saved_paths['latest_npz_path']}")
+		print("Suggested config:")
+		print("normalization:")
+		print(f"  output_dir: {saved_paths['output_dir']}")
+		print(f"  stats_path: {saved_paths['latest_json_path']}")
+		print(f"  npz_path: {saved_paths['latest_npz_path']}")
 		return
 
 	split_mode = str(config.get("split_mode", "train_val_test")).lower()
@@ -391,9 +652,24 @@ def main() -> None:
 			stats["multitask_target_mean"] = target_mean.astype(np.float32)
 			stats["multitask_target_std"] = target_std.astype(np.float32)
 
-	output_path = _resolve_path(config_path, normalization_config["path"])
-	output_path.parent.mkdir(parents=True, exist_ok=True)
-	np.savez_compressed(output_path, **stats)
+	metadata = _stats_metadata(
+		config,
+		mode=str(split_mode),
+		sample_count=len(train_dataset),
+		pixel_count=count,
+		input_channels=train_dataset.total_input_channels,
+	)
+	saved_paths = _save_stats(
+		config_path,
+		config,
+		normalization_config,
+		stats,
+		metadata,
+		output_dir=args.output_dir,
+		config_name=args.config_name,
+		update_latest_aliases=not bool(args.no_latest_alias),
+		latest_as_copy=bool(args.latest_as_copy),
+	)
 
 	channel_mean = stats["mean"]
 	channel_std = stats["std"]
@@ -429,7 +705,19 @@ def main() -> None:
 	print(f"global channel mean range: {channel_mean.min():.6g} to {channel_mean.max():.6g}")
 	print(f"global channel std range: {channel_std.min():.6g} to {channel_std.max():.6g}")
 	print(f"channels with near-zero std: {near_zero_std}")
-	print(f"output path: {output_path}")
+	print("Saved normalization JSON:")
+	print(f"  {saved_paths['json_path']}")
+	print("Saved normalization NPZ:")
+	print(f"  {saved_paths['npz_path']}")
+	if not bool(args.no_latest_alias):
+		print("Updated latest aliases:")
+		print(f"  {saved_paths['latest_json_path']}")
+		print(f"  {saved_paths['latest_npz_path']}")
+	print("Suggested config:")
+	print("normalization:")
+	print(f"  output_dir: {saved_paths['output_dir']}")
+	print(f"  stats_path: {saved_paths['latest_json_path']}")
+	print(f"  npz_path: {saved_paths['latest_npz_path']}")
 
 
 if __name__ == "__main__":

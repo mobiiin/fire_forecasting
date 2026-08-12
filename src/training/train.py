@@ -16,8 +16,9 @@ import time
 from collections import defaultdict
 from contextlib import nullcontext
 from copy import deepcopy
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 if "MPLCONFIGDIR" not in os.environ:
 	_mpl_config_dir = Path(os.environ.get("TMPDIR", "/tmp")) / "fire_forecasting_mplconfig"
@@ -51,7 +52,7 @@ except ImportError:  # pragma: no cover - environment-specific fallback
 	CudaGradScaler = None
 	cuda_autocast = None
 
-from src.config import load_config
+from src.config import compute_file_sha256, load_config
 from src.data.cache import target_definition_version, temporal_target_offsets
 from src.data.dataset import create_dataloaders
 from src.data.spatial_transforms import infer_with_external_test_spatial_handling
@@ -59,6 +60,7 @@ from src.models.architecture_registry import resolve_model_architecture
 from src.models.model_factory import build_model_from_config
 from src.training.checkpoints import latest_and_best_checkpoint_paths, load_checkpoint, save_checkpoint, validate_checkpoint_model_compatibility
 from src.training.cuda_prefetcher import CUDAPrefetcher
+from src.training.early_stopping import build_early_stopping
 from src.training.hardware import (
 	autocast_context,
 	cap_num_workers_by_slurm,
@@ -68,6 +70,13 @@ from src.training.hardware import (
 	find_max_batch_size,
 	get_cuda_device_info,
 	get_performance_config,
+)
+from src.training.input_normalization import (
+	apply_input_normalization,
+	build_input_normalizer_for_loader,
+	input_normalization_status,
+	normalization_metadata_from_loader,
+	resolve_input_normalization_stats_path,
 )
 from src.training.losses import get_loss_function
 from src.training.metrics import compute_metrics
@@ -165,6 +174,10 @@ def apply_training_cli_overrides(
 	run_name: str | None = None,
 	output_root: str | Path | None = None,
 	overwrite_run: bool = False,
+	disable_early_stopping: bool = False,
+	early_stopping_patience: int | None = None,
+	early_stopping_monitor: str | None = None,
+	early_stopping_min_delta: float | None = None,
 ) -> dict[str, Any]:
 	"""Apply common training-output CLI overrides to a config mapping."""
 
@@ -178,8 +191,30 @@ def apply_training_cli_overrides(
 		training_config["output"] = output_config
 	if overwrite_run:
 		training_config["overwrite_run"] = True
+	if disable_early_stopping or early_stopping_patience is not None or early_stopping_monitor not in (None, "", "null") or early_stopping_min_delta is not None:
+		early_config = dict(training_config.get("early_stopping", {})) if isinstance(training_config.get("early_stopping"), Mapping) else {}
+		if disable_early_stopping:
+			early_config["enabled"] = False
+		if early_stopping_patience is not None:
+			early_config["patience"] = int(early_stopping_patience)
+			early_config["enabled"] = True
+		if early_stopping_monitor not in (None, "", "null"):
+			early_config["monitor"] = str(early_stopping_monitor)
+		if early_stopping_min_delta is not None:
+			early_config["min_delta"] = float(early_stopping_min_delta)
+		training_config["early_stopping"] = early_config
 	updated["training"] = training_config
 	return updated
+
+
+def add_early_stopping_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+	"""Add shared early-stopping override flags to a training CLI parser."""
+
+	parser.add_argument("--disable_early_stopping", action="store_true", help="Disable training.early_stopping for this run.")
+	parser.add_argument("--early_stopping_patience", type=int, default=None, help="Override training.early_stopping.patience.")
+	parser.add_argument("--early_stopping_monitor", default=None, help="Override training.early_stopping.monitor.")
+	parser.add_argument("--early_stopping_min_delta", type=float, default=None, help="Override training.early_stopping.min_delta.")
+	return parser
 
 
 def _get_device(config: Mapping[str, Any]) -> torch.device:
@@ -560,55 +595,19 @@ def _coerce_loss_result(loss_result: Any) -> tuple[torch.Tensor, dict[str, float
 def _build_input_normalizer(loader, device: torch.device, input_channels: int):
 	"""Build cached device tensors for per-channel input normalization."""
 
-	dataset = getattr(loader, "dataset", None)
-	if not bool(getattr(dataset, "input_normalization_on_device", False)):
-		return None
-	stats = getattr(dataset, "normalization_stats", None)
-	if not isinstance(stats, Mapping):
-		return None
-	if "mean" not in stats or "std" not in stats:
-		raise KeyError("Device-side input normalization requires normalization stats with mean and std.")
-
-	mean_tensor = torch.as_tensor(stats["mean"], dtype=torch.float32, device=device).flatten()
-	std_tensor = torch.as_tensor(stats["std"], dtype=torch.float32, device=device).flatten()
-	if mean_tensor.numel() < input_channels or std_tensor.numel() < input_channels:
-		raise ValueError(
-			"Normalization stats channel count does not match model inputs. "
-			f"Need at least {input_channels}, got mean={mean_tensor.numel()} std={std_tensor.numel()}."
-		)
-	if mean_tensor.numel() > input_channels:
-		mean_tensor = mean_tensor[:input_channels]
-	if std_tensor.numel() > input_channels:
-		std_tensor = std_tensor[:input_channels]
-	std_tensor = torch.clamp(std_tensor, min=1.0e-6)
-	return {
-		"mean": mean_tensor.reshape(1, 1, input_channels, 1, 1),
-		"std": std_tensor.reshape(1, 1, input_channels, 1, 1),
-	}
+	return build_input_normalizer_for_loader(loader, device, input_channels)
 
 
 def _apply_input_normalizer(x_batch: torch.Tensor, normalizer) -> torch.Tensor:
 	"""Normalize a batch in-place after it has been moved to the training device."""
 
-	if normalizer is None:
-		return x_batch
-	with torch.no_grad():
-		x_batch.sub_(normalizer["mean"])
-		x_batch.div_(normalizer["std"])
-	return x_batch
+	return apply_input_normalization(x_batch, normalizer)
 
 
 def _input_normalization_status(loader) -> str:
 	"""Return a compact user/log facing normalization status for one loader."""
 
-	dataset = getattr(loader, "dataset", None)
-	if bool(getattr(dataset, "input_normalization_on_device", False)):
-		return "device"
-	if bool(getattr(dataset, "inputs_are_normalized", False)):
-		return "dataset"
-	if getattr(dataset, "normalization_stats", None) is None:
-		return "none"
-	return "unknown"
+	return input_normalization_status(loader)
 
 
 def _loader_summary(loader) -> dict[str, Any]:
@@ -627,6 +626,137 @@ def _loader_summary(loader) -> dict[str, Any]:
 	}
 
 
+SUPPORTED_VALIDATION_MODES = {"full_every_epoch", "fixed_subset_every_epoch"}
+
+
+def _coerce_optional_positive_int(value: Any, *, name: str) -> int | None:
+	if value in (None, "", "null", "None"):
+		return None
+	resolved = int(value)
+	if resolved <= 0:
+		raise ValueError(f"{name} must be null or a positive integer, got {value!r}.")
+	return resolved
+
+
+def resolve_validation_policy(config: Mapping[str, Any], val_loader=None, logger=None) -> dict[str, Any]:
+	"""Resolve the training validation protocol.
+
+	Only two modes are supported:
+	- full_every_epoch: use the complete validation loader every epoch.
+	- fixed_subset_every_epoch: choose one deterministic batch-index subset once.
+	"""
+
+	training_config = _get_section(config, "training")
+	validation_config = dict(training_config.get("validation", {})) if isinstance(training_config.get("validation"), Mapping) else {}
+	performance_config = get_performance_config(config)
+
+	deprecated_values = []
+	if "full_validation_every_n_epochs" in config:
+		deprecated_values.append("full_validation_every_n_epochs")
+	if "full_validation_every_n_epochs" in training_config:
+		deprecated_values.append("training.full_validation_every_n_epochs")
+	if "full_validation_every_n_epochs" in performance_config:
+		deprecated_values.append("training.performance.full_validation_every_n_epochs")
+	if deprecated_values and logger is not None:
+		logger.warning(
+			"full_validation_every_n_epochs is deprecated and ignored. Use training.validation.mode instead."
+		)
+
+	mode = str(validation_config.get("mode", "fixed_subset_every_epoch")).strip().lower()
+	if mode not in SUPPORTED_VALIDATION_MODES:
+		raise ValueError(
+			"Unsupported training.validation.mode. "
+			"Expected one of: full_every_epoch, fixed_subset_every_epoch. "
+			f"Got {mode!r}."
+		)
+
+	if mode == "full_every_epoch":
+		if validation_config.get("max_val_batches_per_epoch") not in (None, "", "null", "None") and logger is not None:
+			logger.warning(
+				"training.validation.max_val_batches_per_epoch is set but ignored because "
+				"training.validation.mode=full_every_epoch."
+			)
+		total_batches = len(val_loader) if val_loader is not None else None
+		return {
+			"validation_mode": mode,
+			"validation_scope": "full",
+			"max_val_batches_per_epoch": None,
+			"fixed_subset_seed": None,
+			"fixed_subset_shuffle": False,
+			"selected_batch_indices": None,
+			"validation_batches_total": total_batches,
+			"validation_batches_used": total_batches,
+			"is_full_validation": True,
+			"use_same_metric_for_checkpointing": bool(validation_config.get("use_same_metric_for_checkpointing", True)),
+		}
+
+	max_batches_value = validation_config.get("max_val_batches_per_epoch", performance_config.get("max_val_batches_per_epoch", 50))
+	max_batches = _coerce_optional_positive_int(max_batches_value, name="training.validation.max_val_batches_per_epoch")
+	if max_batches is None:
+		max_batches = len(val_loader) if val_loader is not None else None
+	if max_batches is None:
+		raise ValueError("fixed_subset_every_epoch requires max_val_batches_per_epoch or a validation loader.")
+
+	total_batches = len(val_loader) if val_loader is not None else None
+	if total_batches is None:
+		used_batches = int(max_batches)
+		selected_batch_indices = list(range(used_batches))
+	elif int(total_batches) <= int(max_batches):
+		used_batches = int(total_batches)
+		selected_batch_indices = list(range(used_batches))
+	else:
+		used_batches = int(max_batches)
+		if bool(validation_config.get("fixed_subset_shuffle", False)):
+			generator = torch.Generator()
+			generator.manual_seed(int(validation_config.get("fixed_subset_seed", 42)))
+			selected_batch_indices = sorted(torch.randperm(int(total_batches), generator=generator)[:used_batches].tolist())
+		else:
+			selected_batch_indices = list(range(used_batches))
+
+	return {
+		"validation_mode": mode,
+		"validation_scope": "fixed_subset",
+		"max_val_batches_per_epoch": int(max_batches),
+		"fixed_subset_seed": int(validation_config.get("fixed_subset_seed", 42)),
+		"fixed_subset_shuffle": bool(validation_config.get("fixed_subset_shuffle", False)),
+		"selected_batch_indices": selected_batch_indices,
+		"validation_batches_total": total_batches,
+		"validation_batches_used": used_batches,
+		"is_full_validation": False,
+		"use_same_metric_for_checkpointing": bool(validation_config.get("use_same_metric_for_checkpointing", True)),
+	}
+
+
+def _validation_subset_metadata(policy: Mapping[str, Any], val_loader) -> dict[str, Any]:
+	return {
+		"validation_mode": policy["validation_mode"],
+		"validation_scope": policy["validation_scope"],
+		"fixed_subset_seed": policy.get("fixed_subset_seed"),
+		"fixed_subset_shuffle": policy.get("fixed_subset_shuffle"),
+		"max_val_batches_per_epoch": policy.get("max_val_batches_per_epoch"),
+		"selected_batch_indices": policy.get("selected_batch_indices"),
+		"selected_sample_indices": None,
+		"validation_dataset_length": len(getattr(val_loader, "dataset", [])),
+		"validation_batches_total": policy.get("validation_batches_total", len(val_loader)),
+		"validation_batches_used": policy.get("validation_batches_used"),
+		"is_full_validation": bool(policy.get("is_full_validation", False)),
+		"use_same_metric_for_checkpointing": bool(policy.get("use_same_metric_for_checkpointing", True)),
+		"created_at": datetime.now(timezone.utc).isoformat(),
+	}
+
+
+def save_validation_subset_metadata(run_manager: RunManager, policy: Mapping[str, Any], val_loader) -> Path | None:
+	"""Persist validation subset metadata when using fixed-subset validation."""
+
+	if str(policy.get("validation_mode")) != "fixed_subset_every_epoch":
+		return None
+	path = run_manager.metadata_dir / "validation_subset.json"
+	path.parent.mkdir(parents=True, exist_ok=True)
+	with path.open("w", encoding="utf-8") as handle:
+		json.dump(_validation_subset_metadata(policy, val_loader), handle, indent=2, sort_keys=True, default=str)
+	return path
+
+
 def _run_epoch(
 	model: nn.Module,
 	loader,
@@ -643,6 +773,7 @@ def _run_epoch(
 	amp_dtype=None,
 	gradient_accumulation_steps: int = 1,
 	max_batches: int | None = None,
+	batch_indices: Iterable[int] | None = None,
 	logger=None,
 	epoch_number: int | None = None,
 	timing_csv_path: Path | None = None,
@@ -692,7 +823,19 @@ def _run_epoch(
 	timing_rows: list[dict[str, Any]] = []
 	epoch_start_time = time.perf_counter()
 	total_loader_batches = len(loader)
-	total_batches = total_loader_batches if max_batches is None else min(total_loader_batches, int(max_batches))
+	selected_batch_indices = None if batch_indices is None else sorted({int(index) for index in batch_indices})
+	if selected_batch_indices is not None:
+		if not selected_batch_indices:
+			raise ValueError(f"The {desc} batch-index subset is empty.")
+		invalid_batch_indices = [index for index in selected_batch_indices if index < 0 or index >= total_loader_batches]
+		if invalid_batch_indices:
+			raise ValueError(
+				f"The {desc} batch-index subset contains out-of-range index/indices. "
+				f"Valid range is [0, {total_loader_batches - 1}], got {invalid_batch_indices[:10]}."
+			)
+		total_batches = len(selected_batch_indices)
+	else:
+		total_batches = total_loader_batches if max_batches is None else min(total_loader_batches, int(max_batches))
 	if total_batches <= 0:
 		raise ValueError(f"The {desc} DataLoader produced no batches.")
 	progress_log_batch_interval = _progress_log_interval(total_batches, progress_log_percent_step)
@@ -700,20 +843,23 @@ def _run_epoch(
 	use_progress_bar = bool(show_progress_bar and tqdm is not None)
 	progress_bar = tqdm(range(total_batches), desc=desc, total=total_batches, leave=False) if use_progress_bar else range(total_batches)
 	iterator_source = CUDAPrefetcher(loader, device, non_blocking=non_blocking_transfer) if use_cuda_prefetcher else loader
-	iterator = iter(iterator_source)
+	selected_batch_index_set = None if selected_batch_indices is None else set(selected_batch_indices)
+	iterator = enumerate(iterator_source)
 	input_normalizer = _build_input_normalizer(loader, device, input_channels)
 
 	def _sync_if_timing() -> None:
 		if synchronize_timing and device.type == "cuda":
 			torch.cuda.synchronize(device)
 
-	for batch_offset in progress_bar:
-		batch_number = int(batch_offset) + 1
+	batch_number = 0
+	for _batch_offset in progress_bar:
 		fetch_start_time = time.perf_counter()
-		try:
-			batch = next(iterator)
-		except StopIteration:
+		for loader_batch_index, batch in iterator:
+			if selected_batch_index_set is None or int(loader_batch_index) in selected_batch_index_set:
+				break
+		else:
 			break
+		batch_number += 1
 		fetch_end_time = time.perf_counter()
 		data_wait_time = fetch_end_time - fetch_start_time
 		x_batch, y_batch = _as_batch(batch)
@@ -1192,11 +1338,12 @@ def _save_resolved_run_artifacts(
 	input_channels: int,
 	output_channels: int,
 	loader_summaries: Mapping[str, Any],
+	normalization_metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, str]:
 	"""Save reproducibility artifacts for the resolved training run."""
 
 	payload = dict(config)
-	payload.setdefault("resolved_run", {})
+	existing_resolved_run = dict(payload.get("resolved_run", {})) if isinstance(payload.get("resolved_run"), Mapping) else {}
 	payload["resolved_run"] = {
 		"architecture": run_manager.architecture,
 		"run_name": run_manager.run_name,
@@ -1209,7 +1356,10 @@ def _save_resolved_run_artifacts(
 		"input_shape": _input_shape_metadata(config, input_channels),
 		"output_shape": _output_shape_metadata(config, output_channels),
 		"loader_summaries": dict(loader_summaries),
+		"normalization": dict(normalization_metadata or {}),
 	}
+	if "validation" in existing_resolved_run:
+		payload["resolved_run"]["validation"] = existing_resolved_run["validation"]
 	paths = run_manager.save_configs(original_config=original_config, resolved_config=payload)
 	if bool(run_manager.output_config.get("save_hardware_summary", True)):
 		hardware_summary = _build_hardware_summary(config, backend_summary, amp_dtype)
@@ -1243,10 +1393,39 @@ def _save_resolved_run_artifacts(
 		path_record = run_manager.record_path_metadata("normalization_stats_path.txt", normalization_stats_path)
 		if path_record is not None:
 			paths["normalization_stats_path_record"] = str(path_record)
-		if bool(run_manager.output_config.get("save_normalization_stats_copy", True)):
+		normalization_npz_path: Path | None = None
+		if normalization_stats_path.suffix.lower() == ".json" and normalization_stats_path.exists():
 			normalization_copy_path = run_manager.copy_metadata_file(normalization_stats_path, "normalization_stats.json")
 			if normalization_copy_path is not None:
 				paths["normalization_stats_copy_path"] = str(normalization_copy_path)
+			try:
+				normalization_payload = json.loads(normalization_stats_path.read_text(encoding="utf-8"))
+				paths_payload = normalization_payload.get("paths", {}) if isinstance(normalization_payload, Mapping) else {}
+				npz_value = paths_payload.get("npz_path") if isinstance(paths_payload, Mapping) else None
+				if npz_value not in (None, "", "null"):
+					normalization_npz_path = Path(str(npz_value)).expanduser()
+					if not normalization_npz_path.is_absolute():
+						normalization_npz_path = (normalization_stats_path.parent / normalization_npz_path).resolve()
+			except Exception as exc:
+				logger.warning("Could not parse normalization JSON metadata for NPZ path: %s", exc)
+		elif normalization_stats_path.suffix.lower() == ".npz":
+			normalization_npz_path = normalization_stats_path
+			if bool(run_manager.output_config.get("save_normalization_stats_copy", False)):
+				normalization_copy_path = run_manager.copy_metadata_file(normalization_stats_path, "normalization_stats.npz")
+				if normalization_copy_path is not None:
+					paths["normalization_stats_copy_path"] = str(normalization_copy_path)
+		if normalization_npz_path is not None:
+			npz_record = run_manager.record_path_metadata("normalization_npz_path.txt", normalization_npz_path)
+			if npz_record is not None:
+				paths["normalization_npz_path_record"] = str(npz_record)
+			if normalization_npz_path.exists():
+				hash_path = run_manager.metadata_path("normalization_npz_sha256.txt")
+				hash_path.write_text(compute_file_sha256(normalization_npz_path) + "\n", encoding="utf-8")
+				paths["normalization_npz_sha256_path"] = str(hash_path)
+			if bool(run_manager.output_config.get("copy_normalization_npz", False)):
+				npz_copy_path = run_manager.copy_metadata_file(normalization_npz_path, "normalization_stats.npz")
+				if npz_copy_path is not None:
+					paths["normalization_npz_copy_path"] = str(npz_copy_path)
 
 	logger.info("Saved resolved config: %s", paths.get("resolved_config_path"))
 	if "hardware_summary_path" in paths:
@@ -1257,14 +1436,7 @@ def _save_resolved_run_artifacts(
 def _resolve_existing_normalization_stats_path(config: Mapping[str, Any]) -> Path | None:
 	"""Resolve normalization.path when the stats archive exists."""
 
-	normalization_config = _get_section(config, "normalization")
-	normalization_path = normalization_config.get("path")
-	if not normalization_path:
-		return None
-	config_path_value = config.get("config_path", config.get("_config_path"))
-	config_path = Path(config_path_value).expanduser().resolve() if config_path_value else None
-	resolved_path = _resolve_path(config_path, normalization_path)
-	return resolved_path if resolved_path.exists() else None
+	return resolve_input_normalization_stats_path(config, must_exist=False)
 
 
 def _build_optimizer_from_parameters(parameters, config: Mapping[str, Any]):
@@ -1339,6 +1511,7 @@ def _maybe_probe_auto_batch_size(
 	x_sample, y_sample = _as_batch(sample_batch)
 	if not torch.is_tensor(x_sample) or not torch.is_tensor(y_sample):
 		raise TypeError("Auto batch-size probing requires tensor batches.")
+	probe_input_normalizer = _build_input_normalizer(train_loader, device, input_channels)
 
 	probe_model = build_model_from_config(config, input_channels=input_channels).to(device)
 	criterion = get_loss_function(config)
@@ -1360,6 +1533,7 @@ def _maybe_probe_auto_batch_size(
 			max_memory_fraction=auto_batch_max_memory_fraction,
 			logger=logger,
 			max_trials=max_trials,
+			input_transform=lambda batch: _apply_input_normalizer(batch, probe_input_normalizer),
 		)
 	finally:
 		del probe_model
@@ -1526,7 +1700,7 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 
 	criterion = get_loss_function(config)
 	optimizer = _build_optimizer(model, config)
-	epochs = int(config.get("epochs", training_config.get("epochs", 1)))
+	epochs = int(training_config.get("max_epochs", config.get("max_epochs", config.get("epochs", training_config.get("epochs", 1)))))
 	scheduler = _build_scheduler(optimizer, config, epochs)
 
 	amp_dtype = choose_amp_dtype(config, device)
@@ -1535,10 +1709,11 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 	gradient_clip_norm_value = training_config.get("gradient_clip_norm", config.get("gradient_clip_norm", None))
 	gradient_clip_norm = None if gradient_clip_norm_value in (None, "", 0, 0.0) else float(gradient_clip_norm_value)
 	gradient_accumulation_steps = max(1, int(training_config.get("gradient_accumulation_steps", 1)))
-	early_stopping_patience_value = training_config.get("early_stopping_patience", None)
-	early_stopping_patience = None
-	if early_stopping_patience_value not in (None, "", "null", 0, 0.0):
-		early_stopping_patience = max(1, int(early_stopping_patience_value))
+	early_stopper = build_early_stopping(config)
+	early_stopping_config = training_config.get("early_stopping", {}) if isinstance(training_config.get("early_stopping"), Mapping) else {}
+	early_stopping_checkpoint_best = bool(early_stopping_config.get("checkpoint_best", True))
+	early_stopping_save_latest_on_stop = bool(early_stopping_config.get("save_latest_on_stop", True))
+	early_stopping_verbose = bool(early_stopping_config.get("verbose", True))
 
 	latest_checkpoint_path, best_checkpoint_path = _resolve_training_paths(config)
 	resume_enabled = bool(checkpoint_config.get("resume", True))
@@ -1566,6 +1741,7 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 		global_step = int(checkpoint.get("global_step", 0))
 		resumed_from_checkpoint = True
 		history_rows = _coerce_history_rows(checkpoint.get("history", []))
+		early_stopper.load_state_dict(checkpoint.get("early_stopping"))
 
 	if start_epoch >= epochs:
 		logger.info("Checkpoint already covers requested epochs (%s). Skipping training.", epochs)
@@ -1595,6 +1771,43 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 		"val": _loader_summary(val_loader),
 		"test": {} if test_loader is None else _loader_summary(test_loader),
 	}
+	normalization_metadata = {
+		"train": normalization_metadata_from_loader(train_loader, config, input_channels, normalization_stats_path),
+		"val": normalization_metadata_from_loader(val_loader, config, input_channels, normalization_stats_path),
+		"test": None if test_loader is None else normalization_metadata_from_loader(test_loader, config, input_channels, normalization_stats_path),
+	}
+	validation_policy = resolve_validation_policy(config, val_loader=val_loader, logger=logger)
+	validation_subset_path = save_validation_subset_metadata(run_manager, validation_policy, val_loader)
+	validation_protocol_metadata = _validation_subset_metadata(validation_policy, val_loader)
+	if validation_policy["validation_mode"] == "full_every_epoch":
+		logger.info("Validation mode: full_every_epoch")
+		logger.info("Validation batches this epoch: all")
+	else:
+		logger.info("Validation mode: fixed_subset_every_epoch")
+		logger.info("Fixed validation subset: %s batch(es)", validation_policy["validation_batches_used"])
+		logger.info("Fixed validation seed: %s", validation_policy["fixed_subset_seed"])
+		if validation_subset_path is not None:
+			logger.info("Saved validation subset metadata: %s", validation_subset_path)
+	checkpoint_monitor = str(checkpointing_config.get("monitor", checkpoint_config.get("monitor", "val_loss")))
+	if early_stopper.enabled:
+		logger.info(
+			"Early stopping | monitor=%s mode=%s patience=%s min_delta=%s start_epoch=%s stop_on_nan=%s",
+			early_stopper.monitor,
+			early_stopper.mode,
+			early_stopper.patience,
+			early_stopper.min_delta,
+			early_stopper.start_epoch,
+			early_stopper.stop_on_nan,
+		)
+		if early_stopper.monitor != checkpoint_monitor:
+			logger.warning(
+				"Early stopping monitor %r differs from checkpoint monitor %r. "
+				"Best checkpoint and early stopping may track different metrics.",
+				early_stopper.monitor,
+				checkpoint_monitor,
+			)
+	else:
+		logger.info("Early stopping: disabled")
 	config["resolved_run"] = {
 		"architecture": architecture,
 		"run_name": run_manager.run_name,
@@ -1610,6 +1823,8 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 		"effective_batch_size": int(training_config.get("batch_size", config.get("batch_size", 1)))
 		* int(training_config.get("gradient_accumulation_steps", 1)),
 		"normalization_stats_path": str(normalization_stats_path) if normalization_stats_path is not None else None,
+		"normalization": normalization_metadata,
+		"validation": validation_protocol_metadata,
 	}
 	run_artifact_paths = _save_resolved_run_artifacts(
 		config,
@@ -1623,7 +1838,10 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 		input_channels,
 		output_channels,
 		loader_summaries,
+		normalization_metadata,
 	)
+	if validation_subset_path is not None:
+		run_artifact_paths["validation_subset_path"] = str(validation_subset_path)
 
 	logger.info("Starting training for %s epochs", epochs)
 	test_sample_count = 0 if test_loader is None else len(test_loader.dataset)
@@ -1676,9 +1894,15 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 		"architecture": architecture,
 		"run_artifact_paths": run_artifact_paths,
 		"sequence": _sequence_target_metadata(config),
+		"normalization": normalization_metadata,
 		"history_rows": history_rows,
 		"final_epoch_summary": {},
 		"num_epochs_completed": start_epoch,
+		"validation": validation_protocol_metadata,
+		"early_stopping": early_stopper.state_dict(),
+		"stopped_early": False,
+		"stop_reason": "",
+		"stop_epoch": None,
 	}
 	run_completed = False
 
@@ -1710,15 +1934,35 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 			"input_shape": _input_shape_metadata(config, input_channels),
 			"output_shape": _output_shape_metadata(config, output_channels),
 			"normalization_stats": str(normalization_stats_path) if normalization_stats_path is not None else None,
+			"normalization": normalization_metadata.get("train", {}),
+			"validation": validation_protocol_metadata,
 			"cache_manifest_path": run_artifact_paths.get("cache_manifest_copy_path")
 			or run_artifact_paths.get("cache_manifest_path_record"),
 			"resolved_config_path": run_artifact_paths.get("resolved_config_path"),
 			"resumed_from_checkpoint": resumed_from_checkpoint,
 			"history": history_rows,
+			"early_stopping": {
+				**early_stopper.state_dict(),
+				"restore_best_weights": bool(early_stopping_config.get("restore_best_weights", False)),
+				"checkpoint_best": bool(early_stopping_checkpoint_best),
+				"save_latest_on_stop": bool(early_stopping_save_latest_on_stop),
+			},
 		}
 
 	final_epoch_summary: dict[str, Any] = dict(history_rows[-1]) if history_rows else {}
-	epochs_without_validation_improvement = 0
+	stopped_early = False
+	stop_reason = ""
+
+	def _early_stopping_summary() -> dict[str, Any]:
+		summary = early_stopper.state_dict()
+		summary["restore_best_weights"] = bool(early_stopping_config.get("restore_best_weights", False))
+		summary["checkpoint_best"] = bool(early_stopping_checkpoint_best)
+		summary["save_latest_on_stop"] = bool(early_stopping_save_latest_on_stop)
+		summary["stopped_early"] = bool(stopped_early or early_stopper.should_stop)
+		return summary
+
+	partial_training_result["early_stopping"] = _early_stopping_summary()
+
 	for epoch_index in range(start_epoch, epochs):
 		epoch_number = epoch_index + 1
 		epoch_start_time = time.perf_counter()
@@ -1744,19 +1988,10 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 			epoch_number=epoch_number,
 			timing_csv_path=timing_log_path,
 		)
-		max_val_batches = _resolve_max_batches(config, "val")
-		full_validation_every_n_epochs = int(performance_config.get("full_validation_every_n_epochs", training_config.get("full_validation_every_n_epochs", 1)) or 0)
-		run_full_validation = max_val_batches is None or (
-			full_validation_every_n_epochs > 0 and epoch_number % full_validation_every_n_epochs == 0
-		)
-		val_max_batches = None if run_full_validation else max_val_batches
-		if val_max_batches is not None:
-			logger.info(
-				"Validation capped at %s batch(es) for epoch %s; full validation every %s epoch(s).",
-				val_max_batches,
-				epoch_number,
-				full_validation_every_n_epochs,
-			)
+		if validation_policy["validation_mode"] == "fixed_subset_every_epoch":
+			logger.info("Validation using fixed subset: %s batch(es)", validation_policy["validation_batches_used"])
+		else:
+			logger.info("Validation batches this epoch: all")
 		val_results = _run_epoch(
 			model=model,
 			loader=val_loader,
@@ -1767,7 +2002,8 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 			input_channels=input_channels,
 			output_channels=output_channels,
 			train=False,
-			max_batches=val_max_batches,
+			max_batches=None,
+			batch_indices=validation_policy.get("selected_batch_indices"),
 			logger=logger,
 			epoch_number=epoch_number,
 			amp_dtype=amp_dtype,
@@ -1811,6 +2047,11 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 			"use_patches_train": int(bool(config.get("use_patches", False))),
 			"use_patches_eval": int(bool(config.get("use_patches_for_eval", False))),
 			"patch_size": int(config.get("patch_size", 64)),
+			"validation_mode": validation_policy["validation_mode"],
+			"validation_scope": validation_policy["validation_scope"],
+			"validation_batches_used": int(val_results.get("val_batches", 0.0)),
+			"validation_samples_used": int(val_results.get("val_samples", 0.0)),
+			"is_full_validation": bool(validation_policy["is_full_validation"]),
 		}
 		for metric_name, metric_value in train_results.items():
 			if metric_name != "train_loss":
@@ -1818,12 +2059,21 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 		for metric_name, metric_value in val_results.items():
 			if metric_name != "val_loss":
 				row[metric_name] = metric_value
+		early_stopping_state = early_stopper.step(epoch_number, row)
+		row.update(early_stopping_state)
+		if early_stopper.should_stop:
+			stopped_early = True
+			stop_reason = early_stopper.stop_reason
+			if early_stopping_verbose:
+				logger.info("Early stopping triggered at epoch %s: %s", epoch_number, stop_reason)
 
 		history_rows.append(row)
 		should_save_latest = save_latest_checkpoint and (
-			epoch_number % save_every_n_epochs == 0 or epoch_number == epochs
+			epoch_number % save_every_n_epochs == 0
+			or epoch_number == epochs
+			or (early_stopper.should_stop and early_stopping_save_latest_on_stop)
 		)
-		if is_best_epoch and save_best_checkpoint:
+		if is_best_epoch and save_best_checkpoint and early_stopping_checkpoint_best:
 			best_val_loss = val_loss
 			save_checkpoint(
 				best_checkpoint_path,
@@ -1908,6 +2158,11 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 				"history_rows": history_rows,
 				"final_epoch_summary": final_epoch_summary,
 				"num_epochs_completed": epoch_number,
+				"validation": validation_protocol_metadata,
+				"early_stopping": _early_stopping_summary(),
+				"stopped_early": bool(stopped_early),
+				"stop_reason": stop_reason,
+				"stop_epoch": early_stopper.stop_epoch,
 			}
 		)
 
@@ -1918,18 +2173,8 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 			val_results["val_loss"],
 			best_val_loss,
 		)
-		if early_stopping_patience is not None and math.isfinite(val_loss):
-			if is_best_epoch:
-				epochs_without_validation_improvement = 0
-			else:
-				epochs_without_validation_improvement += 1
-			if epochs_without_validation_improvement >= early_stopping_patience:
-				logger.info(
-					"Early stopping after epoch %s: validation loss did not improve for %s epoch(s).",
-					epoch_number,
-					early_stopping_patience,
-				)
-				break
+		if early_stopper.should_stop:
+			break
 
 	test_results: dict[str, float] = {}
 	test_plot_results: dict[str, float] = {}
@@ -2030,7 +2275,14 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 		"training_curve_paths": training_curve_paths,
 		"final_epoch_summary": final_epoch_summary,
 		"history_rows": history_rows,
+		"normalization": normalization_metadata,
+		"validation": validation_protocol_metadata,
 		"test_results": test_results,
+		"early_stopping": _early_stopping_summary(),
+		"stopped_early": bool(stopped_early),
+		"stop_reason": stop_reason,
+		"stop_epoch": early_stopper.stop_epoch,
+		"epochs_completed": int(final_epoch_summary.get("epoch", start_epoch)) if final_epoch_summary else start_epoch,
 	}
 	hardware_summary_path = run_artifact_paths.get("hardware_summary_path")
 	if hardware_summary_path:
@@ -2299,6 +2551,10 @@ def train_model(
 	run_name: str | None = None,
 	output_root: str | Path | None = None,
 	overwrite_run: bool = False,
+	disable_early_stopping: bool = False,
+	early_stopping_patience: int | None = None,
+	early_stopping_monitor: str | None = None,
+	early_stopping_min_delta: float | None = None,
 ) -> dict[str, Any]:
 	"""Train the forecasting model selected by the provided YAML config."""
 
@@ -2306,7 +2562,16 @@ def train_model(
 		raise ImportError("PyTorch is required to train the wildfire forecasting model.")
 
 	config = _ensure_config_path(load_config(config_path), config_path)
-	config = apply_training_cli_overrides(config, run_name=run_name, output_root=output_root, overwrite_run=overwrite_run)
+	config = apply_training_cli_overrides(
+		config,
+		run_name=run_name,
+		output_root=output_root,
+		overwrite_run=overwrite_run,
+		disable_early_stopping=disable_early_stopping,
+		early_stopping_patience=early_stopping_patience,
+		early_stopping_monitor=early_stopping_monitor,
+		early_stopping_min_delta=early_stopping_min_delta,
+	)
 	return train_model_from_config(config)
 
 

@@ -1927,12 +1927,22 @@ def _resolve_normalization_stats_path(
 	"""Resolve the configured normalization stats path when it exists."""
 
 	normalization_config = _get_section(config, "normalization")
-	normalization_path = normalization_config.get("path")
+	if bool(normalization_config.get("enabled", True)) is False:
+		return None
+	normalization_path = normalization_config.get("stats_path", normalization_config.get("path"))
 	if not normalization_path:
+		if bool(normalization_config.get("require_stats", False)):
+			raise FileNotFoundError("normalization.require_stats=true, but normalization.path/stats_path is not configured.")
 		return None
 	resolved_normalization_path = _resolve_path(config_path, normalization_path)
 	if resolved_normalization_path.exists():
 		return resolved_normalization_path
+	if bool(normalization_config.get("require_stats", False)):
+		raise FileNotFoundError(
+			f"Normalization stats file not found: {resolved_normalization_path}\n"
+			"Compute train-only input stats first, for example:\n"
+			"python scripts/compute_normalization.py --config configs/default.yaml --from_cache"
+		)
 	return None
 
 

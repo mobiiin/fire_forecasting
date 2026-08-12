@@ -12,7 +12,7 @@ except ImportError:  # pragma: no cover - environment-specific fallback
 
 from src.config import load_config
 from src.models.model_factory import build_model_from_config
-from src.training.train import _ensure_config_path, apply_training_cli_overrides, train_model_from_config
+from src.training.train import _ensure_config_path, add_early_stopping_cli_args, apply_training_cli_overrides, train_model_from_config
 
 
 def _weatherformer_config(config_path: str | Path) -> dict:
@@ -39,6 +39,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--run_name", default=None, help="Optional explicit run name.")
 	parser.add_argument("--output_root", default=None, help="Override training.output.root_dir.")
 	parser.add_argument("--overwrite_run", action="store_true", help="Allow writing into an existing explicit run directory.")
+	add_early_stopping_cli_args(parser)
 	return parser
 
 
@@ -69,6 +70,10 @@ def main() -> None:
 		run_name=args.run_name,
 		output_root=args.output_root,
 		overwrite_run=args.overwrite_run,
+		disable_early_stopping=args.disable_early_stopping,
+		early_stopping_patience=args.early_stopping_patience,
+		early_stopping_monitor=args.early_stopping_monitor,
+		early_stopping_min_delta=args.early_stopping_min_delta,
 	)
 	_print_model_summary(config)
 	train_model_from_config(config)

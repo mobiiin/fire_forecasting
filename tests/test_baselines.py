@@ -3,10 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from src.baselines.common import build_mask_logits_from_binary, probability_to_logit
 from src.baselines.linear_extrapolation import predict_linear_extrapolation_for_sample
 from src.baselines.persistence import predict_persistence_for_sample
+from src.training.metrics import compute_metrics
 
 
 def _write_frame(path: Path, surface_flux: float, surface_fuel: float, canopy_fuel: float) -> None:
@@ -22,6 +24,7 @@ def _write_frame(path: Path, surface_flux: float, surface_fuel: float, canopy_fu
 
 def _config() -> dict[str, object]:
 	return {
+		"task_type": "multitask",
 		"input_sequence_length": 2,
 		"prediction_horizon": 1,
 		"channel_layout": {
@@ -155,3 +158,30 @@ def test_linear_extrapolation_scales_by_prediction_horizon(tmp_path: Path) -> No
 	assert np.allclose(prediction[1], 2.0)
 	expected_energy = np.log1p(np.asarray([[4.0]], dtype=np.float32))
 	assert np.allclose(prediction[3], expected_energy)
+
+
+def test_baseline_predictions_produce_log_space_energy_metrics(tmp_path: Path) -> None:
+	torch = pytest.importorskip("torch")
+	config = _config()
+	record = _dataset_record(tmp_path)
+	target = np.zeros((4, 2, 2), dtype=np.float32)
+	target[2] = 1.0
+	target[3] = np.log1p(np.full((2, 2), 3.0, dtype=np.float32))
+
+	for predict_fn in (predict_persistence_for_sample, predict_linear_extrapolation_for_sample):
+		prediction = predict_fn(
+			dataset_record=record,
+			sample_ref={"sample_index": 0},
+			config=config,
+			patch=None,
+		)
+		metrics = compute_metrics(
+			torch.from_numpy(prediction[None]).to(torch.float32),
+			torch.from_numpy(target[None]).to(torch.float32),
+			config,
+		)
+
+		assert "energy_log_mae" in metrics
+		assert "active_energy_log_mae" in metrics
+		assert np.isfinite(metrics["energy_log_mae"])
+		assert np.isfinite(metrics["active_energy_log_mae"])

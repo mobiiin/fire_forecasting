@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import copy
+import hashlib
+import re
 from pathlib import Path
 from typing import Any, Dict, Mapping
 
@@ -11,6 +14,77 @@ import yaml
 def _section(config: Mapping[str, Any], name: str) -> dict[str, Any]:
     value = config.get(name)
     return dict(value) if isinstance(value, Mapping) else {}
+
+
+def compute_file_sha256(path: str | Path) -> str:
+    """Return the SHA-256 hash for a file."""
+
+    resolved = Path(path).expanduser().resolve()
+    hasher = hashlib.sha256()
+    with resolved.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def compute_text_sha256(text: str) -> str:
+    """Return the SHA-256 hash for UTF-8 text."""
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _deep_merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
+    merged = copy.deepcopy(dict(base))
+    for key, value in override.items():
+        if key == "base_config":
+            continue
+        existing = merged.get(key)
+        if isinstance(existing, Mapping) and isinstance(value, Mapping):
+            merged[key] = _deep_merge(existing, value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+_INTERPOLATION_PATTERN = re.compile(r"\$\{([^}]+)\}")
+
+
+def _lookup_dotted(config: Mapping[str, Any], dotted_key: str) -> Any:
+    current: Any = config
+    for part in dotted_key.split("."):
+        if not isinstance(current, Mapping) or part not in current:
+            raise KeyError(f"Config interpolation references unknown key: {dotted_key!r}")
+        current = current[part]
+    return current
+
+
+def _resolve_interpolations(value: Any, root: Mapping[str, Any]) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _resolve_interpolations(nested, root) for key, nested in value.items()}
+    if isinstance(value, list):
+        return [_resolve_interpolations(item, root) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_resolve_interpolations(item, root) for item in value)
+    if not isinstance(value, str):
+        return value
+
+    def replace(match: re.Match[str]) -> str:
+        replacement = _lookup_dotted(root, match.group(1).strip())
+        return str(replacement)
+
+    return _INTERPOLATION_PATTERN.sub(replace, value)
+
+
+def resolve_config_interpolations(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Resolve simple ${section.key} string references in a config mapping."""
+
+    resolved = copy.deepcopy(dict(config))
+    for _ in range(10):
+        next_resolved = _resolve_interpolations(resolved, resolved)
+        if next_resolved == resolved:
+            return dict(next_resolved)
+        resolved = next_resolved
+    raise ValueError("Config interpolation did not converge after 10 passes.")
 
 
 def _normalize_sequence_config(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -71,7 +145,7 @@ def _normalize_sequence_config(config: Dict[str, Any]) -> Dict[str, Any]:
     return config
 
 
-def load_config(config_path: str | Path) -> Dict[str, Any]:
+def _load_config(config_path: str | Path, *, finalize: bool) -> Dict[str, Any]:
     """Load a YAML configuration file into a plain Python dictionary."""
 
     path = Path(config_path).expanduser().resolve()
@@ -85,8 +159,35 @@ def load_config(config_path: str | Path) -> Dict[str, Any]:
         raise ValueError(f"Invalid YAML in config file '{path}': {exc}") from exc
 
     if config is None:
-        return {}
+        config = {}
     if not isinstance(config, dict):
         raise ValueError(f"Config file must contain a mapping at the top level: {path}")
 
+    base_config_value = config.get("base_config")
+    base_path: Path | None = None
+    if base_config_value not in (None, "", "null"):
+        base_path = Path(str(base_config_value)).expanduser()
+        if not base_path.is_absolute():
+            base_path = (path.parent / base_path).resolve()
+        base_config = _load_config(base_path, finalize=False)
+        config = _deep_merge(base_config, config)
+        config["base_config"] = str(base_path)
+
+    if not finalize:
+        return config
+
+    config = resolve_config_interpolations(config)
+    config["config_path"] = str(path)
+    config["_config_path"] = str(path)
+    config["_config_file_name"] = path.name
+    config["_config_sha256"] = compute_file_sha256(path)
+    if base_path is not None:
+        config["_base_config_path"] = str(base_path)
+        config["_base_config_sha256"] = compute_file_sha256(base_path)
     return _normalize_sequence_config(config)
+
+
+def load_config(config_path: str | Path) -> Dict[str, Any]:
+    """Load a YAML configuration file into a fully resolved config dictionary."""
+
+    return _load_config(config_path, finalize=True)

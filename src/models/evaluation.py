@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import math
 from pathlib import Path
 from typing import Any, Mapping
 import warnings
@@ -20,6 +21,12 @@ from src.training.checkpoints import load_checkpoint, validate_checkpoint_model_
 from src.training.losses import get_loss_function
 from src.training.metrics import compute_metrics
 from src.training.hardware import autocast_context, choose_amp_dtype
+from src.training.input_normalization import (
+	apply_input_normalization,
+	build_input_normalizer_for_loader,
+	compare_normalization_metadata,
+	normalization_metadata_from_loader,
+)
 from src.training.train import (
 	_coerce_loss_result,
 	_denormalize_target_tensors_for_metrics,
@@ -138,6 +145,7 @@ def evaluate_checkpoint_on_split(
 	max_batches: int | None = None,
 	expected_architecture: str | None = None,
 	allow_sequence_mismatch: bool = False,
+	allow_normalization_mismatch: bool = False,
 ) -> dict[str, Any]:
 	"""Evaluate one checkpoint on the requested split using existing metrics/losses."""
 
@@ -160,6 +168,8 @@ def evaluate_checkpoint_on_split(
 	device = _get_device(config)
 	model = build_model_from_config(config, input_channels=input_channels).to(device)
 	criterion = get_loss_function(config)
+	input_normalizer = build_input_normalizer_for_loader(selected_loader, device, input_channels, config)
+	normalization_metadata = normalization_metadata_from_loader(selected_loader, config, input_channels)
 
 	if checkpoint_path is None:
 		latest_checkpoint_path, best_checkpoint_path = _resolve_training_paths(config)
@@ -172,6 +182,16 @@ def evaluate_checkpoint_on_split(
 	checkpoint = load_checkpoint(resolved_checkpoint_path, map_location=device)
 	_validate_checkpoint_architecture(checkpoint, expected_architecture, resolved_checkpoint_path)
 	_validate_checkpoint_sequence(checkpoint, config, resolved_checkpoint_path, allow_sequence_mismatch=allow_sequence_mismatch)
+	normalization_mismatches = compare_normalization_metadata(checkpoint.get("normalization"), normalization_metadata)
+	if normalization_mismatches:
+		message = (
+			f"Checkpoint normalization metadata mismatch for {resolved_checkpoint_path}:\n"
+			+ "\n".join(f"  - {item}" for item in normalization_mismatches)
+		)
+		if allow_normalization_mismatch:
+			warnings.warn(message, RuntimeWarning, stacklevel=2)
+		else:
+			raise ValueError(message + "\nPass --allow_normalization_mismatch only for intentional compatibility/debug runs.")
 	validate_checkpoint_model_compatibility(model, checkpoint, resolved_checkpoint_path)
 	model.load_state_dict(checkpoint["model_state_dict"])
 	model.eval()
@@ -179,9 +199,11 @@ def evaluate_checkpoint_on_split(
 
 	aggregate_loss_total = 0.0
 	aggregate_metric_totals: dict[str, float] = defaultdict(float)
+	aggregate_metric_counts: dict[str, int] = defaultdict(int)
 	aggregate_loss_component_totals: dict[str, float] = defaultdict(float)
 	aggregate_samples = 0
 	per_dataset: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+	per_dataset_metric_counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
 
 	with torch.inference_mode():
 		for batch_index, batch in enumerate(selected_loader):
@@ -191,6 +213,7 @@ def evaluate_checkpoint_on_split(
 				raise TypeError("Expected DataLoader batches with at least input and target tensors.")
 			x_batch = batch[0].to(device, non_blocking=True)
 			y_batch = batch[1].to(device, non_blocking=True)
+			x_batch = apply_input_normalization(x_batch, input_normalizer, config)
 			metadata_items = metadata_batch_to_list(batch[2], batch_size=int(x_batch.shape[0])) if len(batch) >= 3 else [{} for _ in range(int(x_batch.shape[0]))]
 			with autocast_context(device, amp_dtype):
 				y_pred = model(x_batch)
@@ -220,8 +243,14 @@ def evaluate_checkpoint_on_split(
 					aggregate_loss_component_totals[component_name] += float(component_value)
 					per_dataset[dataset_name][f"test_{component_name}"] += float(component_value)
 				for metric_name, metric_value in sample_metrics.items():
-					aggregate_metric_totals[metric_name] += float(metric_value)
-					per_dataset[dataset_name][f"test_{metric_name}"] += float(metric_value)
+					metric_float = float(metric_value)
+					if not math.isfinite(metric_float):
+						continue
+					metric_key = f"test_{metric_name}"
+					aggregate_metric_totals[metric_name] += metric_float
+					aggregate_metric_counts[metric_name] += 1
+					per_dataset[dataset_name][metric_key] += metric_float
+					per_dataset_metric_counts[dataset_name][metric_key] += 1
 
 	if aggregate_samples == 0:
 		raise ValueError(f"Selected split {split!r} produced no evaluation samples.")
@@ -230,16 +259,20 @@ def evaluate_checkpoint_on_split(
 	for component_name, total_value in aggregate_loss_component_totals.items():
 		aggregate_results[f"test_{component_name}"] = total_value / aggregate_samples
 	for metric_name, total_value in aggregate_metric_totals.items():
-		aggregate_results[f"test_{metric_name}"] = total_value / aggregate_samples
+		metric_count = aggregate_metric_counts.get(metric_name, 0)
+		if metric_count > 0:
+			aggregate_results[f"test_{metric_name}"] = total_value / metric_count
 
 	per_dataset_results: dict[str, dict[str, float]] = {}
 	for dataset_name, totals in per_dataset.items():
 		num_samples = max(int(totals.get("num_samples", 0.0)), 1)
+		metric_counts = per_dataset_metric_counts.get(dataset_name, {})
 		row: dict[str, float] = {"num_samples": float(num_samples)}
 		for key, total_value in totals.items():
 			if key == "num_samples":
 				continue
-			row[key] = float(total_value) / num_samples
+			denominator = metric_counts.get(key, num_samples)
+			row[key] = float(total_value) / max(int(denominator), 1)
 		per_dataset_results[dataset_name] = row
 
 	return {
@@ -247,6 +280,7 @@ def evaluate_checkpoint_on_split(
 		"split": str(split).lower(),
 		"num_samples": int(aggregate_samples),
 		"sequence": _expected_sequence_metadata(config),
+		"normalization": normalization_metadata,
 		"aggregate_results": aggregate_results,
 		"per_dataset_results": per_dataset_results,
 	}

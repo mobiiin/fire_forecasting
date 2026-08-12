@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 import csv
+import math
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -363,8 +364,10 @@ def evaluate_baseline(
 	total_samples = 0
 	total_loss = 0.0
 	aggregate_metrics: dict[str, float] = defaultdict(float)
+	aggregate_metric_counts: dict[str, int] = defaultdict(int)
 	aggregate_loss_components: dict[str, float] = defaultdict(float)
 	per_dataset: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+	per_dataset_metric_counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
 
 	prediction_output_root = Path("artifacts/baselines") / method_name / split / "predictions"
 	visualization_output_root = Path("artifacts/baselines") / method_name / split / "visualizations"
@@ -414,8 +417,14 @@ def evaluate_baseline(
 				aggregate_loss_components[component_name] += float(component_value)
 				per_dataset[dataset_name][f"test_{component_name}"] += float(component_value)
 			for metric_name, metric_value in sample_metrics.items():
-				aggregate_metrics[metric_name] += float(metric_value)
-				per_dataset[dataset_name][f"test_{metric_name}"] += float(metric_value)
+				metric_float = float(metric_value)
+				if not math.isfinite(metric_float):
+					continue
+				metric_key = f"test_{metric_name}"
+				aggregate_metrics[metric_name] += metric_float
+				aggregate_metric_counts[metric_name] += 1
+				per_dataset[dataset_name][metric_key] += metric_float
+				per_dataset_metric_counts[dataset_name][metric_key] += 1
 
 			if save_predictions:
 				_save_prediction_artifact(
@@ -439,16 +448,20 @@ def evaluate_baseline(
 	for component_name, total_value in aggregate_loss_components.items():
 		aggregate_results[f"test_{component_name}"] = total_value / total_samples
 	for metric_name, total_value in aggregate_metrics.items():
-		aggregate_results[f"test_{metric_name}"] = total_value / total_samples
+		metric_count = aggregate_metric_counts.get(metric_name, 0)
+		if metric_count > 0:
+			aggregate_results[f"test_{metric_name}"] = total_value / metric_count
 
 	per_dataset_results: dict[str, dict[str, float]] = {}
 	for dataset_name, totals in per_dataset.items():
 		sample_count = max(int(totals.get("num_samples", 0.0)), 1)
+		metric_counts = per_dataset_metric_counts.get(dataset_name, {})
 		row = {"num_samples": float(sample_count)}
 		for key, value in totals.items():
 			if key == "num_samples":
 				continue
-			row[key] = float(value) / sample_count
+			denominator = metric_counts.get(key, sample_count)
+			row[key] = float(value) / max(int(denominator), 1)
 		per_dataset_results[dataset_name] = row
 
 	rows: list[dict[str, Any]] = []

@@ -147,6 +147,7 @@ def compute_metrics(y_pred: torch.Tensor, y_true: torch.Tensor, config) -> dict[
 				pred_energy_log = y_pred[:, 3:4]
 				true_energy_log = y_true[:, 3:4]
 				energy_log_error = pred_energy_log - true_energy_log
+				energy_log_abs_error = torch.abs(energy_log_error)
 				results["energy_log_mae"] = float(torch.mean(torch.abs(energy_log_error)).item())
 				results["energy_log_rmse"] = float(torch.sqrt(torch.mean(energy_log_error ** 2) + eps).item())
 
@@ -162,8 +163,31 @@ def compute_metrics(y_pred: torch.Tensor, y_true: torch.Tensor, config) -> dict[
 				energy_abs_error = torch.abs(pred_energy_MW - true_energy_MW)
 				results["energy_MW_mae"] = float(torch.mean(energy_abs_error).item())
 				results["energy_MW_rmse"] = float(torch.sqrt(torch.mean((pred_energy_MW - true_energy_MW) ** 2) + eps).item())
+				results["energy_mw_mae"] = results["energy_MW_mae"]
+				results["energy_mw_rmse"] = results["energy_MW_rmse"]
 
 				energy_active_threshold_MW = float(_get_section(config, "multitask").get("energy_active_threshold_MW", 0.001))
+				consumed_active_threshold = float(
+					_get_section(config, "multitask").get(
+						"consumed_active_threshold",
+						_get_section(config, "multitask").get("consumed_fuel_threshold", 0.001),
+					)
+				)
+				energy_active_threshold_log = math.log1p(max(energy_active_threshold_MW, 0.0))
+				target_defined_active = (
+					(true_mask > 0.5)
+					| (true_energy_log > energy_active_threshold_log)
+					| (true_surface > consumed_active_threshold)
+					| (true_canopy > consumed_active_threshold)
+				)
+				if target_defined_active.any():
+					results["active_energy_log_mae"] = float(energy_log_abs_error[target_defined_active].mean().item())
+					results["active_energy_log_rmse"] = float(
+						torch.sqrt(torch.mean(energy_log_error[target_defined_active] ** 2) + eps).item()
+					)
+				else:
+					results["active_energy_log_mae"] = math.nan
+					results["active_energy_log_rmse"] = math.nan
 				true_energy_active = (true_energy_MW > energy_active_threshold_MW).to(dtype=torch.float32)
 				pred_energy_active = (pred_energy_MW > energy_active_threshold_MW).to(dtype=torch.float32)
 				if true_energy_active.any():
@@ -174,6 +198,8 @@ def compute_metrics(y_pred: torch.Tensor, y_true: torch.Tensor, config) -> dict[
 				else:
 					results["energy_MW_active_mae"] = 0.0
 					results["energy_MW_active_rmse"] = 0.0
+				results["active_energy_mw_mae"] = results["energy_MW_active_mae"]
+				results["active_energy_mw_rmse"] = results["energy_MW_active_rmse"]
 
 				energy_active_metrics = _segmentation_stats(pred_energy_active, true_energy_active, eps)
 				results["energy_active_iou"] = float(energy_active_metrics["iou"])

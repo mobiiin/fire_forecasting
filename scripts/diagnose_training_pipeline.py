@@ -26,6 +26,7 @@ from src.training.train import (
 	_loader_summary,
 	_maybe_probe_auto_batch_size,
 	_run_epoch,
+	resolve_validation_policy,
 )
 from src.utils.logging import setup_logging
 from src.utils.seed import set_seed
@@ -130,6 +131,12 @@ def main() -> None:
 	print(f"val_loader: {_loader_summary(val_loader)}")
 	if test_loader is not None:
 		print(f"test_loader: {_loader_summary(test_loader)}")
+	validation_policy = resolve_validation_policy(config, val_loader=val_loader, logger=logger)
+	print("validation:")
+	print(f"  mode: {validation_policy['validation_mode']}")
+	print(f"  scope: {validation_policy['validation_scope']}")
+	print(f"  batches_used: {validation_policy['validation_batches_used']}")
+	print(f"  is_full_validation: {validation_policy['is_full_validation']}")
 	print(f"train_loss: {results['train_loss']:.6f}")
 	print(f"avg_data_wait_s: {results.get('train_data_wait_avg', 0.0):.6f}")
 	print(f"avg_h2d_s: {results.get('train_h2d_avg', 0.0):.6f}")

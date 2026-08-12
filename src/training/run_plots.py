@@ -68,6 +68,52 @@ def _title(architecture: str | None, run_name: str | None, label: str) -> str:
 	return f"{arch_title} {label}\n{run_name}"
 
 
+def _validation_label(rows: list[Mapping[str, Any]]) -> str | None:
+	if not rows:
+		return None
+	row = rows[-1]
+	mode = str(row.get("validation_mode", "")).strip()
+	scope = str(row.get("validation_scope", "")).strip()
+	batches = row.get("validation_batches_used", row.get("val_batches"))
+	if mode == "full_every_epoch" or scope == "full":
+		return "Validation: full every epoch"
+	if mode == "fixed_subset_every_epoch" or scope == "fixed_subset":
+		try:
+			batch_count = int(float(batches))
+		except (TypeError, ValueError):
+			return "Validation: fixed subset"
+		return f"Validation: fixed subset, {batch_count} batches"
+	return None
+
+
+def _early_stopping_stop_epoch(rows: list[Mapping[str, Any]]) -> int | None:
+	for row in rows:
+		if str(row.get("early_stopping_should_stop", "")).lower() in {"1", "true", "yes"}:
+			try:
+				return int(float(row.get("epoch")))
+			except (TypeError, ValueError):
+				return None
+	return None
+
+
+def _early_stopping_title_label(rows: list[Mapping[str, Any]]) -> str | None:
+	stop_epoch = _early_stopping_stop_epoch(rows)
+	if stop_epoch is None:
+		return None
+	best_epoch = None
+	for row in reversed(rows):
+		value = row.get("early_stopping_best_epoch")
+		if value not in (None, "", "nan", "None"):
+			try:
+				best_epoch = int(float(value))
+				break
+			except (TypeError, ValueError):
+				pass
+	if best_epoch is None:
+		return f"Early stopping: stopped at epoch {stop_epoch}"
+	return f"Early stopping: stopped at epoch {stop_epoch} | Best epoch: {best_epoch}"
+
+
 def save_loss_curves(
 	rows: list[Mapping[str, Any]],
 	output_path: str | Path,
@@ -100,8 +146,18 @@ def save_loss_curves(
 	if val_values:
 		best_index = min(range(len(val_values)), key=lambda index: val_values[index])
 		axis.axvline(best_epochs[best_index], color="0.25", linestyle=":", linewidth=1.2, label=f"Best val epoch {best_epochs[best_index]}")
+	stop_epoch = _early_stopping_stop_epoch(rows)
+	if stop_epoch is not None:
+		axis.axvline(stop_epoch, color="tab:red", linestyle="--", linewidth=1.4, label=f"Early stopped epoch {stop_epoch}")
 
-	axis.set_title(_title(architecture, run_name, "Training Curves"))
+	title = _title(architecture, run_name, "Training Curves")
+	validation_label = _validation_label(rows)
+	if validation_label:
+		title = f"{title}\n{validation_label}"
+	early_label = _early_stopping_title_label(rows)
+	if early_label:
+		title = f"{title}\n{early_label}"
+	axis.set_title(title)
 	axis.set_xlabel("Epoch")
 	axis.set_ylabel("Loss")
 	axis.grid(True, alpha=0.3)
@@ -124,6 +180,9 @@ def _available_metric_names(rows: list[Mapping[str, Any]], test_results: Mapping
 				"val_batches",
 				"train_samples_per_second",
 				"val_samples_per_second",
+				"validation_batches_used",
+				"validation_samples_used",
+				"is_full_validation",
 			}:
 				metrics.add(key.split("_", 1)[1])
 	for key in test_results:
@@ -177,13 +236,23 @@ def save_metric_curves(
 		test_value = _finite_float(test_results.get(f"test_{metric_name}"))
 		if test_value is not None:
 			axis.axhline(test_value, color="tab:green", linestyle="--", linewidth=1.5, label="Test")
+		stop_epoch = _early_stopping_stop_epoch(rows)
+		if stop_epoch is not None:
+			axis.axvline(stop_epoch, color="tab:red", linestyle="--", linewidth=1.2, label="Early stop")
 		axis.set_title(metric_name.replace("_", " ").title())
 		axis.set_xlabel("Epoch")
 		axis.grid(True, alpha=0.3)
 		axis.legend()
 	for axis in flat_axes[len(metrics):]:
 		axis.axis("off")
-	fig.suptitle(_title(architecture, run_name, "Metric Curves"), fontsize=14)
+	title = _title(architecture, run_name, "Metric Curves")
+	validation_label = _validation_label(rows)
+	if validation_label:
+		title = f"{title}\n{validation_label}"
+	early_label = _early_stopping_title_label(rows)
+	if early_label:
+		title = f"{title}\n{early_label}"
+	fig.suptitle(title, fontsize=14)
 	fig.savefig(output, bbox_inches="tight")
 	plt.close(fig)
 	return [output]

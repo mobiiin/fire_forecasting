@@ -29,7 +29,9 @@ from src.data.dataset import (
 from src.data.discovery import discover_multiple_datasets
 from src.data.spatial_transforms import infer_with_external_test_spatial_handling
 from src.models.convlstm_unet import build_model_from_config
+from src.training.input_normalization import apply_input_normalization, build_input_normalizer_for_loader, normalization_metadata_from_loader
 from src.training.losses import get_loss_function
+from src.training.train import resolve_validation_policy
 
 
 def _print_environment_info() -> None:
@@ -103,7 +105,40 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 	parser = argparse.ArgumentParser(description="Sanity-check the wildfire forecasting project.")
 	parser.add_argument("--config", default="configs/default.yaml", help="Path to YAML config file.")
+	parser.add_argument("--batch_size", type=int, default=2, help="Small DataLoader batch size used only for this sanity check.")
+	parser.add_argument("--num_workers", type=int, default=0, help="DataLoader workers used only for this sanity check.")
+	parser.add_argument("--device", default=None, help="Optional device override for this sanity check, e.g. cpu, cuda, cuda:0.")
 	return parser
+
+
+def _apply_sanity_overrides(config: dict[str, Any], batch_size: int, num_workers: int, device: str | None) -> None:
+	"""Keep the sanity check lightweight without mutating the saved config."""
+
+	sanity_batch_size = max(1, int(batch_size))
+	sanity_num_workers = max(0, int(num_workers))
+	config["batch_size"] = sanity_batch_size
+	training_config = config.get("training")
+	if not isinstance(training_config, dict):
+		training_config = {}
+	training_config["batch_size"] = sanity_batch_size
+	training_config["num_workers"] = sanity_num_workers
+	if device not in (None, "", "null"):
+		training_config["device"] = str(device)
+	config["training"] = training_config
+	data_loader_config = config.get("data_loader")
+	if not isinstance(data_loader_config, dict):
+		data_loader_config = {}
+	data_loader_config["batch_size"] = sanity_batch_size
+	data_loader_config["num_workers"] = sanity_num_workers
+	for split in ("train", "val", "test"):
+		split_config = data_loader_config.get(split)
+		if not isinstance(split_config, dict):
+			split_config = {}
+		split_config["batch_size"] = sanity_batch_size
+		split_config["num_workers"] = sanity_num_workers
+		split_config["persistent_workers"] = False
+		data_loader_config[split] = split_config
+	config["data_loader"] = data_loader_config
 
 
 def main() -> None:
@@ -115,6 +150,7 @@ def main() -> None:
 	config_path = Path(args.config).expanduser().resolve()
 	config = load_config(config_path)
 	config["config_path"] = str(config_path)
+	_apply_sanity_overrides(config, args.batch_size, args.num_workers, args.device)
 
 	_print_environment_info()
 	data_dir_value = config.get("data_dir")
@@ -132,8 +168,14 @@ def main() -> None:
 		raise FileNotFoundError(f"No files found in '{data_dir}' using pattern '{config['file_pattern']}'.")
 	first_file = raw_files[0]
 	first_tensor = np.load(first_file, allow_pickle=False)
-	if first_tensor.shape != (144, 144, 86):
-		raise ValueError(f"Expected one raw tensor shaped (144, 144, 86), got {first_tensor.shape} at {first_file}.")
+	if first_tensor.ndim != 3:
+		raise ValueError(f"Expected one raw tensor shaped (H, W, C), got {first_tensor.shape} at {first_file}.")
+	expected_raw_channels = int(config.get("input_channel_count", config.get("model", {}).get("raw_input_channels", first_tensor.shape[2])))
+	if int(first_tensor.shape[2]) != expected_raw_channels:
+		raise ValueError(
+			"Raw tensor channel count does not match the configured base input width. "
+			f"Expected C={expected_raw_channels}, got shape={first_tensor.shape} at {first_file}."
+		)
 	required_atmospheric_channels = int(atmospheric["num_vertical_levels"]) * int(atmospheric["variables_per_level"])
 	if atmospheric["enabled"] and required_atmospheric_channels > first_tensor.shape[2]:
 		print(
@@ -180,6 +222,40 @@ def main() -> None:
 	else:
 		print(f"  external test samples: {len(test_loader.dataset)}")
 
+	training_config = config.get("training", {}) if isinstance(config.get("training"), Mapping) else {}
+	performance_config = training_config.get("performance", {}) if isinstance(training_config.get("performance"), Mapping) else {}
+	validation_policy = resolve_validation_policy(config, val_loader=val_loader)
+	print("Validation")
+	print(f"  mode: {validation_policy['validation_mode']}")
+	print(f"  max_val_batches_per_epoch: {validation_policy['max_val_batches_per_epoch']}")
+	print(f"  fixed_subset_seed: {validation_policy['fixed_subset_seed']}")
+	print("  checkpoint selection: same validation protocol")
+	print("  status: OK")
+	if "full_validation_every_n_epochs" in config or "full_validation_every_n_epochs" in training_config or "full_validation_every_n_epochs" in performance_config:
+		print("  WARNING: full_validation_every_n_epochs is deprecated and ignored. Use training.validation.mode instead.")
+	if validation_policy["validation_mode"] == "full_every_epoch":
+		validation_config = training_config.get("validation", {}) if isinstance(training_config.get("validation"), Mapping) else {}
+		if validation_config.get("max_val_batches_per_epoch") not in (None, "", "null", "None"):
+			print("  WARNING: max_val_batches_per_epoch is ignored when mode is full_every_epoch.")
+	early_config = training_config.get("early_stopping", {}) if isinstance(training_config.get("early_stopping"), Mapping) else {}
+	checkpointing_config = training_config.get("checkpointing", {}) if isinstance(training_config.get("checkpointing"), Mapping) else {}
+	early_monitor = str(early_config.get("monitor", "val_loss"))
+	early_mode = str(early_config.get("mode", "min")).lower()
+	print("Early stopping")
+	print(f"  enabled: {bool(early_config.get('enabled', False))}")
+	print(f"  monitor: {early_monitor}")
+	print(f"  mode: {early_mode}")
+	print(f"  patience: {early_config.get('patience', 8)}")
+	print(f"  min_delta: {early_config.get('min_delta', 0.001)}")
+	print(f"  start_epoch: {early_config.get('start_epoch', 5)}")
+	print(f"  stop_on_nan: {bool(early_config.get('stop_on_nan', True))}")
+	print("  status: OK")
+	if early_mode not in {"min", "max"}:
+		print("  WARNING: early_stopping.mode should be 'min' or 'max'.")
+	checkpoint_monitor = str(checkpointing_config.get("monitor", "val_loss"))
+	if early_monitor != checkpoint_monitor:
+		print(f"  WARNING: early stopping monitor {early_monitor!r} differs from checkpoint monitor {checkpoint_monitor!r}.")
+
 	train_batch = next(iter(train_loader))
 	x_batch, y_batch = train_batch[:2]
 	if x_batch.ndim != 5:
@@ -198,6 +274,8 @@ def main() -> None:
 	model = model.to(device)
 	x_batch = x_batch.to(device)
 	y_batch = y_batch.to(device)
+	input_normalizer = build_input_normalizer_for_loader(train_loader, device, int(x_batch.shape[2]), config)
+	x_batch = apply_input_normalization(x_batch, input_normalizer, config)
 
 	with torch.no_grad():
 		y_pred = model(x_batch)
@@ -246,6 +324,11 @@ def main() -> None:
 	print(f"  X batch shape: {tuple(x_batch.shape)}")
 	print(f"  y batch shape: {tuple(y_batch.shape)}")
 	print(f"  model output shape: {tuple(y_pred.shape)}")
+	print("Input normalization")
+	print(f"  train: {normalization_metadata_from_loader(train_loader, config, int(x_batch.shape[2]))}")
+	print(f"  val: {normalization_metadata_from_loader(val_loader, config, int(x_batch.shape[2]))}")
+	if test_loader is not None:
+		print(f"  test: {normalization_metadata_from_loader(test_loader, config, int(x_batch.shape[2]))}")
 	if str(config.get("split_mode", "")).lower() == "multi_dataset_chronological":
 		train_metadata_items = metadata_batch_to_list(train_batch[2]) if len(train_batch) >= 3 and isinstance(train_batch[2], Mapping) else []
 		for item in train_metadata_items[:3]:
@@ -294,15 +377,37 @@ def main() -> None:
 		print(_format_stats("  y batch", _tensor_stats(y_batch)))
 
 	if test_loader is not None and len(test_loader.dataset) > 0:
-		external_first_file = test_loader.dataset.file_paths[0]
-		external_raw = np.load(external_first_file, allow_pickle=False)
 		print("External test spatial check")
-		print(f"  external raw path: {external_first_file}")
-		print(f"  external raw shape: {tuple(external_raw.shape)}")
+		external_file_paths = getattr(test_loader.dataset, "file_paths", None)
+		if external_file_paths:
+			external_first_file = external_file_paths[0]
+			external_raw = np.load(external_first_file, allow_pickle=False)
+			print(f"  external raw path: {external_first_file}")
+			print(f"  external raw shape: {tuple(external_raw.shape)}")
+		else:
+			cache_dir = getattr(test_loader.dataset, "cache_dir", None)
+			shards = getattr(test_loader.dataset, "shards", [])
+			first_shard = shards[0].get("path") if shards and isinstance(shards[0], Mapping) else None
+			print(f"  external raw path: not available from {type(test_loader.dataset).__name__}")
+			if cache_dir is not None:
+				print(f"  cache_dir: {cache_dir}")
+			if first_shard is not None:
+				print(f"  first cache shard: {first_shard}")
+			metadata = getattr(test_loader.dataset, "metadata", [])
+			if metadata:
+				first_metadata = metadata[0]
+				current_file = first_metadata.get("current_file_path", first_metadata.get("current_file"))
+				target_file = first_metadata.get("target_file_path", first_metadata.get("future_file"))
+				if current_file:
+					print(f"  metadata current file: {current_file}")
+				if target_file:
+					print(f"  metadata target file: {target_file}")
 		external_batch = next(iter(test_loader))
 		external_x, external_y = external_batch[:2]
 		print(f"  external X before spatial handling: {tuple(external_x.shape)}")
 		external_x_device = external_x.to(device)
+		external_normalizer = build_input_normalizer_for_loader(test_loader, device, int(external_x_device.shape[2]), config)
+		external_x_device = apply_input_normalization(external_x_device, external_normalizer, config)
 		external_spatial_result = infer_with_external_test_spatial_handling(model, external_x_device, config)
 		external_pred = external_spatial_result["y_pred"]
 		external_model_input = external_spatial_result["x_model_input"]

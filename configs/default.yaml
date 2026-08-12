@@ -5,8 +5,20 @@
 # Main dataset directories used for training/validation/test in multi-dataset mode.
 # Options: a non-empty list of relative or absolute directory paths containing one .npy file per timestamp.
 
+paths:
+  project_root: /home/mhabibp/fire_forecasting
+  raw_data_root: /project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE
+  scratch_root: /scratch/mhabibp
+  dataset_root: ${paths.scratch_root}/fire_forecasting_datasets/
+  patch_cache_root: ${paths.scratch_root}/fire_forecasting_patch_cache
+  normalization_root: ${paths.patch_cache_root}
+  artifacts_root: artifacts
+  runs_root: ${paths.artifacts_root}/runs
+  results_root: ${paths.artifacts_root}/results
+  logs_root: ${paths.artifacts_root}/logs
+
 # main_data_dir: /media/mhabibp/Elements/Mobin_CPS_files/New_CAWFE/
-main_data_dir: /project/fafghah/iswinlab/CAWFE_MOBIN/New_CAWFE
+main_data_dir: ${paths.raw_data_root}
 
 # Use ../fire_dataset_index_trimmed.json here after running scripts/manual_trim_fire_datasets.py.
 # The trimmed index stores compact temporal_trim start/end indices, not long frame-path lists.
@@ -127,21 +139,19 @@ manual_fire_split:
   #   - WOOLSEY
   #   - SPRINGS
   #   - YUBA_HYPOTHETICAL
-  
+
   train_fires:
-    - ESPERANZA
     - THOMAS__1204__keepz_08
     - THOMAS__1208__keepz_08
-    - THOMAS__1209__keepz_08
-    - THOMAS__1210__keepz_08
+
   val_fires:
-    - WITCHCREEK
+    - THOMAS__1209__keepz_08
 
   test_fires:
-    - WOOLSEY
+    - THOMAS__1210__keepz_08
 
 
-  
+
 
   use_full_fire_for_split: true
   within_fire_train_fraction: 1.0
@@ -180,8 +190,8 @@ fire_threshold: 0.5
 
 cache:
   enabled: true
-  scratch_root: /scratch/mhabibp/
-  cache_dir: /scratch/mhabibp/fire_forecasting_patch_cache/
+  scratch_root: ${paths.scratch_root}
+  cache_dir: ${paths.patch_cache_root}
   cache_version: v5_manual_trim_T5_H10_stride60
   input_sequence_length: 5
   prediction_horizon: 10
@@ -206,10 +216,10 @@ cache:
   save_preview_images: true
   num_preview_images: 50
   save_normalized_inputs: false
-  # Cached training batch order. shard_local_shuffle keeps all samples but
-  # forms batches from nearby samples in the same shard to reduce random reads.
+  # Cached training batch order. shard_local keeps batches sequential within
+  # each shard for faster smoke tests on network-backed scratch storage.
   # Options: weighted_random, shard_local_shuffle, shard_local
-  train_batch_sampler: shard_local_shuffle
+  train_batch_sampler: shard_local
   shard_memory_cache_size: 2
 
 patching:
@@ -288,9 +298,10 @@ dataset_sampling:
   # - balanced_by_fire
   mode: balanced_by_fire
 
-# Batch size for DataLoaders.
+# Batch size for DataLoaders. Keep this aligned with cache.samples_per_shard
+# for smoke tests so validation batches do not repeatedly cross shard files.
 # Options: any positive integer >= 1, limited by memory.
-batch_size: 16
+batch_size: 128
 
 # Top-level learning rate fallback.
 # Options: any positive float > 0.
@@ -299,7 +310,7 @@ learning_rate: 0.0001
 
 # Total training epochs.
 # Options: any positive integer >= 1.
-epochs: 20
+epochs: 50
 
 # Number of DataLoader workers.
 # Options: any integer >= 0.
@@ -711,6 +722,18 @@ model:
 
 convlstm_unet:
   input_sequence_length: 5
+  use_mask_gated_regression: false
+  regression_activation: softplus
+  mask_gate_source: predicted_mask
+  mask_gate_mode: soft
+  mask_gate_threshold: 0.0
+  detach_mask_gate: false
+  mask_gate_min: 0.05
+  output_bias_init:
+    enabled: true
+    regression_bias: -3.0
+    mask_bias: -3.0
+    energy_bias: -2.0
 
 earthformer_lite:
   input_sequence_length: 5
@@ -1019,9 +1042,24 @@ architectures:
     - ufno
 
 normalization:
-  # Saved normalization-stats file.
-  # Options: any relative or absolute .npz path.
-  path: ./artifacts/normalization_stats.npz
+  # Enable input normalization. Statistics are fit on the train split only and
+  # reused unchanged for train/val/test.
+  enabled: true
+
+  # Saved normalization-stats files. compute_normalization.py writes
+  # timestamped train_normalization_stats_<config>_<timestamp>.json/.npz files
+  # and updates these normalization_stats aliases in the patch-cache directory.
+  output_dir: ${paths.patch_cache_root}
+  path: ${paths.patch_cache_root}/normalization_stats.json
+  stats_path: ${paths.patch_cache_root}/normalization_stats.json
+  npz_path: ${paths.patch_cache_root}/normalization_stats.npz
+  fit_split: train
+  apply_to_splits:
+    - train
+    - val
+    - test
+  allow_val_test_fit: false
+  require_stats: true
 
   # Compute normalization from the precomputed train patch cache.
   # Options: true, false
@@ -1132,6 +1170,20 @@ training:
   # Total training epochs.
   # Options: any positive integer >= 1.
   epochs: 20
+  max_epochs: 50
+
+  early_stopping:
+    enabled: true
+    monitor: val_loss
+    mode: min
+    patience: 8
+    min_delta: 0.001
+    start_epoch: 5
+    restore_best_weights: false
+    checkpoint_best: true
+    save_latest_on_stop: true
+    verbose: true
+    stop_on_nan: true
 
   # Optional explicit run name. When null, training creates:
   # <architecture>_<YYYYMMDD_HHMMSS>_slurm<JOBID> or _local<pid>.
@@ -1142,23 +1194,24 @@ training:
   overwrite_run: false
 
   output:
-    root_dir: artifacts/runs
-    checkpoint_root: artifacts/checkpoints
-    log_root: artifacts/logs
+    root_dir: ${paths.runs_root}
+    checkpoint_root: ${paths.artifacts_root}/checkpoints
+    log_root: ${paths.logs_root}
     save_compatibility_checkpoints: true
     update_architecture_latest_checkpoint: true
     save_epoch_checkpoints: false
     save_best_checkpoint: true
-    save_latest_checkpoint: true
+    save_latest_checkpoint: false
     save_training_curves: true
     save_metric_curves: true
-    save_timing_plots: true
-    save_resolved_config: true
-    save_original_config: true
+    save_timing_plots: false
+    save_resolved_config: false
+    save_original_config: false
     save_run_summary: true
-    save_hardware_summary: true
-    save_cache_manifest_copy: true
-    save_normalization_stats_copy: true
+    save_hardware_summary: false
+    save_cache_manifest_copy: false
+    save_normalization_stats_copy: false
+    copy_normalization_npz: false
 
   checkpointing:
     monitor: val_loss
@@ -1168,10 +1221,25 @@ training:
     save_every_n_epochs: null
     keep_last_n_epoch_checkpoints: 3
 
+  loss:
+    background_suppression:
+      enabled: true
+      architectures: [convlstm_unet]
+      weight: 0.005
+      include_surface: true
+      include_canopy: true
+      include_energy: true
+      include_mask_prob: false
+      inactive_definition: combined
+      consumed_threshold: 0.001
+      energy_log_threshold: 0.001
+      mask_threshold: 0.5
+      reduction: mean
+
   # Automatically tune batch/accumulation from detected CUDA VRAM and architecture.
   # ConvLSTM-U-Net is much lighter than CAWFE-LATTE and can use larger batches.
   auto_hardware_tuning:
-    enabled: true
+    enabled: false
     max_host_memory_fraction: 0.55
     # Approximate extra host-memory copies from DataLoader collation, pinned-memory
     # staging, normalization temporaries, and framework overhead.
@@ -1203,7 +1271,7 @@ training:
     allow_tf32: true
     cudnn_benchmark: true
     torch_compile: false
-    auto_batch_size: true
+    auto_batch_size: false
     auto_batch_probe_batch_size: 8
     auto_batch_max_trials: 12
     # Treat probe batches above this fraction of total GPU memory as unsafe.
@@ -1219,8 +1287,18 @@ training:
     compute_train_metrics_every_batch: false
     cheap_train_metrics_every_n_batches: 100
     compute_val_metrics: true
-    max_train_batches_per_epoch: null
-    max_val_batches_per_epoch: 200
+    max_train_batches_per_epoch: 100
+
+  validation:
+    # Validation protocol. Do not mix capped and full validation in one run.
+    # Choices:
+    # - full_every_epoch
+    # - fixed_subset_every_epoch
+    mode: fixed_subset_every_epoch
+    max_val_batches_per_epoch: 50
+    fixed_subset_seed: 42
+    fixed_subset_shuffle: false
+    use_same_metric_for_checkpointing: true
 
   # Optimizer choice.
   # Supported options:
@@ -1253,17 +1331,9 @@ training:
   # Options: integer >= 1
   gradient_accumulation_steps: 4
 
-  # Reduce validation cost on normal epochs.
-  # Options: null for full validation every epoch, or positive integer batch cap.
-  max_val_batches_per_epoch: 200
-
   # Optional train-batch cap per epoch for very large sliding-window caches.
   # Options: null for a full train epoch, or positive integer batch cap.
-  max_train_batches_per_epoch: null
-
-  # Run full validation every N epochs when max_val_batches_per_epoch is set.
-  # Options: positive integer; 5 means epochs 5, 10, 15, ...
-  full_validation_every_n_epochs: 5
+  max_train_batches_per_epoch: 100
 
   # Compute expensive train metrics every batch.
   # Options: true, false
@@ -1356,7 +1426,7 @@ hparam_tuning:
   # Options: random, grid, optuna
 
   num_trials: 12
-  seed: 42
+  seed: 123
 
   output_dir: artifacts/hparam/cawfe_latte
 
@@ -1370,12 +1440,16 @@ hparam_tuning:
     training:
       performance:
         max_train_batches_per_epoch: 1000
-        max_val_batches_per_epoch: 200
-        full_validation_every_n_epochs: 5
         auto_batch_size: true
         precision: auto
         prefer_bf16_on_ampere_or_newer: true
         allow_tf32: true
+      validation:
+        mode: fixed_subset_every_epoch
+        max_val_batches_per_epoch: 200
+        fixed_subset_seed: 123
+        fixed_subset_shuffle: false
+        use_same_metric_for_checkpointing: true
 
   search_space:
     training.learning_rate: [0.0001, 0.0003, 0.0005]

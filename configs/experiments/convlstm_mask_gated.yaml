@@ -1,0 +1,35 @@
+base_config: ../default.yaml
+
+experiment:
+  name: convlstm_mask_gated
+  description: ConvLSTM U-Net run with mask-gated regression enabled.
+
+paths:
+  patch_cache_root: ${paths.scratch_root}/fire_forecasting_patch_cache/convlstm_mask_gated
+  artifacts_root: artifacts/experiments/convlstm_mask_gated
+  runs_root: ${paths.artifacts_root}/runs
+  results_root: ${paths.artifacts_root}/results
+  logs_root: ${paths.artifacts_root}/logs
+
+cache:
+  cache_dir: ${paths.patch_cache_root}
+  cache_version: v5_manual_trim_T5_H10_stride60_convlstm_mask_gated
+
+normalization:
+  output_dir: ${paths.patch_cache_root}
+  path: ${paths.patch_cache_root}/normalization_stats.json
+  stats_path: ${paths.patch_cache_root}/normalization_stats.json
+  npz_path: ${paths.patch_cache_root}/normalization_stats.npz
+
+convlstm_unet:
+  use_mask_gated_regression: true
+  regression_activation: softplus
+  mask_gate_source: predicted_mask
+  mask_gate_mode: soft
+  mask_gate_min: 0.05
+
+training:
+  output:
+    root_dir: ${paths.runs_root}
+    checkpoint_root: ${paths.artifacts_root}/checkpoints
+    log_root: ${paths.logs_root}

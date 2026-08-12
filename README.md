@@ -199,6 +199,91 @@ python scripts/train_forecasting_model.py --config configs/default.yaml
 
 If `/scratch` purges the cache, training raises a clear error and asks you to rerun precompute unless `cache.allow_dynamic_fallback: true` is set.
 
+## Visualizing Patch Cache Samples
+Use the standalone patch-cache viewer to inspect cached `X`/`y` samples directly from scratch without modifying the cache:
+
+```bash
+python scripts/visualize_patch_cache.py \
+  --config configs/default.yaml \
+  --split train
+
+python scripts/visualize_patch_cache.py \
+  --config configs/default.yaml \
+  --split val \
+  --sample_index 100
+
+python scripts/visualize_patch_cache.py \
+  --config configs/default.yaml \
+  --split test \
+  --mode save \
+  --random \
+  --num_save_samples 10
+```
+
+Useful controls: `n`/`p` for next/previous sample, up/down for input frame, `g`/`G` for channel group, `v` to cycle views, `w` to save the current figure, and `q` to quit.
+
+## Experiment Configs
+Every launchable training/evaluation script should be run with an explicit config:
+
+```bash
+python scripts/precompute_patch_cache.py --config configs/experiments/convlstm_debug_fixed_subset.yaml --split all
+python scripts/compute_normalization.py --config configs/experiments/convlstm_debug_fixed_subset.yaml --from_cache
+python scripts/train_forecasting_model.py --config configs/experiments/convlstm_debug_fixed_subset.yaml
+```
+
+Experiment configs can inherit from `configs/default.yaml` with `base_config` and override only what changes. The loader recursively merges the config and resolves simple `${paths.*}` references, so each experiment can own separate patch-cache, normalization, run, log, and result directories:
+
+```yaml
+base_config: ../default.yaml
+experiment:
+  name: convlstm_debug_fixed_subset
+paths:
+  patch_cache_root: ${paths.scratch_root}/fire_forecasting_patch_cache/convlstm_debug_fixed_subset
+  artifacts_root: artifacts/experiments/convlstm_debug_fixed_subset
+```
+
+Training runs save the exact submitted config as `configs/original_config.yaml`, the fully resolved config as `configs/resolved_config.yaml` and `configs/config_used.yaml`, plus hashes and inheritance metadata in `metadata/config_metadata.json`. Patch-cache manifests and normalization sidecars also record config and dataset-index hashes, which makes parallel Slurm experiments reproducible and easier to audit.
+
+Generic Palmetto wrappers:
+
+```bash
+sbatch scripts/slurm_precompute_cache_with_config.sh configs/experiments/convlstm_debug_fixed_subset.yaml all
+sbatch scripts/slurm_train_with_config_a10080.sh configs/experiments/convlstm_debug_fixed_subset.yaml
+```
+
+## Input Normalization Consistency
+Input normalization is fit once from train samples only. The same saved train stats are then reused for train, validation, test, debug, and paper evaluation. With the default `input_normalization_device: cuda`, datasets return raw inputs and the shared training/evaluation code applies z-score normalization on the model device immediately before `model(x)`.
+
+Each normalization run writes timestamped, config-aware files under `normalization.output_dir`. The default points that directory at `paths.patch_cache_root`, so normalization stats sit beside the scratch patch cache:
+
+```text
+train_normalization_stats_<config_name>_<YYYYMMDD_HHMMSS>.json
+train_normalization_stats_<config_name>_<YYYYMMDD_HHMMSS>.npz
+normalization_stats.json
+normalization_stats.npz
+```
+
+For this project, configs point the stable aliases directly into the patch-cache directory:
+
+```yaml
+normalization:
+  output_dir: ${paths.patch_cache_root}
+  stats_path: ${paths.patch_cache_root}/normalization_stats.json
+  npz_path: ${paths.patch_cache_root}/normalization_stats.npz
+```
+
+The JSON metadata records the exact timestamped NPZ path, config name/path/hash, cache directory/version, dataset-index hash, fit split, and channel count. Training copies the JSON metadata into the run directory and records the exact NPZ path/hash without copying the potentially large NPZ unless `training.output.copy_normalization_npz: true`.
+
+Useful checks:
+
+```bash
+python scripts/compute_normalization.py --config configs/default.yaml --from_cache
+python scripts/inspect_normalization_pipeline.py --config configs/default.yaml --split all
+python scripts/sanity_check_project.py --config configs/default.yaml
+```
+
+New checkpoints record normalization metadata in the checkpoint and run summary. Evaluation checks that metadata when present; use `--allow_normalization_mismatch` only for intentional compatibility/debug runs with older or deliberately different stats.
+
 ## Training Performance Optimization
 All model-specific training scripts now route through the shared optimized training path in `src/training/train.py`. The shared path supports GPU-aware batch sizing, BF16/FP16 AMP, TF32, GPU-side input normalization, shard-local cache batching, Slurm-aware DataLoader worker caps, timing CSV logs, optional CUDA prefetching, and optional `torch.compile`.
 
@@ -257,37 +342,170 @@ python scripts/train_forecasting_model.py \
 
 The loss and metric curves are debugging plots for overfitting, instability, and training-speed inspection; they are not paper figures.
 
-## Evaluating Trained Models
-Use the paper-results evaluator after training jobs have produced run directories under `artifacts/runs/<architecture>/<run_name>/`. The script searches those run folders, selects the best checkpoint by validation metric, evaluates the held-out split, and writes paper-ready quantitative metrics.
+## Validation Protocol
+Training uses one validation policy for the whole run. Mixing capped validation on most epochs with full validation every few epochs can make loss, Dice, IoU, active canopy consumed MAE, and active energy log MAE oscillate because the epochs are not evaluated on the same data.
 
-Evaluate all trained models on the test split:
+The default is a fixed validation subset:
 
-```bash
-python scripts/evaluate_trained_models.py \
-  --config configs/default.yaml \
-  --mode quantitative \
-  --split test
+```yaml
+training:
+  validation:
+    mode: fixed_subset_every_epoch
+    max_val_batches_per_epoch: 50
+    fixed_subset_seed: 42
 ```
 
-Evaluate only CAWFE-Latte:
+In this mode, the training loop selects one deterministic set of validation batches at the beginning of training and reuses that exact subset every epoch. This keeps curves comparable while avoiding the cost of full validation.
+
+For final model training, use full validation every epoch:
+
+```yaml
+training:
+  validation:
+    mode: full_every_epoch
+    max_val_batches_per_epoch: null
+```
+
+After training, run full held-out evaluation with:
+
+```bash
+python scripts/evaluate_trained_models.py --config configs/default.yaml
+```
+
+## Early Stopping
+All architectures that use the shared training loop support configurable early stopping. The default monitors `val_loss` on the same validation protocol used for checkpoint selection.
+
+```yaml
+training:
+  max_epochs: 50
+  early_stopping:
+    enabled: true
+    monitor: val_loss
+    mode: min
+    patience: 8
+    min_delta: 0.001
+    start_epoch: 5
+    save_latest_on_stop: true
+    stop_on_nan: true
+```
+
+CLI overrides:
+
+```bash
+python scripts/train_forecasting_model.py \
+  --config configs/default.yaml \
+  --early_stopping_patience 12 \
+  --early_stopping_min_delta 0.0005
+```
+
+Use `--disable_early_stopping` for a full `max_epochs` run. Stop state is saved in checkpoints, `logs/training_log.csv`, and `metadata/run_summary.json`.
+
+## Evaluating Trained Models
+Use the paper-results evaluator after training jobs have produced run directories under `artifacts/runs/<architecture>/<run_name>/`. The script searches the requested architecture's run folders, selects the best checkpoint by saved validation-selection metadata, evaluates the held-out split with the current horizon/config, and writes a compact Markdown report plus optional JSON/CSV/TEX outputs.
+
+Evaluate ConvLSTM on the test split using the auto-selected best checkpoint:
 
 ```bash
 python scripts/evaluate_trained_models.py \
   --config configs/default.yaml \
   --mode quantitative \
   --split test \
-  --model_architecture cawfe_latte
+  --model_architecture convlstm_unet \
+  --paper_energy_metric log
+```
+
+The fourth output/target channel remains `log1p(energy_release_MW)`. The paper table reports `Energy Log MAE` and `Active Energy Log MAE` by default, computed directly on that channel; MW-space energy metrics are still saved as secondary diagnostics because `expm1` can amplify log-space outliers.
+
+Evaluate ConvLSTM using an explicit checkpoint:
+
+```bash
+python scripts/evaluate_trained_models.py \
+  --config configs/default.yaml \
+  --mode quantitative \
+  --split test \
+  --model_architecture convlstm_unet \
+  --checkpoint artifacts/runs/convlstm_unet/<run_name>/checkpoints/best_model.pt \
+  --paper_energy_metric log
+```
+
+Evaluate baselines only:
+
+```bash
+python scripts/evaluate_trained_models.py \
+  --config configs/default.yaml \
+  --mode quantitative \
+  --split test \
+  --model_architecture baseline \
+  --paper_energy_metric log
+```
+
+Evaluate all learned models and baselines:
+
+```bash
+python scripts/evaluate_trained_models.py \
+  --config configs/default.yaml \
+  --mode quantitative \
+  --split test \
+  --model_architecture all \
+  --paper_energy_metric log
+```
+
+Run quantitative and qualitative evaluation in one command:
+
+```bash
+python scripts/evaluate_trained_models.py \
+  --config configs/default.yaml \
+  --mode all \
+  --split test \
+  --model_architecture all \
+  --num_samples 10 \
+  --paper_energy_metric log
 ```
 
 Primary outputs are written to:
 
 ```text
-artifacts/results/quantitative/<eval_run_name>/paper_metrics.csv
-artifacts/results/quantitative/<eval_run_name>/paper_table.tex
-artifacts/results/quantitative/<eval_run_name>/per_fire_metrics.csv
+artifacts/results/<eval_name>/evaluation_report.md
 ```
 
-Qualitative prediction and rollout mode is reserved for a later implementation; for now, use `--mode quantitative`.
+JSON, CSV, and LaTeX sidecars are opt-in. Add `--include_json_outputs`, `--include_csv_outputs`, or `--write_latex` when you need those files.
+
+Generate qualitative figures for a single learned checkpoint:
+
+```bash
+python scripts/evaluate_trained_models.py \
+  --config configs/default.yaml \
+  --mode qualitative \
+  --split test \
+  --model_architecture convlstm_unet \
+  --checkpoint artifacts/runs/convlstm_unet/<run_name>/checkpoints/best_model.pt \
+  --num_samples 10 \
+  --qualitative_seed 42
+```
+
+Generate qualitative figures for all available learned models plus baselines:
+
+```bash
+python scripts/evaluate_trained_models.py \
+  --config configs/default.yaml \
+  --mode qualitative \
+  --split test \
+  --model_architecture all \
+  --num_samples 10 \
+  --qualitative_seed 42
+```
+
+Qualitative mode uses the same selected sample indices for every evaluated model. It writes one summary image per sample by default, plus reports and selection metadata:
+
+```text
+artifacts/results/qualitative/<eval_name>/images/sample_000.png
+artifacts/results/qualitative/<eval_name>/qualitative_report.md
+artifacts/results/qualitative/<eval_name>/qualitative_report.json
+artifacts/results/qualitative/<eval_name>/selected_samples.json
+artifacts/results/qualitative/<eval_name>/selected_models.json
+```
+
+Use `--qualitative_output_format pdf` for PDF figures, `--qualitative_dpi` to change image resolution, and `--save_individual_model_panels` only when you also want per-model single-panel files. Qualitative mode is one-shot; it does not perform recursive rollout.
 
 ## Debugging Model Predictions
 Use the prediction debug utility when a checkpoint looks suspicious, for example when a model performs worse than persistence or appears to overpredict energy/background activity.
@@ -302,6 +520,68 @@ python scripts/debug_model_predictions.py \
 ```
 
 The script loads the checkpoint through the shared model factory and dataloader path, applies the same input-normalization path used during training/evaluation, prints target and prediction channel statistics, computes quick metrics, and saves prediction figures. It is meant to catch wrong checkpoints, output scale mismatches, energy explosions, mask collapse, channel-order mistakes, and unconstrained fuel/energy outputs.
+
+### ConvLSTM Mask-Gated Regression
+ConvLSTM U-Net can optionally gate its continuous regression outputs with the predicted fire probability to reduce diffuse positive predictions in inactive background. Channels 0, 1, and 3 are activated then multiplied by `sigmoid(mask_logits)`; channel 2 remains raw mask logits. A background suppression loss can also penalize nonzero surface/canopy/energy predictions and high mask probability in inactive target regions.
+
+```yaml
+convlstm_unet:
+  use_mask_gated_regression: true
+  regression_activation: relu
+  mask_gate_mode: soft
+  detach_mask_gate: false
+  mask_gate_min: 0.0
+  output_bias_init:
+    enabled: true
+    regression_bias: -2.0
+    mask_bias: -2.0
+    energy_bias: -2.0
+
+training:
+  loss:
+    background_suppression:
+      enabled: true
+      architectures: [convlstm_unet]
+      weight: 0.05
+```
+
+Train normally with:
+
+```bash
+python scripts/train_forecasting_model.py \
+  --config configs/default.yaml
+```
+
+### ConvLSTM Diagnostic Evaluation
+For ConvLSTM checkpoints, the same debug utility can run diagnostic-only analyses without retraining or changing model weights:
+
+```bash
+python scripts/debug_model_predictions.py \
+  --config configs/default.yaml \
+  --model_architecture convlstm_unet \
+  --checkpoint artifacts/runs/convlstm_unet/<run_name>/checkpoints/best_model.pt \
+  --split test \
+  --num_batches 20 \
+  --run_background_diagnostics \
+  --run_mask_gating_diagnostics \
+  --run_oracle_gating_diagnostics
+```
+
+These diagnostics report inactive-vs-active prediction statistics, predicted-mask gated metrics, oracle target-mask gated metrics, and output activation inspection. Gating is diagnostic only: channels 0, 1, and 3 are multiplied after prediction, channel 2 remains unchanged, and the saved checkpoint/model is not modified.
+
+Compare two checkpoints on the same selected batches:
+
+```bash
+python scripts/debug_model_predictions.py \
+  --config configs/default.yaml \
+  --model_architecture convlstm_unet \
+  --split test \
+  --num_batches 20 \
+  --compare_checkpoints \
+    artifacts/runs/convlstm_unet/<run_name>/checkpoints/best_model.pt \
+    artifacts/runs/convlstm_unet/<run_name>/checkpoints/latest_model.pt \
+  --checkpoint_labels best latest
+```
 
 Outputs are written under:
 

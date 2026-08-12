@@ -122,7 +122,7 @@ def main() -> None:
 		max_train_batches = int(tuning_config.get("trial_overrides", {}).get("training", {}).get("performance", {}).get("max_train_batches_per_epoch", 1000))
 	max_val_batches = args.max_val_batches_per_epoch
 	if max_val_batches is None:
-		max_val_batches = int(tuning_config.get("trial_overrides", {}).get("training", {}).get("performance", {}).get("max_val_batches_per_epoch", 200))
+		max_val_batches = int(tuning_config.get("trial_overrides", {}).get("training", {}).get("validation", {}).get("max_val_batches_per_epoch", 200))
 
 	output_dir.mkdir(parents=True, exist_ok=True)
 	csv_path = output_dir / "tuning_trials.csv"

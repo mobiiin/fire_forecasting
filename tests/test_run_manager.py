@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -50,6 +51,45 @@ def test_run_manager_resolves_relative_output_root_from_repo_root(tmp_path: Path
 
 	assert manager.root_dir == Path.cwd() / "artifacts" / "test_runs_relative"
 	assert manager.checkpoint_root == Path.cwd() / "artifacts" / "test_checkpoints_relative"
+
+
+def test_run_manager_saves_exact_and_resolved_config_artifacts(tmp_path: Path) -> None:
+	config_file = tmp_path / "experiment.yaml"
+	config_text = "experiment:\n  name: artifact_demo\ninput_sequence_length: 5\nprediction_horizon: 10\n"
+	config_file.write_text(config_text, encoding="utf-8")
+	config = {
+		"config_path": str(config_file),
+		"_config_path": str(config_file),
+		"experiment": {"name": "artifact_demo"},
+		"input_sequence_length": 5,
+		"prediction_horizon": 10,
+		"training": {
+			"run_name": "artifact_demo",
+			"output": {
+				"root_dir": str(tmp_path / "runs"),
+				"checkpoint_root": str(tmp_path / "checkpoints"),
+				"save_original_config": True,
+				"save_resolved_config": True,
+			},
+		},
+	}
+	manager = RunManager(config, "convlstm_unet")
+
+	paths = manager.save_configs(original_config={"old": True}, resolved_config=config)
+
+	original_path = Path(paths["original_config_path"])
+	resolved_path = Path(paths["resolved_config_path"])
+	config_used_path = Path(paths["config_used_path"])
+	metadata_path = manager.metadata_path("config_metadata.json")
+	metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+	assert original_path.read_text(encoding="utf-8") == config_text
+	assert resolved_path.exists()
+	assert config_used_path.exists()
+	assert metadata["config_path_passed"] == str(config_file.resolve())
+	assert metadata["config_sha256"]
+	assert metadata["resolved_config_sha256"]
+	assert metadata["experiment_name"] == "artifact_demo"
 
 
 def test_run_manager_copies_compatibility_checkpoints_atomically(tmp_path: Path) -> None:

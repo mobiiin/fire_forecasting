@@ -21,7 +21,14 @@ def _base_config(tmp_path: Path) -> dict:
 		"model": {"architecture": "convlstm_unet", "name": "convlstm_unet"},
 		"training": {
 			"epochs": 20,
-			"performance": {"max_train_batches_per_epoch": None, "max_val_batches_per_epoch": 200},
+			"performance": {"max_train_batches_per_epoch": None},
+			"validation": {
+				"mode": "fixed_subset_every_epoch",
+				"max_val_batches_per_epoch": 200,
+				"fixed_subset_seed": 42,
+				"fixed_subset_shuffle": False,
+				"use_same_metric_for_checkpointing": True,
+			},
 			"early_stopping_patience": 3,
 		},
 		"multitask": {
@@ -74,7 +81,8 @@ def test_random_search_generates_requested_trial_configs(tmp_path: Path) -> None
 	assert configs[0]["training"]["epochs"] == 2
 	assert configs[0]["training"]["run_name"] == "cawfe_latte_hparam_trial_000"
 	assert configs[0]["training"]["performance"]["max_train_batches_per_epoch"] == 10
-	assert configs[0]["training"]["performance"]["max_val_batches_per_epoch"] == 4
+	assert configs[0]["training"]["validation"]["mode"] == "fixed_subset_every_epoch"
+	assert configs[0]["training"]["validation"]["max_val_batches_per_epoch"] == 4
 	assert configs[0]["cache"]["allow_config_hash_mismatch"] is True
 
 

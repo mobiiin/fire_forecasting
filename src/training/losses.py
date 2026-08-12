@@ -28,6 +28,18 @@ def _get_section(config, *names):
 	return config if isinstance(config, dict) else {}
 
 
+def _get_training_loss_section(config) -> dict:
+	"""Return nested training.loss config when present."""
+
+	if isinstance(config, dict):
+		training = config.get("training")
+		if isinstance(training, dict):
+			loss = training.get("loss")
+			if isinstance(loss, dict):
+				return loss
+	return {}
+
+
 def _sigmoid_if_needed(y_pred: torch.Tensor, from_logits: bool) -> torch.Tensor:
 	"""Convert logits to probabilities when needed."""
 
@@ -172,6 +184,9 @@ class MultiTaskLoss(nn.Module):
 		self.multitask_config = _get_section(config, "multitask")
 		self.training_config = _get_section(config, "training")
 		self.loss_config = _get_section(config, "loss")
+		self.training_loss_config = _get_training_loss_section(config)
+		self.model_config = _get_section(config, "model")
+		self.architecture = str(self.model_config.get("architecture", self.model_config.get("name", ""))).lower()
 		self.segmentation_loss_name = str(self.multitask_config.get("segmentation_loss", "bce_dice")).lower()
 		self.regression_loss_name = str(self.multitask_config.get("regression_loss", "weighted_huber")).lower()
 		self.surface_loss_weight = float(self.multitask_config.get("surface_loss_weight", 1.0))
@@ -191,6 +206,34 @@ class MultiTaskLoss(nn.Module):
 		self.energy_active_weight = float(self.multitask_config.get("energy_active_weight", 10.0))
 		self.energy_background_weight = float(self.multitask_config.get("energy_background_weight", 1.0))
 		self.energy_active_threshold_MW = float(self.multitask_config.get("energy_active_threshold_MW", 0.001))
+		background_suppression_config = {}
+		if isinstance(self.loss_config.get("background_suppression"), dict):
+			background_suppression_config.update(self.loss_config.get("background_suppression", {}))
+		if isinstance(self.training_loss_config.get("background_suppression"), dict):
+			background_suppression_config.update(self.training_loss_config.get("background_suppression", {}))
+		self.background_suppression_config = background_suppression_config
+		self.background_suppression_enabled = bool(background_suppression_config.get("enabled", False))
+		background_architectures = background_suppression_config.get("architectures")
+		if background_architectures is not None:
+			allowed_architectures = {str(name).lower() for name in background_architectures}
+			self.background_suppression_enabled = self.background_suppression_enabled and self.architecture in allowed_architectures
+		self.background_suppression_weight = float(background_suppression_config.get("weight", 0.0))
+		self.background_suppression_include_surface = bool(background_suppression_config.get("include_surface", True))
+		self.background_suppression_include_canopy = bool(background_suppression_config.get("include_canopy", True))
+		self.background_suppression_include_energy = bool(background_suppression_config.get("include_energy", True))
+		self.background_suppression_include_mask_prob = bool(background_suppression_config.get("include_mask_prob", True))
+		self.background_suppression_inactive_definition = str(background_suppression_config.get("inactive_definition", "combined")).lower()
+		if self.background_suppression_inactive_definition not in ("combined", "mask_only"):
+			raise ValueError(
+				"training.loss.background_suppression.inactive_definition must be 'combined' or 'mask_only', "
+				f"got {self.background_suppression_inactive_definition!r}."
+			)
+		self.background_suppression_consumed_threshold = float(background_suppression_config.get("consumed_threshold", 0.001))
+		self.background_suppression_energy_log_threshold = float(background_suppression_config.get("energy_log_threshold", 0.001))
+		self.background_suppression_mask_threshold = float(background_suppression_config.get("mask_threshold", 0.5))
+		self.background_suppression_reduction = str(background_suppression_config.get("reduction", "mean")).lower()
+		if self.background_suppression_reduction != "mean":
+			raise ValueError("training.loss.background_suppression.reduction currently supports only 'mean'.")
 
 	def _energy_threshold_in_target_space(self) -> float:
 		"""Convert the physical active threshold into target space."""
@@ -276,6 +319,44 @@ class MultiTaskLoss(nn.Module):
 			)
 		return _weighted_mean(loss_map, weights)
 
+	def _background_suppression_loss(
+		self,
+		pred_surface: torch.Tensor,
+		pred_canopy: torch.Tensor,
+		pred_mask_logits: torch.Tensor,
+		pred_energy_log: torch.Tensor,
+		true_surface: torch.Tensor,
+		true_canopy: torch.Tensor,
+		true_mask: torch.Tensor,
+		true_energy_log: torch.Tensor,
+	) -> torch.Tensor:
+		if not self.background_suppression_enabled:
+			return torch.zeros((), dtype=pred_surface.dtype, device=pred_surface.device)
+		if self.background_suppression_inactive_definition == "mask_only":
+			inactive = true_mask <= self.background_suppression_mask_threshold
+		else:
+			active = (
+				(true_mask > self.background_suppression_mask_threshold)
+				| (true_surface > self.background_suppression_consumed_threshold)
+				| (true_canopy > self.background_suppression_consumed_threshold)
+				| (true_energy_log > self.background_suppression_energy_log_threshold)
+			)
+			inactive = torch.logical_not(active)
+		if not bool(inactive.any().item()):
+			return torch.zeros((), dtype=pred_surface.dtype, device=pred_surface.device)
+		terms = []
+		if self.background_suppression_include_surface:
+			terms.append(F.relu(pred_surface[inactive]).mean())
+		if self.background_suppression_include_canopy:
+			terms.append(F.relu(pred_canopy[inactive]).mean())
+		if self.background_suppression_include_energy:
+			terms.append(F.relu(pred_energy_log[inactive]).mean())
+		if self.background_suppression_include_mask_prob:
+			terms.append(torch.sigmoid(pred_mask_logits[inactive]).mean())
+		if not terms:
+			return torch.zeros((), dtype=pred_surface.dtype, device=pred_surface.device)
+		return torch.stack(terms).mean()
+
 	def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> dict[str, torch.Tensor]:
 		if y_pred.shape != y_true.shape:
 			raise ValueError(f"MultiTaskLoss expects matching shapes, got {tuple(y_pred.shape)} and {tuple(y_true.shape)}.")
@@ -290,6 +371,8 @@ class MultiTaskLoss(nn.Module):
 		true_canopy_consumed = y_true[:, 1:2]
 		pred_mask_logits = y_pred[:, 2:3]
 		true_mask = y_true[:, 2:3]
+		pred_energy_log = y_pred[:, 3:4] if self.energy_output_names else torch.zeros_like(pred_surface_consumed)
+		true_energy_log = y_true[:, 3:4] if self.energy_output_names else torch.zeros_like(true_surface_consumed)
 
 		surface_loss = self._regression_loss(pred_surface_consumed, true_surface_consumed, true_mask)
 		canopy_loss = self._regression_loss(pred_canopy_consumed, true_canopy_consumed, true_mask)
@@ -301,11 +384,23 @@ class MultiTaskLoss(nn.Module):
 				channel_index = 3 + channel_offset
 				energy_losses.append(self._energy_loss(y_pred[:, channel_index : channel_index + 1], y_true[:, channel_index : channel_index + 1]))
 			energy_loss = torch.stack(energy_losses).mean()
+		background_suppression_loss = self._background_suppression_loss(
+			pred_surface_consumed,
+			pred_canopy_consumed,
+			pred_mask_logits,
+			pred_energy_log,
+			true_surface_consumed,
+			true_canopy_consumed,
+			true_mask,
+			true_energy_log,
+		)
+		background_suppression_weighted = self.background_suppression_weight * background_suppression_loss
 		total_loss = (
 			self.surface_loss_weight * surface_loss
 			+ self.canopy_loss_weight * canopy_loss
 			+ self.segmentation_loss_weight * mask_loss
 			+ self.energy_loss_weight * energy_loss
+			+ background_suppression_weighted
 		)
 		return {
 			"total_loss": total_loss,
@@ -313,6 +408,8 @@ class MultiTaskLoss(nn.Module):
 			"loss_canopy": canopy_loss,
 			"loss_segmentation": mask_loss,
 			"loss_energy": energy_loss,
+			"background_suppression_loss": background_suppression_loss,
+			"background_suppression_weighted": background_suppression_weighted,
 		}
 
 

@@ -37,6 +37,7 @@ from src.config import load_config
 from src.data.spatial_transforms import infer_with_external_test_spatial_handling
 from src.models.convlstm_unet import build_model_from_config
 from src.training.checkpoints import load_checkpoint
+from src.training.input_normalization import apply_input_normalization, build_input_normalizer_for_loader
 from src.training.train import _get_device
 
 CONSUMED_THRESHOLDS = [0.0001, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1]
@@ -155,6 +156,8 @@ def evaluate_split(
     """Evaluate consumed-fuel-derived masks on one split."""
 
     loader = _build_loader(dataset)
+    input_channels = int(getattr(dataset, "total_input_channels", getattr(dataset, "input_channel_count", 0)))
+    input_normalizer = build_input_normalizer_for_loader(loader, device, input_channels, config) if input_channels > 0 else None
     plot_ordinals = _select_plot_ordinals(len(dataset), num_visualizations)
     representative_threshold = float(_resolve_multitask_config(config)["consumed_fuel_threshold"])
 
@@ -173,6 +176,7 @@ def evaluate_split(
             if not isinstance(batch, (tuple, list)) or len(batch) < 3:
                 raise TypeError("Expected batches to contain input tensor, target tensor, and metadata.")
             x_batch = batch[0].to(device)
+            x_batch = apply_input_normalization(x_batch, input_normalizer, config)
             metadata = _metadata_to_dict(batch[2])
 
             if split_name == "external_test":

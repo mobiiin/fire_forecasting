@@ -33,6 +33,7 @@ from src.data.spatial_transforms import infer_with_external_test_spatial_handlin
 from src.data.splits import chronological_split_indices, chronological_train_val_split_indices
 from src.models.convlstm_unet import build_model_from_config
 from src.training.checkpoints import latest_and_best_checkpoint_paths, load_checkpoint
+from src.training.input_normalization import apply_input_normalization, build_input_normalizer_for_loader
 from src.training.train import _ensure_config_path, _get_device
 
 SOURCE_THRESHOLDS = [0.0001, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0]
@@ -491,6 +492,8 @@ def diagnose_split(
     """Run raw-source, probability, threshold-sweep, and plotting diagnostics for one split."""
 
     loader = _build_loader(dataset)
+    input_channels = int(getattr(dataset, "total_input_channels", getattr(dataset, "input_channel_count", 0)))
+    input_normalizer = build_input_normalizer_for_loader(loader, device, input_channels, config) if input_channels > 0 else None
     plot_ordinals = _select_plot_ordinals(len(dataset), num_visualizations) if split_name in {"val", "external_test"} else set()
 
     source_values: list[np.ndarray] = []
@@ -520,6 +523,7 @@ def diagnose_split(
                 raise TypeError("Expected diagnostic batches to contain input tensor, target tensor, and metadata.")
             x_batch = batch[0].to(device)
             y_batch = batch[1].to(device)
+            x_batch = apply_input_normalization(x_batch, input_normalizer, config)
             metadata = _metadata_to_dict(batch[2])
             mode_key = "direct"
 

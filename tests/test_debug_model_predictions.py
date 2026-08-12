@@ -75,3 +75,104 @@ def test_checkpoint_metadata_payload_fails_clearly_on_architecture_mismatch(tmp_
 			requested_architecture="convlstm_unet",
 			allow_architecture_mismatch=False,
 		)
+
+
+def _multitask_config() -> dict:
+	return {
+		"model": {"task_type": "multitask"},
+		"training": {"task_type": "multitask"},
+		"metrics": {"task_type": "multitask"},
+		"multitask": {"energy_active_threshold_MW": 0.001, "consumed_active_threshold": 0.001},
+	}
+
+
+def test_background_diagnostic_computes_expected_inactive_active_means() -> None:
+	y = torch.zeros(1, 4, 2, 2)
+	y[:, 2, 0, 0] = 1.0
+	y[:, 0, 0, 0] = 2.0
+	pred = torch.zeros_like(y)
+	pred[:, 0] = torch.tensor([[4.0, 1.0], [1.0, 1.0]])
+	pred[:, 1] = 2.0
+	pred[:, 2] = 0.0
+	pred[:, 3] = 3.0
+
+	rows, summary = debug.compute_background_diagnostics(pred, y, active_definition="mask_only", inactive_threshold=1.0e-6)
+
+	assert rows[0]["active_pixel_count"] == 1
+	assert rows[0]["inactive_pixel_count"] == 3
+	assert rows[0]["active_pred_surface_mean"] == pytest.approx(4.0)
+	assert rows[0]["inactive_pred_surface_mean"] == pytest.approx(1.0)
+	assert summary["inactive_pred_canopy"]["mean"] == pytest.approx(2.0)
+
+
+def test_mask_gating_threshold_zero_keeps_positive_mask_predictions_active() -> None:
+	pred = torch.zeros(1, 4, 2, 2)
+	pred[:, 0] = 5.0
+	pred[:, 1] = 6.0
+	pred[:, 2] = 0.0
+	pred[:, 3] = 7.0
+
+	gated = debug.apply_predicted_mask_gating(pred, threshold=0.0)
+
+	assert torch.equal(gated[:, 0], pred[:, 0])
+	assert torch.equal(gated[:, 1], pred[:, 1])
+	assert torch.equal(gated[:, 3], pred[:, 3])
+	assert torch.equal(gated[:, 2], pred[:, 2])
+
+
+def test_oracle_gating_zeros_predictions_outside_target_active_mask() -> None:
+	y = torch.zeros(1, 4, 2, 2)
+	y[:, 2, 0, 0] = 1.0
+	pred = torch.ones(1, 4, 2, 2)
+
+	gated = debug.apply_oracle_gating(pred, y, active_definition="mask_only")
+
+	assert gated[0, 0, 0, 0].item() == pytest.approx(1.0)
+	assert gated[0, 0, 0, 1].item() == pytest.approx(0.0)
+	assert gated[0, 1, 1, 0].item() == pytest.approx(0.0)
+	assert gated[0, 3, 1, 1].item() == pytest.approx(0.0)
+	assert torch.equal(gated[:, 2], pred[:, 2])
+
+
+def test_checkpoint_comparison_sample_keys_use_same_metadata_indices() -> None:
+	metadata = [
+		{"fire_name": "fire_a", "sample_index": 10, "target_idx": 12, "patch_top": 0, "patch_left": 0},
+		{"fire_name": "fire_a", "sample_index": 11, "target_idx": 13, "patch_top": 0, "patch_left": 64},
+	]
+
+	keys_a = [debug._metadata_sample_key(item, index) for index, item in enumerate(metadata)]
+	keys_b = [debug._metadata_sample_key(item, index) for index, item in enumerate(metadata)]
+
+	assert keys_a == keys_b
+
+
+def test_diagnostics_summary_text_includes_main_conclusions() -> None:
+	text = debug._diagnostics_summary_text(
+		{
+			"background_summary": {
+				"inactive_pred_surface": {"mean": 0.1},
+				"inactive_pred_canopy": {"mean": 0.0},
+				"inactive_pred_energy_log": {"mean": 0.0},
+				"inactive_pred_mask_prob": {"mean": 0.2},
+			}
+		}
+	)
+
+	assert "Main Diagnostic Conclusions" in text
+	assert "Background overprediction" in text
+
+
+def test_mask_and_oracle_gating_diagnostics_return_metric_rows() -> None:
+	y = torch.zeros(1, 4, 2, 2)
+	y[:, 2, 0, 0] = 1.0
+	pred = torch.zeros_like(y)
+	pred[:, 0] = 1.0
+	pred[:, 2] = 0.0
+
+	mask_rows, mask_summary = debug.compute_mask_gating_diagnostics(pred, y, _multitask_config(), thresholds=[0.5])
+	oracle_rows, oracle_summary = debug.compute_oracle_gating_diagnostics(pred, y, _multitask_config(), active_definition="mask_only")
+
+	assert mask_rows
+	assert "raw_metrics" in mask_summary
+	assert oracle_rows
+	assert "relative_improvements" in oracle_summary

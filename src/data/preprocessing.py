@@ -2,10 +2,24 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
+import zipfile
 
 import numpy as np
+
+
+def _npz_member_has_object_dtype(path: Path, member_name: str) -> bool:
+	"""Return whether an NPZ member has object dtype without loading its values."""
+
+	npy_name = member_name if member_name.endswith(".npy") else f"{member_name}.npy"
+	with zipfile.ZipFile(path) as archive:
+		with archive.open(npy_name) as member:
+			version = np.lib.format.read_magic(member)
+			shape, _fortran_order, dtype = np.lib.format._read_array_header(member, version)
+			_ = shape
+	return bool(dtype.hasobject)
 
 
 def resolve_input_normalization_device(config: Mapping[str, Any] | None) -> str:
@@ -185,11 +199,54 @@ def inverse_normalize_channel_map(
 
 
 def load_normalization_stats(path: str | Path) -> dict[str, np.ndarray]:
-	"""Load normalization statistics from a saved ``.npz`` archive."""
+	"""Load normalization statistics from a saved ``.npz`` archive or JSON file."""
 
 	archive_path = Path(path).expanduser().resolve()
 	if not archive_path.exists():
 		raise FileNotFoundError(f"Normalization statistics file not found: {archive_path}")
+
+	if archive_path.suffix.lower() == ".json":
+		with archive_path.open("r", encoding="utf-8") as handle:
+			payload = json.load(handle)
+		paths_payload = payload.get("paths", {}) if isinstance(payload, Mapping) else {}
+		npz_path_value = paths_payload.get("npz_path") if isinstance(paths_payload, Mapping) else None
+		if npz_path_value not in (None, "", "null"):
+			npz_path = Path(str(npz_path_value)).expanduser()
+			if not npz_path.is_absolute():
+				npz_path = (archive_path.parent / npz_path).resolve()
+			stats = load_normalization_stats(npz_path)
+			stats["normalization_metadata_path"] = np.asarray(str(archive_path))
+			stats["normalization_npz_path"] = np.asarray(str(npz_path))
+			config_payload = payload.get("config", {}) if isinstance(payload.get("config"), Mapping) else {}
+			cache_payload = payload.get("cache", {}) if isinstance(payload.get("cache"), Mapping) else {}
+			data_payload = payload.get("data", {}) if isinstance(payload.get("data"), Mapping) else {}
+			for key, value in {
+				"normalization_version": payload.get("normalization_version"),
+				"created_at": payload.get("created_at"),
+				"timestamp": payload.get("timestamp"),
+				"config_name": config_payload.get("config_name"),
+				"config_path": config_payload.get("config_path"),
+				"config_sha256": config_payload.get("config_sha256"),
+				"cache_version": cache_payload.get("cache_version"),
+				"dataset_index_hash": paths_payload.get("dataset_index_hash"),
+				"fit_split": data_payload.get("fit_split", payload.get("fit_split", payload.get("split_used"))),
+			}.items():
+				if value is not None:
+					stats[key] = np.asarray(value)
+			return stats
+		required_keys = {"mean", "std", "min", "max"}
+		missing = required_keys.difference(payload.keys())
+		if missing:
+			raise KeyError(
+				f"Normalization JSON is missing required key(s): {', '.join(sorted(missing))}"
+			)
+		stats: dict[str, np.ndarray] = {}
+		for key, value in payload.items():
+			if isinstance(value, (list, tuple, int, float, bool)):
+				stats[key] = np.asarray(value)
+			else:
+				stats[key] = np.asarray(str(value))
+		return stats
 
 	with np.load(archive_path, allow_pickle=False) as data:
 		required_keys = {"mean", "std", "min", "max"}
@@ -199,7 +256,10 @@ def load_normalization_stats(path: str | Path) -> dict[str, np.ndarray]:
 				f"Normalization archive is missing required key(s): {', '.join(sorted(missing))}"
 			)
 		stats = {key: data[key] for key in required_keys}
-		for optional_key in ("target_mean", "target_std", "target_min", "target_max"):
-			if optional_key in data.files:
-				stats[optional_key] = data[optional_key]
+		for optional_key in data.files:
+			if optional_key in stats:
+				continue
+			if _npz_member_has_object_dtype(archive_path, optional_key):
+				continue
+			stats[optional_key] = data[optional_key]
 		return stats
