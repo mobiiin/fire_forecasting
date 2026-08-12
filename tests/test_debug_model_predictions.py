@@ -70,7 +70,7 @@ def test_checkpoint_metadata_payload_fails_clearly_on_architecture_mismatch(tmp_
 
 	with pytest.raises(ValueError, match="Checkpoint architecture mismatch"):
 		debug.checkpoint_metadata_payload(
-			{"architecture": "cawfe_latte", "model_state_dict": {}},
+			{"architecture": "earthformer_lite", "model_state_dict": {}},
 			checkpoint_path,
 			requested_architecture="convlstm_unet",
 			allow_architecture_mismatch=False,

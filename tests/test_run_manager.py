@@ -119,21 +119,21 @@ def test_apply_training_cli_overrides_sets_nested_output() -> None:
 
 def test_verify_training_outputs_accepts_valid_synthetic_run(tmp_path: Path) -> None:
 	torch = pytest.importorskip("torch")
-	run_dir = tmp_path / "runs" / "cawfe_latte" / "cawfe_latte_test"
+	run_dir = tmp_path / "runs" / "convlstm_unet" / "convlstm_unet_test"
 	for relative in ("checkpoints", "logs", "figures", "configs", "metadata"):
 		(run_dir / relative).mkdir(parents=True, exist_ok=True)
 	torch.save(
 		{
-			"architecture": "cawfe_latte",
-			"run_name": "cawfe_latte_test",
+			"architecture": "convlstm_unet",
+			"run_name": "convlstm_unet_test",
 			"model_state_dict": {},
 		},
 		run_dir / "checkpoints" / "best_model.pt",
 	)
 	torch.save(
 		{
-			"architecture": "cawfe_latte",
-			"run_name": "cawfe_latte_test",
+			"architecture": "convlstm_unet",
+			"run_name": "convlstm_unet_test",
 			"model_state_dict": {},
 		},
 		run_dir / "checkpoints" / "latest_model.pt",
@@ -149,4 +149,4 @@ def test_verify_training_outputs_accepts_valid_synthetic_run(tmp_path: Path) -> 
 	ok, messages, info = verify_run(run_dir)
 
 	assert ok, messages
-	assert info["run_name"] == "cawfe_latte_test"
+	assert info["run_name"] == "convlstm_unet_test"

@@ -40,8 +40,6 @@ DEFAULT_ARCHITECTURES = [
 	"earthformer_lite",
 	"st_mamba_lite",
 	"weatherformer_lite",
-	"cawfe_latte_lite",
-	"cawfe_latte",
 ]
 OPTIONAL_ARCHITECTURES = [
 	"current_frame_unet",
@@ -56,6 +54,8 @@ ARCHITECTURE_ALIASES = {
 	"cawfe_st_mamba": "st_mamba_lite",
 }
 BASELINE_ARCHITECTURES = ["persistence", "linear_extrapolation"]
+REMOVED_MODEL_ARCHITECTURES = {"cawfe_latte", "cawfe_latte_lite"}
+REMOVED_MODEL_ARCHITECTURE_MESSAGE = "The old CAWFE-Latte implementation has been removed. A new design will be added later."
 SUPPORTED_MODEL_ARCHITECTURES = {
 	"all",
 	"baseline",
@@ -73,8 +73,6 @@ DISPLAY_NAMES = {
 	"st_mamba_lite": "CAWFE-ST-Mamba",
 	"cawfe_st_mamba": "CAWFE-ST-Mamba",
 	"weatherformer_lite": "WeatherFormer-lite",
-	"cawfe_latte_lite": "CAWFE-Latte-Lite",
-	"cawfe_latte": "CAWFE-Latte",
 }
 
 PAPER_COLUMNS = [
@@ -213,6 +211,8 @@ def display_name(name: str) -> str:
 
 def selected_architectures(model_architecture: str) -> list[str]:
 	requested = str(model_architecture).lower()
+	if requested in REMOVED_MODEL_ARCHITECTURES:
+		raise ValueError(REMOVED_MODEL_ARCHITECTURE_MESSAGE)
 	if requested == "all":
 		return list(DEFAULT_ARCHITECTURES) + list(OPTIONAL_ARCHITECTURES)
 	if requested in {"baseline", "baselines", "persistence", "linear_extrapolation"}:
@@ -224,6 +224,8 @@ def _resolve_requested_targets(model_architecture: str, include_baselines: bool 
 	"""Resolve learned and baseline targets from the user-facing architecture selector."""
 
 	requested = str(model_architecture).strip().lower()
+	if requested in REMOVED_MODEL_ARCHITECTURES:
+		raise ValueError(REMOVED_MODEL_ARCHITECTURE_MESSAGE)
 	if requested not in SUPPORTED_MODEL_ARCHITECTURES and canonical_architecture(requested) not in DEFAULT_ARCHITECTURES + OPTIONAL_ARCHITECTURES:
 		supported = ", ".join(sorted(SUPPORTED_MODEL_ARCHITECTURES))
 		raise ValueError(f"Unsupported --model_architecture {model_architecture!r}. Supported values: {supported}")

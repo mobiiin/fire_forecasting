@@ -292,7 +292,7 @@ Useful commands:
 ```bash
 python scripts/diagnose_training_pipeline.py \
   --config configs/default.yaml \
-  --model_architecture cawfe_latte \
+  --model_architecture convlstm_unet \
   --num_batches 50
 
 python scripts/benchmark_patch_cache_io.py \
@@ -329,7 +329,7 @@ python scripts/list_training_runs.py --root artifacts/runs
 python scripts/verify_training_outputs.py --all --root artifacts/runs
 
 python scripts/plot_training_curves.py \
-  --run_dir artifacts/runs/cawfe_latte/<run_name>
+  --run_dir artifacts/runs/convlstm_unet/<run_name>
 ```
 
 You can also name a run explicitly:
@@ -337,7 +337,7 @@ You can also name a run explicitly:
 ```bash
 python scripts/train_forecasting_model.py \
   --config configs/default.yaml \
-  --run_name cawfe_latte_main_seed42
+  --run_name convlstm_unet_main_seed42
 ```
 
 The loss and metric curves are debugging plots for overfitting, instability, and training-speed inspection; they are not paper figures.
@@ -1011,56 +1011,5 @@ Use `--help` on any Python script for the full CLI:
 python scripts/visualize_predictions.py --help
 ```
 
-## CAWFE-Latte-Lite
-`cawfe_latte_lite` is the custom CAWFE-specific architecture for this project. It separately encodes vertical atmospheric structure and fire/fuel state variables, applies fire-front attention, and uses a hybrid Transformer + Mamba backbone to predict the four dense multitask maps.
-
-Detailed architecture notes are in [cawfe_latte.md](cawfe_latte.md).
-
-```bash
-python scripts/smoke_test_cawfe_latte_lite.py --config configs/default.yaml
-python scripts/train_cawfe_latte_lite.py --config configs/default.yaml
-python scripts/test_cawfe_latte_lite.py --config configs/default.yaml --checkpoint artifacts/checkpoints/cawfe_latte_lite/best_model.pt --split test
-```
-
-## Full CAWFE-Latte
-`cawfe_latte` extends CAWFE-Latte-Lite with wind-guided directional feature modulation and an AFNO-style neural-operator bottleneck. This is the main custom paper architecture. Detailed documentation is in [cawfe_latte.md](cawfe_latte.md).
-
-```bash
-python scripts/smoke_test_cawfe_latte.py --config configs/default.yaml
-python scripts/train_cawfe_latte.py --config configs/default.yaml
-python scripts/test_cawfe_latte.py --config configs/default.yaml --checkpoint artifacts/checkpoints/cawfe_latte/best_model.pt --split test
-python scripts/visualize_cawfe_latte_aux.py --config configs/default.yaml --checkpoint artifacts/checkpoints/cawfe_latte/best_model.pt --split test --num_samples 5
-```
-
-## CAWFE-Latte Hyperparameter Tuning
-Only the main `cawfe_latte` paper model is tuned. ConvLSTM U-Net, Earthformer-lite, WeatherFormer-lite, CAWFE-ST-Mamba, and CAWFE-Latte-Lite use their fixed configs.
-
-The tuner runs short validation-only CAWFE-Latte trials through the shared training pipeline, then writes:
-
-- `artifacts/hparam/cawfe_latte/tuning_trials.csv`
-- `artifacts/hparam/cawfe_latte/tuning_trials.jsonl`
-- `artifacts/hparam/cawfe_latte/best_params.json`
-- `artifacts/hparam/cawfe_latte/best_config.yaml`
-- `artifacts/hparam/cawfe_latte/tuning_summary.txt`
-
-```bash
-# Tune on one A100 80GB GPU.
-sbatch slurm/slurm_tune_cawfe_latte_a10080.sh
-
-# Final full training from the tuned config.
-sbatch slurm/slurm_train_cawfe_latte_tuned_a10080.sh
-
-# Tuned ablations.
-sbatch slurm/slurm_ablate_cawfe_latte_a10080.sh
-
-# Or submit tune -> train -> ablate with Slurm dependencies.
-bash scripts/submit_cawfe_latte_pipeline.sh
-```
-
-Local/debug commands:
-
-```bash
-python scripts/tune_cawfe_latte.py --config configs/default.yaml --num_trials 12 --output_dir artifacts/hparam/cawfe_latte
-python scripts/train_cawfe_latte.py --config artifacts/hparam/cawfe_latte/best_config.yaml
-python scripts/ablate_cawfe_latte.py --base_config artifacts/hparam/cawfe_latte/best_config.yaml --output_dir configs/ablations/cawfe_latte_tuned
-```
+## Removed CAWFE-Latte Implementation
+The previous CAWFE-Latte and CAWFE-Latte-Lite implementations have been removed from the active codebase. A new CAWFE-Latte design will be added later. Current active learned architectures are ConvLSTM U-Net, Earthformer-lite, CAWFE-ST-Mamba, and WeatherFormer-lite.

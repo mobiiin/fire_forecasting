@@ -70,40 +70,14 @@ ARCHITECTURE_REGISTRY: dict[str, ArchitectureSpec] = {
 		supports_patch_cache=True,
 		supports_tiled_inference=True,
 	),
-	"cawfe_latte_lite": ArchitectureSpec(
-		name="cawfe_latte_lite",
-		requires_fixed_patch_size=True,
-		patch_divisibility=16,
-		input_type="sequence",
-		supports_sequence=True,
-		output_type="final_step_map",
-		expected_input_shape="(B, T, C, H, W)",
-		expected_output_shape="(B, 4, H, W)",
-		supports_patch_cache=True,
-		supports_tiled_inference=True,
-		custom_architecture=True,
-		ablation_ready=True,
-	),
-	"cawfe_latte": ArchitectureSpec(
-		name="cawfe_latte",
-		requires_fixed_patch_size=True,
-		patch_divisibility=16,
-		input_type="sequence",
-		supports_sequence=True,
-		output_type="final_step_map",
-		expected_input_shape="(B, T, C, H, W)",
-		expected_output_shape="(B, 4, H, W)",
-		supports_patch_cache=True,
-		supports_tiled_inference=True,
-		custom_architecture=True,
-		ablation_ready=True,
-		paper_main_model=True,
-	),
 }
 
 ARCHITECTURE_ALIASES = {
 	"cawfe_st_mamba": "st_mamba_lite",
 }
+
+REMOVED_ARCHITECTURES = {"cawfe_latte", "cawfe_latte_lite"}
+REMOVED_ARCHITECTURE_MESSAGE = "The old CAWFE-Latte implementation has been removed. A new design will be added later."
 
 
 def resolve_model_architecture(config: Mapping[str, Any]) -> str:
@@ -123,6 +97,8 @@ def get_architecture_spec(name: str) -> ArchitectureSpec:
 
 	key = str(name).lower()
 	key = ARCHITECTURE_ALIASES.get(key, key)
+	if key in REMOVED_ARCHITECTURES:
+		raise KeyError(REMOVED_ARCHITECTURE_MESSAGE)
 	if key not in ARCHITECTURE_REGISTRY:
 		raise KeyError(f"Unsupported model architecture: {name!r}.")
 	return ARCHITECTURE_REGISTRY[key]

@@ -172,11 +172,12 @@ python scripts/benchmark_patch_cache_io.py \
 
 python scripts/diagnose_training_pipeline.py \
   --config configs/default.yaml \
-  --model_architecture cawfe_latte \
+  --model_architecture convlstm_unet \
   --num_batches 50
 
-python scripts/train_cawfe_latte.py \
-  --config configs/default.yaml
+python scripts/train_forecasting_model.py \
+  --config configs/default.yaml \
+  --model_architecture convlstm_unet
 ```
 
 Watch these timing fields in `artifacts/logs/training_timing_<run_name>.csv` and the training log:
@@ -496,7 +497,7 @@ Regenerate curves for a run if needed:
 
 ```bash
 python scripts/plot_training_curves.py \
-  --run_dir artifacts/runs/cawfe_latte/<run_name>
+  --run_dir artifacts/runs/convlstm_unet/<run_name>
 ```
 
 The best checkpoint for a run is:
@@ -580,75 +581,8 @@ Notes:
 - the shifted-window path currently uses cyclic shifts without a masking scheme
 - channel `2` remains mask logits; the model does not apply sigmoid internally
 
-## Running CAWFE-Latte-Lite
-`cawfe_latte_lite` is the custom paper architecture. It explicitly encodes CAWFE vertical atmospheric levels, fire/fuel state variables, fire-front attention, and a hybrid Transformer + Mamba backbone.
-
-Recommended workflow:
-
-```bash
-python scripts/inspect_patch_cache.py --config configs/default.yaml
-python scripts/compute_normalization.py --config configs/default.yaml --from_cache
-python scripts/smoke_test_cawfe_latte_lite.py --config configs/default.yaml
-python scripts/train_cawfe_latte_lite.py --config configs/default.yaml
-python scripts/test_cawfe_latte_lite.py --config configs/default.yaml --checkpoint artifacts/checkpoints/cawfe_latte_lite/best_model.pt --split test
-python scripts/ablate_cawfe_latte_lite.py --base_config configs/default.yaml --output_dir configs/ablations/cawfe_latte_lite/
-python scripts/evaluate_all_baselines.py --config configs/default.yaml --split test --include_model --checkpoint artifacts/checkpoints/cawfe_latte_lite/best_model.pt --model_architecture cawfe_latte_lite
-```
-
-Notes:
-- canonical CAWFE-Latte-Lite patch input is `(B, 5, 129, 64, 64)`
-- canonical output is `(B, 4, 64, 64)`
-- channel `2` remains mask logits; the model does not apply sigmoid internally
-- detailed architecture documentation is in `cawfe_latte.md`
-
-## Running Full CAWFE-Latte
-`cawfe_latte` is the main custom paper model. It extends CAWFE-Latte-Lite with wind-guided directional modulation and an AFNO-style neural-operator bottleneck.
-
-Recommended workflow:
-
-```bash
-python scripts/inspect_patch_cache.py --config configs/default.yaml
-python scripts/compute_normalization.py --config configs/default.yaml --from_cache
-python scripts/smoke_test_cawfe_latte.py --config configs/default.yaml
-python scripts/train_cawfe_latte.py --config configs/default.yaml
-python scripts/test_cawfe_latte.py --config configs/default.yaml --checkpoint artifacts/checkpoints/cawfe_latte/best_model.pt --split test
-python scripts/visualize_cawfe_latte_aux.py --config configs/default.yaml --checkpoint artifacts/checkpoints/cawfe_latte/best_model.pt --split test --num_samples 5
-python scripts/ablate_cawfe_latte.py --base_config configs/default.yaml --output_dir configs/ablations/cawfe_latte/
-python scripts/evaluate_all_baselines.py --config configs/default.yaml --split test --include_model --checkpoint artifacts/checkpoints/cawfe_latte/best_model.pt --model_architecture cawfe_latte
-```
-
-Notes:
-- canonical full CAWFE-Latte patch input is `(B, 5, 129, 64, 64)`
-- canonical output is `(B, 4, 64, 64)`
-- channel `2` remains mask logits; the model does not apply sigmoid internally
-- if `mamba-ssm` is not installed, `mamba_backend: auto` uses the fallback gated SSM for smoke/debug runs
-- set `neural_operator_type: none` or reduce `neural_operator_depth` if memory is tight
-
-## CAWFE-Latte Tuned Training Pipeline
-
-This workflow tunes only `cawfe_latte`; all other architectures use their default configs.
-
-```bash
-cd /home/mhabibp/fire_forecasting
-
-sbatch slurm/slurm_tune_cawfe_latte_a10080.sh
-squeue -u mhabibp
-tail -f artifacts/logs/slurm_tune_cawfe_latte_<JOBID>.out
-```
-
-After tuning finishes:
-
-```bash
-cat artifacts/hparam/cawfe_latte/best_params.json
-sbatch slurm/slurm_train_cawfe_latte_tuned_a10080.sh
-sbatch slurm/slurm_ablate_cawfe_latte_a10080.sh
-```
-
-Or submit the dependent sequence in one step:
-
-```bash
-bash scripts/submit_cawfe_latte_pipeline.sh
-```
+## Removed CAWFE-Latte Implementation
+The previous CAWFE-Latte and CAWFE-Latte-Lite implementations have been removed from the active codebase. A new CAWFE-Latte design will be added later. Current active learned architectures are ConvLSTM U-Net, Earthformer-lite, CAWFE-ST-Mamba, and WeatherFormer-lite.
 
 ## Rebuilding The Sliding-Window Patch Cache
 Train, validation, and test now all use sliding-window patchification with `patch_size=64` and `stride=60`.

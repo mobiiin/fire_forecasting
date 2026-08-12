@@ -117,7 +117,7 @@ def _normalize_sequence_config(config: Dict[str, Any]) -> Dict[str, Any]:
                     f"input_sequence_length={input_sequence_length}, model.input_sequence_length={model['input_sequence_length']}"
                 )
             config["model"] = model
-        for section_name in ("convlstm_unet", "earthformer_lite", "st_mamba_lite", "cawfe_st_mamba", "weatherformer_lite", "cawfe_latte_lite", "cawfe_latte"):
+        for section_name in ("convlstm_unet", "earthformer_lite", "st_mamba_lite", "cawfe_st_mamba", "weatherformer_lite"):
             section = _section(config, section_name)
             if not section:
                 continue

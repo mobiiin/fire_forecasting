@@ -159,7 +159,7 @@ def test_background_suppression_loss_is_positive_for_positive_inactive_predictio
 
 def test_background_suppression_architecture_filter_disables_other_models() -> None:
 	config = _loss_config(background_enabled=True)
-	config["model"]["architecture"] = "cawfe_latte"
+	config["model"]["architecture"] = "weatherformer_lite"
 	config["training"]["loss"]["background_suppression"]["architectures"] = ["convlstm_unet"]
 	criterion = MultiTaskLoss(config)
 	pred = torch.ones(1, 4, 2, 2)
