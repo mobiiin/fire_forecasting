@@ -56,8 +56,8 @@ def _write_rows(output_csv: Path, rows: list[dict[str, Any]]) -> None:
 
 def _model_config_override(architecture: str) -> dict[str, Any]:
 	architecture_name = str(architecture).lower()
-	if architecture_name in {"cawfe_latte", "cawfe_latte_lite"}:
-		raise ValueError("The old CAWFE-Latte implementation has been removed. A new design will be added later.")
+	if architecture_name == "cawfe_latte_lite":
+		raise ValueError("The old CAWFE-Latte-Lite implementation has been removed. A new design will be added later.")
 	override: dict[str, Any] = {"model": {"architecture": architecture_name, "name": architecture_name}}
 	if architecture_name == "earthformer_lite":
 		override["checkpoint"] = {

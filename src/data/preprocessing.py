@@ -209,7 +209,9 @@ def load_normalization_stats(path: str | Path) -> dict[str, np.ndarray]:
 		with archive_path.open("r", encoding="utf-8") as handle:
 			payload = json.load(handle)
 		paths_payload = payload.get("paths", {}) if isinstance(payload, Mapping) else {}
-		npz_path_value = paths_payload.get("npz_path") if isinstance(paths_payload, Mapping) else None
+		npz_path_value = payload.get("npz_path") if isinstance(payload, Mapping) else None
+		if npz_path_value in (None, "", "null"):
+			npz_path_value = paths_payload.get("npz_path") if isinstance(paths_payload, Mapping) else None
 		if npz_path_value not in (None, "", "null"):
 			npz_path = Path(str(npz_path_value)).expanduser()
 			if not npz_path.is_absolute():

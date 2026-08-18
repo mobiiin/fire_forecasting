@@ -71,6 +71,8 @@ from src.training.hardware import (
 	get_cuda_device_info,
 	get_performance_config,
 )
+from src.training.model_outputs import extract_prediction
+from src.training.batch_utils import unpack_batch
 from src.training.input_normalization import (
 	apply_input_normalization,
 	build_input_normalizer_for_loader,
@@ -295,7 +297,7 @@ def _infer_input_channels_from_loader(train_loader) -> int:
 	except StopIteration as exc:
 		raise ValueError("Training DataLoader is empty; cannot infer input channels.") from exc
 
-	x_batch, y_batch = _as_batch(first_batch)
+	x_batch, y_batch, _batch_extra = unpack_batch(first_batch)
 	if not torch.is_tensor(x_batch) or not torch.is_tensor(y_batch):
 		raise TypeError("Expected tensor batches from the training DataLoader.")
 
@@ -862,7 +864,8 @@ def _run_epoch(
 		batch_number += 1
 		fetch_end_time = time.perf_counter()
 		data_wait_time = fetch_end_time - fetch_start_time
-		x_batch, y_batch = _as_batch(batch)
+		x_batch, y_batch, batch_extra = unpack_batch(batch)
+		terrain_batch = batch_extra.get("terrain")
 		if not torch.is_tensor(x_batch) or not torch.is_tensor(y_batch):
 			raise TypeError("Expected tensor batches from the DataLoader.")
 
@@ -872,6 +875,8 @@ def _run_epoch(
 			x_batch = x_batch.to(device, non_blocking=non_blocking_transfer)
 		if not _tensor_on_device(y_batch, device):
 			y_batch = y_batch.to(device, non_blocking=non_blocking_transfer)
+		if terrain_batch is not None:
+			terrain_batch = terrain_batch.to(device, non_blocking=non_blocking_transfer)
 		_sync_if_timing()
 		h2d_time = 0.0 if use_cuda_prefetcher else time.perf_counter() - h2d_start_time
 		normalization_start_time = time.perf_counter()
@@ -894,7 +899,8 @@ def _run_epoch(
 		with torch.set_grad_enabled(train):
 			with _maybe_autocast(device, amp_dtype):
 				forward_start_time = time.perf_counter()
-				y_pred = model(x_batch)
+				model_output = model(x_batch, terrain=terrain_batch) if terrain_batch is not None else model(x_batch)
+				y_pred = extract_prediction(model_output)
 				_sync_if_timing()
 				forward_time = time.perf_counter() - forward_start_time
 				if y_pred.ndim != 4:
@@ -911,7 +917,7 @@ def _run_epoch(
 					)
 
 				loss_start_time = time.perf_counter()
-				loss_result = criterion(y_pred, y_batch)
+				loss_result = criterion(model_output, y_batch)
 				loss, batch_loss_components = _coerce_loss_result(loss_result)
 				loss_for_backward = loss / float(gradient_accumulation_steps)
 				_sync_if_timing()
@@ -1114,16 +1120,19 @@ def _run_external_test_epoch_with_spatial_handling(
 	input_normalizer = _build_input_normalizer(loader, device, input_channels) if input_channels > 0 else None
 
 	for batch in loader:
-		x_batch, y_batch = _as_batch(batch)
+		x_batch, y_batch, batch_extra = unpack_batch(batch)
+		terrain_batch = batch_extra.get("terrain")
 		if not torch.is_tensor(x_batch) or not torch.is_tensor(y_batch):
 			raise TypeError("Expected tensor batches from the external test DataLoader.")
+		if terrain_batch is not None:
+			raise ValueError("External spatial test handling does not support terrain batches; use the processed evaluation path.")
 
 		x_batch = x_batch.to(device, non_blocking=True)
 		y_batch = y_batch.to(device, non_blocking=True)
 		x_batch = _apply_input_normalizer(x_batch, input_normalizer)
 		with torch.no_grad():
 			spatial_result = infer_with_external_test_spatial_handling(model, x_batch, config)
-			y_pred = spatial_result["y_pred"]
+			y_pred = extract_prediction(spatial_result["y_pred"])
 
 		if tuple(y_pred.shape) != tuple(y_batch.shape):
 			raise ValueError(
@@ -1131,7 +1140,7 @@ def _run_external_test_epoch_with_spatial_handling(
 				f"Prediction={tuple(y_pred.shape)} target={tuple(y_batch.shape)} mode={spatial_result['mode_used']}."
 			)
 
-		loss_result = criterion(y_pred, y_batch)
+		loss_result = criterion(spatial_result["y_pred"], y_batch)
 		loss, batch_loss_components = _coerce_loss_result(loss_result)
 		batch_size = int(x_batch.shape[0])
 		total_samples += batch_size
@@ -1636,8 +1645,13 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 				)
 
 	normalization_stats_path = _resolve_existing_normalization_stats_path(config)
+	processed_mode = str(_get_section(config, "dataloader").get("source", "")).lower() == "processed_full_frames"
+	if processed_mode:
+		data_config = _get_section(config, "dataloader")
+		processed_config = _get_section(config, "processed_dataset")
+		logger.info("Data source: processed_full_frames | root=%s | pattern=%s | target_root=%s | normalization=%s | input_sequence_length=%s | prediction_horizon=%s", processed_config.get("root"), data_config.get("sample_pattern"), data_config.get("target_root", "<dataset_root>/targets"), normalization_stats_path, config.get("input_sequence_length", training_config.get("input_sequence_length")), config.get("prediction_horizon", training_config.get("prediction_horizon")))
 	cache_config = _get_section(config, "cache")
-	if bool(cache_config.get("enabled", False)) and bool(cache_config.get("use_precomputed_patches", False)):
+	if not processed_mode and bool(cache_config.get("enabled", False)) and bool(cache_config.get("use_precomputed_patches", False)):
 		from src.data.cache import get_patch_cache_dir, validate_patch_cache
 
 		try:
@@ -1921,6 +1935,28 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 	atexit.register(_write_incomplete_run_summary)
 
 	def _checkpoint_extra_state() -> dict[str, Any]:
+		cawfe_latte_metadata = {}
+		if architecture == "cawfe_latte":
+			cawfe_config = _get_section(config, "cawfe_latte")
+			loss_config_for_meta = _get_section(_get_section(config, "training"), "loss")
+			cawfe_latte_metadata = {
+				"version": cawfe_config.get("version", "v1_end_to_end"),
+				"encoder_dim": int(cawfe_config.get("output_dim", 64)),
+				"backbone": {"type": _get_section(cawfe_config, "backbone").get("type", "temporal_cnn")},
+				"decoder": {"type": _get_section(cawfe_config, "decoder").get("type", "shallow_cnn")},
+				"auxiliary": {
+					"fire_support_head": {
+						"enabled": bool(_get_section(_get_section(cawfe_config, "auxiliary"), "fire_support_head").get("enabled", True)),
+					}
+				},
+				"loss_weights": {
+					"surface": float(_get_section(loss_config_for_meta, "surface").get("weight", 1.0)),
+					"canopy": float(_get_section(loss_config_for_meta, "canopy").get("weight", 1.0)),
+					"mask": float(_get_section(loss_config_for_meta, "mask").get("weight", 5.0)),
+					"energy": float(_get_section(loss_config_for_meta, "energy").get("weight", 1.0)),
+					"aux_fire_support": float(_get_section(loss_config_for_meta, "auxiliary_fire_support").get("weight", 0.2)),
+				},
+			}
 		return {
 			"architecture": architecture,
 			"run_name": run_manager.run_name,
@@ -1941,6 +1977,7 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 			"resolved_config_path": run_artifact_paths.get("resolved_config_path"),
 			"resumed_from_checkpoint": resumed_from_checkpoint,
 			"history": history_rows,
+			"cawfe_latte": cawfe_latte_metadata,
 			"early_stopping": {
 				**early_stopper.state_dict(),
 				"restore_best_weights": bool(early_stopping_config.get("restore_best_weights", False)),

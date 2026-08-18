@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from src.training.batch_utils import unpack_batch
+
 import argparse
 import csv
 from datetime import datetime
@@ -1612,13 +1614,14 @@ def _collect_checkpoint_predictions(
 		for batch_index, batch in enumerate(selected_loader):
 			if batch_index >= int(args.num_batches):
 				break
-			if not isinstance(batch, (tuple, list)) or len(batch) < 2:
-				raise TypeError("Expected DataLoader batches with at least input and target tensors.")
-			x_batch = batch[0].to(device, non_blocking=True)
-			y_batch = batch[1].to(device, non_blocking=True).float()
+			x_raw, y_raw, batch_extra = unpack_batch(batch)
+			terrain_raw = batch_extra.get("terrain")
+			x_batch = x_raw.to(device, non_blocking=True)
+			y_batch = y_raw.to(device, non_blocking=True).float()
+			terrain_batch = terrain_raw.to(device, non_blocking=True) if terrain_raw is not None else None
 			x_batch = _apply_input_normalizer(x_batch, normalizer)
 			with autocast_context(device, amp_dtype):
-				model_output = model(x_batch)
+				model_output = model(x_batch, terrain=terrain_batch) if terrain_batch is not None else model(x_batch)
 			pred, _aux = _extract_prediction_and_aux(model_output)
 			pred = pred.float()
 			_validate_shapes(x_batch, y_batch, pred)
@@ -1837,7 +1840,7 @@ def main() -> None:
 			normalization_row.update(input_batch_summary(x_batch, prefix="model_x"))
 			normalization_rows.append(normalization_row)
 			with autocast_context(device, amp_dtype):
-				model_output = model(x_batch)
+				model_output = model(x_batch, terrain=terrain_batch) if terrain_batch is not None else model(x_batch)
 			pred, aux = _extract_prediction_and_aux(model_output)
 			pred = pred.float()
 			if raw_x_for_comparison is not None:

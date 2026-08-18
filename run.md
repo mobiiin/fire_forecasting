@@ -1,3 +1,18 @@
+# Rebuilt Dataset Pipeline
+
+The staged dataset pipeline preserves the configured manual train/validation/test fire holdout and saves engineered full-frame tensors in channel-first `(C,H,W)` format under scratch. It does not construct targets or fixed X/y training samples.
+
+```bash
+python scripts/build_engineered_frame_dataset.py --config configs/default.yaml
+python scripts/visualize_engineered_frames.py --config configs/default.yaml --split train
+
+Viewer controls: Left/Right browse timestamps, Up/Down browse channels while keeping the timestamp, and `n`/`p` browse fires. Use `--channel_group core` or `--channel N` to start from a specific channel.
+python scripts/build_patch_index.py --config configs/default.yaml
+python scripts/visualize_patch_index.py --config configs/default.yaml --split train
+```
+
+Stages: build full-frame engineered data, visualize channels, build spatial patch metadata, visualize patch boxes, then later add target construction, temporal sample indices, train-only normalization, and training. Patch indices define crops only; they do not save patch tensors. No `targets/` or fixed training-cache outputs are created here.
+
 # Run Guide
 
 Project base directory: `/home/mhabibp/fire_forecasting`
@@ -581,8 +596,33 @@ Notes:
 - the shifted-window path currently uses cyclic shifts without a masking scheme
 - channel `2` remains mask logits; the model does not apply sigmoid internally
 
-## Removed CAWFE-Latte Implementation
-The previous CAWFE-Latte and CAWFE-Latte-Lite implementations have been removed from the active codebase. A new CAWFE-Latte design will be added later. Current active learned architectures are ConvLSTM U-Net, Earthformer-lite, CAWFE-ST-Mamba, and WeatherFormer-lite.
+## CAWFE-Latte v1 End-to-End
+CAWFE-Latte v1 is the first trainable end-to-end baseline for the fresh architecture. It uses four encoders, fire-query modality fusion, a small temporal CNN backbone, a shallow same-resolution decoder, and four heads.
+
+Outputs are surface consumed fuel, canopy consumed fuel, fire mask logits, and log1p energy release. The v1 loss uses surface Huber weight 1, canopy Huber weight 1, mask BCE+Dice weight 5, energy-log Huber weight 1, and one auxiliary fire-support mask loss after local fused features with weight 0.2. There are no per-encoder auxiliary losses and no heavy backbone, neural operator, Mamba, or large transformer yet.
+
+Smoke-test v1 with:
+
+```bash
+python scripts/smoke_test_cawfe_latte.py --config configs/default.yaml
+```
+
+Train with the example experiment config:
+
+```bash
+python scripts/train_forecasting_model.py \
+  --config configs/experiments/cawfe_latte_v1.yaml
+```
+
+Evaluate with:
+
+```bash
+python scripts/evaluate_trained_models.py \
+  --config configs/experiments/cawfe_latte_v1.yaml \
+  --mode quantitative \
+  --split test \
+  --model_architecture cawfe_latte
+```
 
 ## Rebuilding The Sliding-Window Patch Cache
 Train, validation, and test now all use sliding-window patchification with `patch_size=64` and `stride=60`.
@@ -601,3 +641,47 @@ Notes:
 - all three splits now use deterministic sliding-window patch refs
 - border patches are included so the full domain is covered
 - if cache validation fails, rerun `python scripts/precompute_patch_cache.py --config configs/default.yaml --split all`
+
+
+## Rebuilt target/sample pipeline
+
+After full-frame engineering and patch-index creation, build full-frame targets and metadata-only temporal samples:
+
+```bash
+python scripts/estimate_fire_mask_thresholds.py --config configs/default.yaml --percentile 1.0 --update_config --derived_config_path configs/derived/default_with_fire_mask_thresholds.yaml
+python scripts/build_target_dataset.py --config configs/derived/default_with_fire_mask_thresholds.yaml
+python scripts/visualize_targets.py --config configs/default.yaml --split train
+python scripts/build_temporal_sample_index.py --config configs/default.yaml --pattern all
+python scripts/visualize_processed_samples.py --config configs/default.yaml --pattern consecutive5_h10 --split train
+python scripts/compute_processed_dataset_normalization.py --config configs/default.yaml --pattern consecutive5_h10
+python scripts/inspect_processed_dataset.py --config configs/default.yaml
+```
+
+The processed ConvLSTM ablations use dynamic full-frame loading rather than fixed patch shards:
+
+```bash
+python scripts/train_forecasting_model.py --config configs/experiments/convlstm_consecutive5_h10.yaml
+python scripts/train_forecasting_model.py --config configs/experiments/convlstm_single1_h10.yaml
+python scripts/train_forecasting_model.py --config configs/experiments/convlstm_sparse5_h10.yaml
+```
+
+Targets are full-frame files, sample indices contain only references, and normalization is fitted on train samples only.
+
+
+## Automated Data Preparation Pipeline
+
+Run the rebuilt data stages in order with one command:
+
+```bash
+bash scripts/run_data_preparation_pipeline.sh configs/default.yaml
+```
+
+Optional quicklooks, percentile, and pattern selection:
+
+```bash
+bash scripts/run_data_preparation_pipeline.sh configs/default.yaml --make-quicklooks
+bash scripts/run_data_preparation_pipeline.sh configs/default.yaml --percentile 5.0
+bash scripts/run_data_preparation_pipeline.sh configs/default.yaml --pattern sparse5_h10
+```
+
+The runner builds engineered frames, estimates train-only fire-mask thresholds, constructs targets using the frozen derived config, builds patch and temporal indices, computes train-only normalization, inspects the dataset, and optionally saves visualizations. It never trains models by default. Logs are written under `artifacts/logs/data_preparation/`; after success, the script prints the exact next training commands.

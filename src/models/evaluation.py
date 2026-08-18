@@ -18,7 +18,7 @@ from src.data.cache import target_definition_version, temporal_target_offsets
 from src.data.dataset import create_dataloaders, metadata_batch_to_list
 from src.models.model_factory import build_model_from_config
 from src.training.checkpoints import load_checkpoint, validate_checkpoint_model_compatibility
-from src.training.losses import get_loss_function
+from src.training.losses import extract_aux_outputs, extract_prediction, get_loss_function
 from src.training.metrics import compute_metrics
 from src.training.hardware import autocast_context, choose_amp_dtype
 from src.training.input_normalization import (
@@ -209,14 +209,16 @@ def evaluate_checkpoint_on_split(
 		for batch_index, batch in enumerate(selected_loader):
 			if max_batches is not None and batch_index >= int(max_batches):
 				break
-			if not isinstance(batch, (tuple, list)) or len(batch) < 2:
-				raise TypeError("Expected DataLoader batches with at least input and target tensors.")
-			x_batch = batch[0].to(device, non_blocking=True)
-			y_batch = batch[1].to(device, non_blocking=True)
+			x_raw, y_raw, batch_extra = unpack_batch(batch)
+			terrain_raw = batch_extra.get("terrain")
+			x_batch = x_raw.to(device, non_blocking=True)
+			y_batch = y_raw.to(device, non_blocking=True)
+			terrain_batch = terrain_raw.to(device, non_blocking=True) if terrain_raw is not None else None
 			x_batch = apply_input_normalization(x_batch, input_normalizer, config)
 			metadata_items = metadata_batch_to_list(batch[2], batch_size=int(x_batch.shape[0])) if len(batch) >= 3 else [{} for _ in range(int(x_batch.shape[0]))]
 			with autocast_context(device, amp_dtype):
-				y_pred = model(x_batch)
+				model_output = model(x_batch, terrain=terrain_batch) if terrain_batch is not None else model(x_batch)
+			y_pred = extract_prediction(model_output)
 			if tuple(y_pred.shape) != tuple(y_batch.shape):
 				raise ValueError(
 					f"Prediction shape {tuple(y_pred.shape)} does not match target shape {tuple(y_batch.shape)}."
@@ -225,8 +227,14 @@ def evaluate_checkpoint_on_split(
 				dataset_name = str(metadata.get("dataset_name", f"dataset_{metadata.get('dataset_id', 'unknown')}"))
 				sample_pred = y_pred[sample_index : sample_index + 1]
 				sample_true = y_batch[sample_index : sample_index + 1]
+				sample_output = sample_pred
+				if isinstance(model_output, dict):
+					sample_output = {"prediction": sample_pred}
+					for aux_key, aux_value in extract_aux_outputs(model_output).items():
+						if torch.is_tensor(aux_value) and int(aux_value.shape[0]) == int(y_pred.shape[0]):
+							sample_output[aux_key] = aux_value[sample_index : sample_index + 1]
 				with autocast_context(device, amp_dtype):
-					loss_result = criterion(sample_pred, sample_true)
+					loss_result = criterion(sample_output, sample_true)
 				loss, loss_components = _coerce_loss_result(loss_result)
 				metric_prediction, metric_target = _denormalize_target_tensors_for_metrics(
 					selected_loader,

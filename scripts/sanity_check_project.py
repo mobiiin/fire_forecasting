@@ -31,6 +31,8 @@ from src.data.spatial_transforms import infer_with_external_test_spatial_handlin
 from src.models.convlstm_unet import build_model_from_config
 from src.training.input_normalization import apply_input_normalization, build_input_normalizer_for_loader, normalization_metadata_from_loader
 from src.training.losses import get_loss_function
+from src.training.batch_utils import unpack_batch
+from src.training.metrics import compute_metrics
 from src.training.train import resolve_validation_policy
 
 
@@ -108,6 +110,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--batch_size", type=int, default=2, help="Small DataLoader batch size used only for this sanity check.")
 	parser.add_argument("--num_workers", type=int, default=0, help="DataLoader workers used only for this sanity check.")
 	parser.add_argument("--device", default=None, help="Optional device override for this sanity check, e.g. cpu, cuda, cuda:0.")
+	parser.add_argument("--deep", action="store_true", help="Run loss/metrics and a backward-pass smoke test.")
 	return parser
 
 
@@ -151,6 +154,52 @@ def main() -> None:
 	config = load_config(config_path)
 	config["config_path"] = str(config_path)
 	_apply_sanity_overrides(config, args.batch_size, args.num_workers, args.device)
+
+	if str(config.get("dataloader", {}).get("source", "")).lower() == "processed_full_frames":
+		processed = config.get("processed_dataset", {}) if isinstance(config.get("processed_dataset"), Mapping) else {}
+		root = Path(str(processed.get("root", ""))).expanduser()
+		pattern = str(config.get("dataloader", {}).get("sample_pattern", "consecutive5_h10"))
+		checks = [root, root / "dataset_manifest.json", root / "channel_manifest.json", root / "indices" / "temporal" / f"samples_{pattern}.jsonl"]
+		for path in checks:
+			if not path.exists(): raise FileNotFoundError(f"Processed dataset sanity check failed; missing: {path}")
+		train_loader, val_loader, test_loader = create_dataloaders(config)
+		if not len(train_loader.dataset) or not len(val_loader.dataset) or not len(test_loader.dataset): raise ValueError("Processed dataset sanity check requires non-empty train/val/test splits.")
+		batch = next(iter(train_loader)); x_batch, y_batch, batch_extra = unpack_batch(batch); terrain_batch = batch_extra.get("terrain")
+		if x_batch.ndim != 5 or y_batch.ndim != 4 or y_batch.shape[1] != 4: raise ValueError(f"Processed batch shapes must be X=(B,T,C,H,W), y=(B,4,H,W); got {tuple(x_batch.shape)}, {tuple(y_batch.shape)}")
+		expected_t = int(config.get("input_sequence_length", config.get("training", {}).get("input_sequence_length", x_batch.shape[1])))
+		if int(x_batch.shape[1]) != expected_t: raise ValueError(f"Processed input T={x_batch.shape[1]} does not match configured T={expected_t}")
+		mask_values = torch.unique(y_batch[:, 2])
+		if not bool(torch.all((mask_values == 0) | (mask_values == 1))): raise ValueError(f"Processed fire mask is not binary: {mask_values.tolist()}")
+		if not torch.isfinite(y_batch[:, 0]).all() or not torch.isfinite(y_batch[:, 1]).all() or not torch.isfinite(y_batch[:, 3]).all(): raise ValueError("Processed targets contain NaN/Inf values.")
+		if bool((y_batch[:, 3] < 0).any()): raise ValueError("Processed energy_log targets must be non-negative.")
+		if getattr(train_loader.dataset, "input_normalization_on_device", False): raise ValueError("Processed dataset unexpectedly enables device-side normalization.")
+		if not getattr(train_loader.dataset, "inputs_are_normalized", False) and bool(config.get("dataloader", {}).get("normalize_inputs", True)): raise ValueError("Processed inputs were not normalized in the Dataset.")
+		model = build_model_from_config(config, input_channels=int(x_batch.shape[2]))
+		if bool(config.get("cawfe_latte", {}).get("use_terrain_conditioning", False)) and terrain_batch is None: raise ValueError("CAWFE-Latte terrain conditioning is enabled but sanity batch has no terrain.")
+		with torch.no_grad(): prediction = model(x_batch, terrain=terrain_batch) if terrain_batch is not None else model(x_batch)
+		if tuple(prediction.shape) != (int(x_batch.shape[0]), 4, int(y_batch.shape[2]), int(y_batch.shape[3])): raise ValueError(f"Processed model output shape mismatch: {tuple(prediction.shape)}")
+		criterion = get_loss_function(config)
+		loss_result = criterion(prediction, y_batch)
+		loss_value = loss_result["total_loss"] if isinstance(loss_result, Mapping) else loss_result
+		if not torch.isfinite(loss_value): raise ValueError("Processed loss is not finite.")
+		metric_values = compute_metrics(prediction, y_batch, config)
+		if args.deep:
+			model.zero_grad(set_to_none=True); deep_prediction = model(x_batch, terrain=terrain_batch) if terrain_batch is not None else model(x_batch); deep_loss_result = criterion(deep_prediction, y_batch); deep_loss = deep_loss_result["total_loss"] if isinstance(deep_loss_result, Mapping) else deep_loss_result; deep_loss.backward()
+		print("Data pipeline mode: processed_full_frames")
+		print(f"  root: {root}")
+		print(f"  pattern: {pattern}")
+		print(f"  train samples: {len(train_loader.dataset)}")
+		print(f"  val samples: {len(val_loader.dataset)}")
+		print(f"  test samples: {len(test_loader.dataset)}")
+		print(f"  X batch shape: {tuple(x_batch.shape)}")
+		print(f"  y batch shape: {tuple(y_batch.shape)}")
+		print(f"  input normalization applied in dataset: {getattr(train_loader.dataset, 'inputs_are_normalized', False)}")
+		print(f"  device-side normalization skipped: {not getattr(train_loader.dataset, 'input_normalization_on_device', False)}")
+		print(f"  loss: {float(loss_value.item()):.6g}")
+		print(f"  metrics: {metric_values}")
+		print(f"  deep backward: {args.deep}")
+		print("Status: OK")
+		return
 
 	_print_environment_info()
 	data_dir_value = config.get("data_dir")

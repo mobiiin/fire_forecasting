@@ -70,14 +70,27 @@ ARCHITECTURE_REGISTRY: dict[str, ArchitectureSpec] = {
 		supports_patch_cache=True,
 		supports_tiled_inference=True,
 	),
+	"cawfe_latte": ArchitectureSpec(
+		name="cawfe_latte",
+		requires_fixed_patch_size=False,
+		patch_divisibility=1,
+		input_type="sequence",
+		supports_sequence=True,
+		output_type="fused_sequence_features",
+		expected_input_shape="(B, T, C, H, W)",
+		expected_output_shape="(B, T, 64, H, W)",
+		supports_patch_cache=True,
+		supports_tiled_inference=False,
+		custom_architecture=True,
+	),
 }
 
 ARCHITECTURE_ALIASES = {
 	"cawfe_st_mamba": "st_mamba_lite",
 }
 
-REMOVED_ARCHITECTURES = {"cawfe_latte", "cawfe_latte_lite"}
-REMOVED_ARCHITECTURE_MESSAGE = "The old CAWFE-Latte implementation has been removed. A new design will be added later."
+REMOVED_ARCHITECTURES = {"cawfe_latte_lite"}
+REMOVED_ARCHITECTURE_MESSAGE = "The old CAWFE-Latte-Lite implementation has been removed. A new design will be added later."
 
 
 def resolve_model_architecture(config: Mapping[str, Any]) -> str:

@@ -10,6 +10,7 @@ except ImportError:  # pragma: no cover - environment-specific fallback
 	torch = None
 
 from src.data.energy_release import resolve_energy_output_channel_names, resolve_energy_release_config
+from src.training.model_outputs import extract_prediction
 
 
 def _get_section(config, *names):
@@ -54,6 +55,7 @@ def compute_metrics(y_pred: torch.Tensor, y_true: torch.Tensor, config) -> dict[
 
 	if torch is None:
 		raise ImportError("PyTorch is required to compute wildfire metrics.")
+	y_pred = extract_prediction(y_pred)
 	if y_pred.shape != y_true.shape:
 		raise ValueError(f"Metrics expect matching shapes, got {tuple(y_pred.shape)} and {tuple(y_true.shape)}.")
 
@@ -101,9 +103,10 @@ def compute_metrics(y_pred: torch.Tensor, y_true: torch.Tensor, config) -> dict[
 			return _segmentation_stats(predicted_mask, target_mask, eps)
 
 		if task_type == "multitask":
+			processed_mode = str(_get_section(config, "dataloader").get("source", "")).lower() == "processed_full_frames"
 			energy_release = resolve_energy_release_config(config)
 			energy_output_names = resolve_energy_output_channel_names(config)
-			expected_channels = 3 + len(energy_output_names)
+			expected_channels = 4 if processed_mode else 3 + len(energy_output_names)
 			if y_pred.ndim != 4 or y_pred.shape[1] != expected_channels:
 				raise ValueError(
 					f"Multitask metrics expect tensors shaped (B, {expected_channels}, H, W), got {tuple(y_pred.shape)}."
@@ -115,6 +118,8 @@ def compute_metrics(y_pred: torch.Tensor, y_true: torch.Tensor, config) -> dict[
 			true_canopy = y_true[:, 1:2]
 			mask_logits = y_pred[:, 2:3]
 			true_mask = y_true[:, 2:3].to(dtype=torch.float32)
+			if not torch.isfinite(true_mask).all() or bool(((true_mask < 0) | (true_mask > 1)).any()):
+				raise ValueError("Fire-mask targets must be finite floats in [0, 1].")
 			mask_prob = torch.sigmoid(mask_logits)
 			mask_pred = (mask_prob > 0.5).to(dtype=torch.float32)
 
@@ -126,8 +131,8 @@ def compute_metrics(y_pred: torch.Tensor, y_true: torch.Tensor, config) -> dict[
 				active_surface_mae = surface_abs_error[active_mask].mean()
 				active_canopy_mae = canopy_abs_error[active_mask].mean()
 			else:
-				active_surface_mae = torch.zeros((), device=y_pred.device, dtype=y_pred.dtype)
-				active_canopy_mae = torch.zeros((), device=y_pred.device, dtype=y_pred.dtype)
+				active_surface_mae = torch.full((), float("nan"), device=y_pred.device, dtype=y_pred.dtype)
+				active_canopy_mae = torch.full((), float("nan"), device=y_pred.device, dtype=y_pred.dtype)
 
 			segmentation_metrics = _segmentation_stats(mask_pred, true_mask, eps)
 			results = {
@@ -142,6 +147,11 @@ def compute_metrics(y_pred: torch.Tensor, y_true: torch.Tensor, config) -> dict[
 				"mask_precision": float(segmentation_metrics["precision"]),
 				"mask_recall": float(segmentation_metrics["recall"]),
 				"active_mask_fraction": float(true_mask.mean().item()),
+				"predicted_active_mask_fraction": float(mask_pred.mean().item()),
+				"surface_mae": float(surface_abs_error.mean().item()),
+				"surface_rmse": float(torch.sqrt(torch.mean((pred_surface - true_surface) ** 2) + eps).item()),
+				"canopy_mae": float(canopy_abs_error.mean().item()),
+				"canopy_rmse": float(torch.sqrt(torch.mean((pred_canopy - true_canopy) ** 2) + eps).item()),
 			}
 			if energy_output_names:
 				pred_energy_log = y_pred[:, 3:4]
@@ -174,12 +184,15 @@ def compute_metrics(y_pred: torch.Tensor, y_true: torch.Tensor, config) -> dict[
 					)
 				)
 				energy_active_threshold_log = math.log1p(max(energy_active_threshold_MW, 0.0))
-				target_defined_active = (
-					(true_mask > 0.5)
-					| (true_energy_log > energy_active_threshold_log)
-					| (true_surface > consumed_active_threshold)
-					| (true_canopy > consumed_active_threshold)
-				)
+				if processed_mode:
+					target_defined_active = true_mask > 0.5
+				else:
+					target_defined_active = (
+						(true_mask > 0.5)
+						| (true_energy_log > energy_active_threshold_log)
+						| (true_surface > consumed_active_threshold)
+						| (true_canopy > consumed_active_threshold)
+					)
 				if target_defined_active.any():
 					results["active_energy_log_mae"] = float(energy_log_abs_error[target_defined_active].mean().item())
 					results["active_energy_log_rmse"] = float(

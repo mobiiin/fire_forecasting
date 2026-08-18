@@ -38,6 +38,7 @@ from src.data.patching import (
 	sample_random_patch,
 	validate_patch_dict,
 )
+from src.data.processed_sample_dataset import ProcessedTemporalPatchDataset
 from src.data.preprocessing import (
 	input_normalization_runs_on_device,
 	load_normalization_stats,
@@ -2077,6 +2078,47 @@ def create_dataloaders(config):
 
 	if torch is None or DataLoader is None:
 		raise ImportError("PyTorch is required to build DataLoaders for wildfire forecasting.")
+
+	dataloader_config = _get_section(config, "dataloader")
+	if str(dataloader_config.get("source", "")).lower() == "processed_full_frames":
+		config_path_value = config.get("config_path", config.get("_config_path"))
+		config_path = Path(config_path_value).expanduser().resolve() if config_path_value else None
+		processed = _get_section(config, "processed_dataset")
+		root_value = dataloader_config.get("dataset_root", processed.get("root", "/scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1"))
+		root = _resolve_path(config_path, root_value)
+		pattern = str(dataloader_config.get("sample_pattern", "consecutive5_h10"))
+		sample_dir_value = dataloader_config.get("split_sample_index_dir")
+		sample_dir = _resolve_path(config_path, sample_dir_value) if sample_dir_value else root / "indices" / "temporal"
+		sample_path_value = dataloader_config.get("sample_index_path")
+		sample_path = _resolve_path(config_path, sample_path_value) if sample_path_value else sample_dir / f"samples_{pattern}.jsonl"
+		normalization = _get_section(config, "normalization")
+		normalize_inputs = bool(dataloader_config.get("normalize_inputs", True))
+		stats_value = normalization.get("stats_path") if normalize_inputs else None
+		stats_path = _resolve_path(config_path, stats_value) if stats_value else None
+		if normalize_inputs and bool(normalization.get("require_stats", False)) and (stats_path is None or not stats_path.exists()):
+			raise FileNotFoundError(f"Processed-full-frame normalization stats are required but missing: {stats_path}")
+		return_terrain_value = dataloader_config.get("return_terrain", "auto")
+		architecture = str(_get_section(config, "model").get("architecture", "")).lower()
+		cawfe_config = _get_section(config, "cawfe_latte")
+		return_terrain = bool(return_terrain_value) if not isinstance(return_terrain_value, str) or return_terrain_value.lower() != "auto" else (architecture == "cawfe_latte" and bool(cawfe_config.get("use_terrain_conditioning", False)))
+		common = {"dataset_root": root, "sample_index_path": sample_path, "normalization_stats_path": stats_path, "normalize_inputs": normalize_inputs, "input_key": str(dataloader_config.get("input_key", "x_engineered")), "return_metadata": bool(config.get("return_metadata", dataloader_config.get("return_metadata", False))), "single_frame_mode": str(dataloader_config.get("single_frame_mode", "as_is")), "repeat_to_length": dataloader_config.get("repeat_to_length"), "return_terrain": return_terrain, "terrain_key": str(dataloader_config.get("terrain_key", "terrain_features"))}
+		train_dataset = ProcessedTemporalPatchDataset(split="train", **common)
+		val_dataset = ProcessedTemporalPatchDataset(split="val", **common)
+		test_dataset = ProcessedTemporalPatchDataset(split="test", **common)
+		fire_sets = {split: {str(record["fire_name"]) for record in dataset.records} for split, dataset in (("train", train_dataset), ("val", val_dataset), ("test", test_dataset))}
+		for left, right in (("train", "val"), ("train", "test"), ("val", "test")):
+			overlap = fire_sets[left] & fire_sets[right]
+			if overlap:
+				raise ValueError(f"Processed dataset fire split leakage between {left} and {right}: {sorted(overlap)}")
+		for split, dataset in (("train", train_dataset), ("val", val_dataset), ("test", test_dataset)):
+			bad = [record.get("sample_id", "<unknown>") for record in dataset.records if record.get("split") != split]
+			if bad:
+				raise ValueError(f"Processed {split} dataset contains records from another split: {bad[:3]}")
+		options = [_resolve_dataloader_options(config, split) for split in ("train", "val", "test")]
+		loaders = (DataLoader(train_dataset, shuffle=True, **options[0]), DataLoader(val_dataset, shuffle=False, **options[1]), DataLoader(test_dataset, shuffle=False, **options[2]))
+		print(f"Data source: processed_full_frames | root={root} | pattern={pattern} | sample_index={sample_path} | normalization={stats_path}")
+		print(f"Processed samples | train={len(train_dataset)} val={len(val_dataset)} test={len(test_dataset)}")
+		return loaders
 
 	for required_key in ("file_pattern", "input_sequence_length", "prediction_horizon"):
 		if required_key not in config:

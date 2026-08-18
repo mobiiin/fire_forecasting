@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from src.training.model_outputs import extract_prediction
+
 try:
 	import torch  # type: ignore[import-not-found]
 	import torch.nn.functional as F  # type: ignore[import-not-found]
@@ -115,7 +117,7 @@ def infer_with_external_test_spatial_handling(model, x, config: Mapping[str, Any
 
 	def _attempt(selected_mode: str):
 		if selected_mode == "direct":
-			y_pred = model(x)
+			y_pred = extract_prediction(model(x))
 			return {
 				"y_pred": y_pred,
 				"x_model_input": x,
@@ -139,7 +141,7 @@ def infer_with_external_test_spatial_handling(model, x, config: Mapping[str, Any
 		else:
 			raise ValueError(f"Unsupported spatial handling mode: {selected_mode!r}.")
 
-		y_pred = model(x_model_input)
+		y_pred = extract_prediction(model(x_model_input))
 		if bool(spatial_config["crop_output_to_original_size"]):
 			y_pred = crop_to_original(y_pred, metadata)
 		return {

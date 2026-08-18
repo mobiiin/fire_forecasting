@@ -17,6 +17,9 @@ except ImportError:  # pragma: no cover - environment-specific fallback
 from src.data.energy_release import resolve_energy_output_channel_names, resolve_energy_release_config
 
 
+
+from src.training.model_outputs import extract_aux_outputs, extract_prediction
+
 def _get_section(config, *names):
 	"""Return the first mapping-like section present in ``config``."""
 
@@ -205,6 +208,17 @@ class MultiTaskLoss(nn.Module):
 		self.energy_loss_space = str(self.multitask_config.get("energy_loss_space", "log")).lower()
 		self.energy_active_weight = float(self.multitask_config.get("energy_active_weight", 10.0))
 		self.energy_background_weight = float(self.multitask_config.get("energy_background_weight", 1.0))
+		self.processed_full_frames = str(_get_section(config, "dataloader").get("source", "")).lower() == "processed_full_frames"
+		if self.processed_full_frames:
+			self.regression_loss_name = "huber"
+			self.surface_loss_weight = 1.0
+			self.canopy_loss_weight = 1.0
+			self.segmentation_loss_weight = 5.0
+			self.energy_loss_weight = 1.0
+			self.active_fire_weight = 1.0
+			self.background_weight = 1.0
+			self.energy_active_weight = 1.0
+			self.energy_background_weight = 1.0
 		self.energy_active_threshold_MW = float(self.multitask_config.get("energy_active_threshold_MW", 0.001))
 		background_suppression_config = {}
 		if isinstance(self.loss_config.get("background_suppression"), dict):
@@ -234,6 +248,27 @@ class MultiTaskLoss(nn.Module):
 		self.background_suppression_reduction = str(background_suppression_config.get("reduction", "mean")).lower()
 		if self.background_suppression_reduction != "mean":
 			raise ValueError("training.loss.background_suppression.reduction currently supports only 'mean'.")
+		self.cawfe_latte_loss_enabled = self.architecture == "cawfe_latte"
+		if self.cawfe_latte_loss_enabled:
+			surface_config = _get_section(self.training_loss_config, "surface")
+			canopy_config = _get_section(self.training_loss_config, "canopy")
+			mask_config = _get_section(self.training_loss_config, "mask")
+			energy_config = _get_section(self.training_loss_config, "energy")
+			aux_config = _get_section(self.training_loss_config, "auxiliary_fire_support")
+			self.surface_loss_weight = float(surface_config.get("weight", 1.0))
+			self.canopy_loss_weight = float(canopy_config.get("weight", 1.0))
+			self.segmentation_loss_weight = float(mask_config.get("weight", 5.0))
+			self.energy_loss_weight = float(energy_config.get("weight", 1.0))
+			self.huber_delta = float(surface_config.get("delta", canopy_config.get("delta", energy_config.get("delta", self.huber_delta))))
+			self.cawfe_mask_bce_weight = float(mask_config.get("bce_weight", 1.0))
+			self.cawfe_mask_dice_weight = float(mask_config.get("dice_weight", 1.0))
+			self.aux_fire_support_enabled = bool(aux_config.get("enabled", True))
+			self.aux_fire_support_weight = float(aux_config.get("weight", 0.2))
+		else:
+			self.cawfe_mask_bce_weight = 1.0
+			self.cawfe_mask_dice_weight = 1.0
+			self.aux_fire_support_enabled = False
+			self.aux_fire_support_weight = 0.0
 
 	def _energy_threshold_in_target_space(self) -> float:
 		"""Convert the physical active threshold into target space."""
@@ -357,7 +392,24 @@ class MultiTaskLoss(nn.Module):
 			return torch.zeros((), dtype=pred_surface.dtype, device=pred_surface.device)
 		return torch.stack(terms).mean()
 
+
+	def _bce_dice_parts(self, pred_logits: torch.Tensor, true_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+		if pred_logits.shape != true_mask.shape:
+			raise ValueError(f"BCE+Dice expects matching shapes, got {tuple(pred_logits.shape)} and {tuple(true_mask.shape)}.")
+		bce = F.binary_cross_entropy_with_logits(pred_logits, true_mask)
+		dice = DiceLoss(from_logits=True, eps=self.dice_eps)(pred_logits, true_mask)
+		total = self.cawfe_mask_bce_weight * bce + self.cawfe_mask_dice_weight * dice
+		return bce, dice, total
+
+	def _cawfe_huber(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+		if y_pred.shape != y_true.shape:
+			raise ValueError(f"Huber expects matching shapes, got {tuple(y_pred.shape)} and {tuple(y_true.shape)}.")
+		return F.smooth_l1_loss(y_pred, y_true, beta=self.huber_delta)
+
 	def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> dict[str, torch.Tensor]:
+		model_output = y_pred
+		aux_outputs = extract_aux_outputs(model_output)
+		y_pred = extract_prediction(model_output)
 		if y_pred.shape != y_true.shape:
 			raise ValueError(f"MultiTaskLoss expects matching shapes, got {tuple(y_pred.shape)} and {tuple(y_true.shape)}.")
 		if y_pred.ndim != 4 or y_pred.shape[1] != self.expected_channels:
@@ -371,8 +423,47 @@ class MultiTaskLoss(nn.Module):
 		true_canopy_consumed = y_true[:, 1:2]
 		pred_mask_logits = y_pred[:, 2:3]
 		true_mask = y_true[:, 2:3]
+		if not torch.isfinite(true_mask).all() or bool(((true_mask < 0) | (true_mask > 1)).any()):
+			raise ValueError("Processed fire-mask targets must be finite floats in [0, 1].")
 		pred_energy_log = y_pred[:, 3:4] if self.energy_output_names else torch.zeros_like(pred_surface_consumed)
 		true_energy_log = y_true[:, 3:4] if self.energy_output_names else torch.zeros_like(true_surface_consumed)
+
+		if self.cawfe_latte_loss_enabled:
+			surface_loss = self._cawfe_huber(pred_surface_consumed, true_surface_consumed)
+			canopy_loss = self._cawfe_huber(pred_canopy_consumed, true_canopy_consumed)
+			mask_bce, mask_dice, mask_loss = self._bce_dice_parts(pred_mask_logits, true_mask)
+			energy_loss = self._cawfe_huber(pred_energy_log, true_energy_log) if self.energy_output_names else torch.zeros((), dtype=y_pred.dtype, device=y_pred.device)
+			aux_logits = aux_outputs.get("aux_fire_support_logits")
+			aux_bce = torch.zeros((), dtype=y_pred.dtype, device=y_pred.device)
+			aux_dice = torch.zeros((), dtype=y_pred.dtype, device=y_pred.device)
+			aux_total = torch.zeros((), dtype=y_pred.dtype, device=y_pred.device)
+			if self.aux_fire_support_enabled and torch.is_tensor(aux_logits):
+				aux_bce, aux_dice, aux_total = self._bce_dice_parts(aux_logits, true_mask)
+			weighted_surface = self.surface_loss_weight * surface_loss
+			weighted_canopy = self.canopy_loss_weight * canopy_loss
+			weighted_mask = self.segmentation_loss_weight * mask_loss
+			weighted_energy = self.energy_loss_weight * energy_loss
+			weighted_aux = self.aux_fire_support_weight * aux_total
+			total_loss = weighted_surface + weighted_canopy + weighted_mask + weighted_energy + weighted_aux
+			return {
+				"total_loss": total_loss,
+				"loss_total": total_loss,
+				"loss_surface": surface_loss,
+				"loss_canopy": canopy_loss,
+				"loss_mask_bce": mask_bce,
+				"loss_mask_dice": mask_dice,
+				"loss_mask_total": mask_loss,
+				"loss_segmentation": mask_loss,
+				"loss_energy": energy_loss,
+				"loss_aux_fire_support_bce": aux_bce,
+				"loss_aux_fire_support_dice": aux_dice,
+				"loss_aux_fire_support_total": aux_total,
+				"weighted_surface": weighted_surface,
+				"weighted_canopy": weighted_canopy,
+				"weighted_mask": weighted_mask,
+				"weighted_energy": weighted_energy,
+				"weighted_aux_fire_support": weighted_aux,
+			}
 
 		surface_loss = self._regression_loss(pred_surface_consumed, true_surface_consumed, true_mask)
 		canopy_loss = self._regression_loss(pred_canopy_consumed, true_canopy_consumed, true_mask)

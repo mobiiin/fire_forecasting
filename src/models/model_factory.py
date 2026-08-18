@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any, Mapping
 
 from src.models.architecture_registry import (
@@ -10,11 +12,62 @@ from src.models.architecture_registry import (
 	get_architecture_spec,
 	resolve_model_architecture,
 )
+from src.models.cawfe_latte import CAWFELatte
 from src.models.convlstm_unet import ConvLSTMUNet, build_convlstm_unet_from_config
 from src.models.earthformer_lite import EarthformerLite
 from src.models.st_mamba_lite import STMamba
 from src.models.weatherformer_lite import WeatherFormerLite
 
+
+
+def _resolve_optional_path(config: Mapping[str, Any], value: Any) -> Path | None:
+	if value in (None, "", "null"):
+		return None
+	path = Path(str(value)).expanduser()
+	if path.is_absolute():
+		return path.resolve()
+	config_path = config.get("config_path")
+	if config_path not in (None, "", "null"):
+		return (Path(str(config_path)).expanduser().resolve().parent / path).resolve()
+	return path.resolve()
+
+
+def _load_channel_names(config: Mapping[str, Any]) -> dict[int, str]:
+	candidates: list[Path] = []
+	data_config = config.get("data")
+	if isinstance(data_config, Mapping):
+		path = _resolve_optional_path(config, data_config.get("channel_manifest_path"))
+		if path is not None:
+			candidates.append(path)
+	for section_name in ("channels", "channel_manifest", "metadata"):
+		section = config.get(section_name)
+		if isinstance(section, Mapping):
+			for key in ("manifest", "path", "channel_manifest"):
+				path = _resolve_optional_path(config, section.get(key))
+				if path is not None:
+					candidates.append(path)
+	for path in candidates:
+		if not path.exists():
+			continue
+		payload = json.loads(path.read_text(encoding="utf-8"))
+		items = payload.get("channels", payload.get("input_channels", payload)) if isinstance(payload, Mapping) else payload
+		names: dict[int, str] = {}
+		if isinstance(items, list):
+			for index, item in enumerate(items):
+				if isinstance(item, Mapping):
+					channel_index = int(item.get("index", item.get("channel", index)))
+					names[channel_index] = str(item.get("name", item.get("label", f"ch{channel_index:03d}")))
+				else:
+					names[index] = str(item)
+		elif isinstance(items, Mapping):
+			for key, value in items.items():
+				try:
+					channel_index = int(str(key).replace("ch", ""))
+				except ValueError:
+					continue
+				names[channel_index] = str(value.get("name", value.get("label")) if isinstance(value, Mapping) else value)
+		return names
+	return {}
 
 
 def build_model_from_config(config: Mapping[str, Any], input_channels: int):
@@ -149,5 +202,31 @@ def build_model_from_config(config: Mapping[str, Any], input_channels: int):
 			downsample_stages=int(section.get("downsample_stages", 2)),
 			patch_merge_factor=int(section.get("patch_merge_factor", 2)),
 			required_patch_divisibility=int(section.get("required_patch_divisibility", 16)),
+		)
+	if architecture == "cawfe_latte":
+		section = config.get("cawfe_latte", {})
+		if not isinstance(section, Mapping):
+			section = {}
+		return CAWFELatte(
+			input_channels=int(input_channels),
+			input_sequence_length=int(section.get("input_sequence_length", config.get("input_sequence_length", 1))),
+			output_channels=int(section.get("output_channels", model_config.get("output_channels", 4))),
+			output_dim=int(section.get("output_dim", 64)),
+			version=str(section.get("version", "v1_end_to_end")),
+			atmosphere=section.get("atmosphere", {}),
+			wind=section.get("wind", {}),
+			fire_fuel=section.get("fire_fuel", {}),
+			flux_energy=section.get("flux_energy", {}),
+			fusion=section.get("fusion", {}),
+			backbone=section.get("backbone", {}),
+			temporal_aggregation=section.get("temporal_aggregation", {}),
+			decoder=section.get("decoder", {}),
+			heads=section.get("heads", {}),
+			auxiliary=section.get("auxiliary", {}),
+			use_terrain_conditioning=bool(section.get("use_terrain_conditioning", False)),
+			terrain_encoder=section.get("terrain_encoder", {}),
+			terrain_film=section.get("terrain_film", {}),
+			channel_names=_load_channel_names(config),
+			debug_prediction_head=bool(section.get("debug_prediction_head", False)),
 		)
 	raise ValueError(f"Unsupported model architecture: {architecture!r}.")

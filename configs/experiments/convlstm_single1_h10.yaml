@@ -1,0 +1,68 @@
+base_config: ../derived/default_with_fire_mask_thresholds.yaml
+experiment:
+  name: convlstm_single1_h10
+model:
+  architecture: convlstm_unet
+  input_sequence_length: 1
+dataloader:
+  source: processed_full_frames
+  sample_pattern: single1_h10
+  split_sample_index_dir: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1/indices/temporal
+  patch_index_path: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1/indices/patches/patches_64_stride60_border.jsonl
+  target_root: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1/targets
+  normalize_inputs: true
+  return_metadata: false
+  input_key: x_engineered
+  target_horizon: 10
+  single_frame_mode: as_is
+processed_dataset:
+  root: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1
+  version: cawfe_engineered_v1
+normalization:
+  enabled: true
+  stats_path: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1/normalization/latest_normalization.json
+  npz_path: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1/normalization/latest_normalization.npz
+  require_stats: true
+training:
+  max_epochs: 20
+  output:
+    save_resolved_config: true
+  input_sequence_length: 1
+  prediction_horizon: 10
+  input_normalization_device: cpu
+input_sequence_length: 1
+prediction_horizon: 10
+convlstm_unet:
+  input_sequence_length: 1
+  prediction_horizon: 10
+data:
+  input_sequence_length: 1
+  prediction_horizon: 10
+sequence:
+  input_sequence_length: 1
+  prediction_horizon: 10
+patching:
+  input_sequence_length: 1
+  prediction_horizon: 10
+cache:
+  enabled: false
+  use_precomputed_patches: false
+  input_sequence_length: 1
+  prediction_horizon: 10
+earthformer_lite:
+  input_sequence_length: 1
+  prediction_horizon: 10
+st_mamba_lite:
+  input_sequence_length: 1
+  prediction_horizon: 10
+cawfe_st_mamba:
+  input_sequence_length: 1
+  prediction_horizon: 10
+weatherformer_lite:
+  input_sequence_length: 1
+  prediction_horizon: 10
+evaluation:
+  split: test
+  mask_threshold: 0.5
+  primary_energy_metric: energy_log_mae
+  use_test_for_checkpointing: false

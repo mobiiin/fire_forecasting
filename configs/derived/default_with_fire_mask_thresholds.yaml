@@ -1,0 +1,9 @@
+base_config: ../default.yaml
+target_construction:
+  fire_mask:
+    method: threshold_union
+    energy_threshold_mw: 0.008769744075834751
+    surface_fuel_threshold: 3.000000106112566e-06
+    canopy_fuel_threshold: 0.0085982084274292
+    threshold_file: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1/thresholds/fire_mask_thresholds_latest.json
+    require_frozen_thresholds: true

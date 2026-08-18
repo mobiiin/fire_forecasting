@@ -1,0 +1,110 @@
+base_config: ../default.yaml
+
+experiment:
+  name: cawfe_latte_v1
+  description: First end-to-end CAWFE-Latte with four encoders, modality fusion, temporal CNN backbone, shallow decoder, and auxiliary fire-support head.
+
+model:
+  architecture: cawfe_latte
+
+processed_dataset:
+  root: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1
+  version: cawfe_engineered_v1
+
+dataloader:
+  source: processed_full_frames
+  sample_pattern: consecutive5_h10
+  return_terrain: auto
+  normalize_inputs: true
+
+paths:
+  patch_cache_root: /scratch/mhabibp/fire_forecasting_patch_cache/cawfe_latte_v1
+  normalization_root: /scratch/mhabibp/fire_forecasting_normalization/cawfe_latte_v1
+
+cache:
+  enabled: false
+  use_precomputed_patches: false
+  cache_version: v5_manual_trim_T5_H10_stride60_cawfe_latte_v1
+  cache_dir: /scratch/mhabibp/fire_forecasting_patch_cache/cawfe_latte_v1
+
+normalization:
+  enabled: true
+  require_stats: true
+  output_dir: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1/normalization
+  stats_path: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1/normalization/latest_normalization.json
+  path: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1/normalization/latest_normalization.json
+  npz_path: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1/normalization/latest_normalization.npz
+
+cawfe_latte:
+  use_terrain_conditioning: true
+  enabled: true
+  version: v1_end_to_end
+  input_channels: 129
+  input_sequence_length: 5
+  output_channels: 4
+  output_dim: 64
+  debug_prediction_head: false
+
+  backbone:
+    type: temporal_cnn
+    dim: 64
+    num_blocks: 3
+    temporal_kernel_size: 3
+    spatial_kernel_size: 3
+    dropout: 0.1
+    residual: true
+    norm: groupnorm
+    activation: silu
+
+  temporal_aggregation:
+    mode: last
+
+  decoder:
+    type: shallow_cnn
+    in_dim: 64
+    hidden_dim: 64
+    num_blocks: 2
+    dropout: 0.1
+    norm: groupnorm
+    activation: silu
+
+  heads:
+    surface:
+      activation: none
+    canopy:
+      activation: none
+    mask:
+      activation: logits
+    energy:
+      activation: none
+
+  auxiliary:
+    fire_support_head:
+      enabled: true
+      source: fused_local
+      weight: 0.2
+      loss: bce_dice
+      detach_source: false
+
+training:
+  loss:
+    surface:
+      type: huber
+      weight: 1.0
+      delta: 1.0
+    canopy:
+      type: huber
+      weight: 1.0
+      delta: 1.0
+    mask:
+      type: bce_dice
+      weight: 5.0
+      bce_weight: 1.0
+      dice_weight: 1.0
+    energy:
+      type: huber
+      weight: 1.0
+      delta: 1.0
+    auxiliary_fire_support:
+      enabled: true
+      weight: 0.2

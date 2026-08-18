@@ -70,9 +70,127 @@ data:
   input_sequence_length: 5
   prediction_horizon: 10
 
+terrain:
+  enabled: true
+  required: true
+  copy_original_file: true
+  parser:
+    format: cawfe_terrain
+  features:
+    output_channels: 4
+    channels: [relative_elevation, slope_magnitude, slope_x, slope_y]
+    elevation_normalization: zscore
+    slope_magnitude_normalization: log1p_minmax
+    slope_xy_normalization: p99_abs_clip
+    slope_xy_clip_value: 1.0
+  quicklook:
+    enabled: true
+
+processed_dataset:
+  enabled: true
+  version: cawfe_engineered_v1
+  root: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1
+  save_raw_channels: true
+  save_engineered_channels: true
+  save_area_2d: true
+  save_quicklooks: true
+  frame_format: npz
+  compression: compressed
+  dtype: float32
+  overwrite: false
+  skip_existing: true
+  quicklook:
+    enabled: true
+    every_n_frames: 100
+    max_per_fire: 20
+  patch_index:
+    enabled: true
+    patch_size: 64
+    stride: 60
+    include_border_patches: true
+    min_valid_fraction: 0.0
+
 sequence:
   input_sequence_length: 5
   prediction_horizon: 10
+
+target_construction:
+  enabled: true
+  output_root: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1/targets
+  horizon: 10
+  current_frame_reference: last_input
+  threshold_estimation:
+    enabled: true
+    fit_split: train
+    percentile: 1.0
+    positive_only: true
+    min_positive_value:
+      energy_release_mw: 0.0
+      surface_consumed: 0.0
+      canopy_consumed: 0.0
+    max_samples_per_quantity: null
+    # Optional speed control: randomly process at most this many current/future
+    # frame pairs per train fire. null scans every valid pair.
+    max_frame_pairs_per_fire: null
+    output_dir: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1/thresholds
+    output_path: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1/thresholds/fire_mask_thresholds_latest.json
+    update_config: false
+    derived_config_path: configs/derived/default_with_fire_mask_thresholds.yaml
+  fire_mask:
+    method: threshold_union
+    energy_threshold_mw: null
+    surface_fuel_threshold: null
+    canopy_fuel_threshold: null
+    threshold_file: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1/thresholds/fire_mask_thresholds_latest.json
+    require_frozen_thresholds: true
+    save_dtype: bool
+  consumed_fuel:
+    clip_negative: true
+    clip_to_available_fuel: true
+  energy:
+    save_mw: true
+    save_log1p: true
+    use_area_2d: true
+
+temporal_sampling:
+  horizon: 10
+  sample_patterns:
+    consecutive5_h10:
+      enabled: true
+      input_offsets: [-4, -3, -2, -1, 0]
+      horizon: 10
+    single1_h10:
+      enabled: true
+      input_offsets: [0]
+      horizon: 10
+    sparse5_h10:
+      enabled: true
+      input_offsets: [-40, -30, -20, -10, 0]
+      horizon: 10
+  default_pattern: consecutive5_h10
+
+normalization:
+  enabled: true
+  output_dir: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1/normalization
+  stats_path: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1/normalization/latest_normalization.json
+  npz_path: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1/normalization/latest_normalization.npz
+  fit_split: train
+  apply_to_splits: [train, val, test]
+  compute_from: dynamic_patches
+  sample_pattern: consecutive5_h10
+  patch_index: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1/indices/patches/patches_64_stride60_border.jsonl
+  max_samples: null
+  eps: 1.0e-6
+
+dataloader:
+  source: processed_full_frames
+  sample_pattern: consecutive5_h10
+  patch_size: 64
+  normalize_inputs: true
+  single_frame_mode: as_is
+  return_terrain: auto
+  target_root: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1/targets
+  return_metadata: false
 
 # Legacy single-target channel index used by regression/segmentation utilities.
 # Options: any valid raw channel index in [0, C_raw - 1].
@@ -677,6 +795,7 @@ model:
   # - earthformer_lite
   # - st_mamba_lite
   # - weatherformer_lite
+  # - cawfe_latte (v1 end-to-end: encoders, fusion, temporal CNN, decoder, heads)
   architecture: convlstm_unet
   name: convlstm_unet
   input_sequence_length: 5
@@ -828,12 +947,136 @@ weatherformer_lite:
   gradient_checkpointing: false
   required_patch_divisibility: 16
 
+cawfe_latte:
+  enabled: true
+  version: v1_end_to_end
+  debug_prediction_head: false
+
+  input_channels: 129
+  input_sequence_length: 5
+  output_channels: 4
+  output_dim: 64
+  use_terrain_conditioning: true
+  terrain_encoder:
+    in_channels: 4
+    hidden_dim: 32
+    out_dim: 64
+    activation: gelu
+    norm: groupnorm
+  terrain_film:
+    dim: 64
+    use_scale: true
+    use_shift: true
+    scale_init_zero: true
+    shift_init_zero: true
+
+  atmosphere:
+    out_dim: 64
+    num_levels: 8
+    vars_per_level: 10
+    hidden_dim: 64
+    num_blocks: 2
+    vertical_mixing: attention
+
+  wind:
+    out_dim: 64
+    hidden_dim: 64
+    num_blocks: 2
+    u_var_index: 0
+    v_var_index: 1
+    w_var_index: 2
+    use_engineered_wind_channels: true
+    engineered_channel_keywords:
+      - wind
+      - speed
+      - direction
+      - dir_cos
+      - dir_sin
+      - updraft
+
+  fire_fuel:
+    out_dim: 64
+    hidden_dim: 64
+    num_blocks: 4
+    raw_fuel_channels: [84, 85]
+    engineered_channel_keywords:
+      - fuel_delta
+      - step_consumed
+      - cumulative_consumed
+      - consumed
+      - active
+      - fire
+
+  flux_energy:
+    out_dim: 64
+    hidden_dim: 64
+    num_blocks: 2
+    raw_flux_channels: [80, 81, 82, 83]
+    engineered_channel_keywords:
+      - flux
+      - heat
+      - energy
+
+  fusion:
+    dim: 64
+    num_heads: 4
+    dropout: 0.1
+    use_layer_norm: true
+    residual: true
+    query_source: fire_fuel
+    key_value_sources:
+      - atmosphere
+      - wind
+      - flux_energy
+
+  backbone:
+    type: temporal_cnn
+    dim: 64
+    num_blocks: 3
+    temporal_kernel_size: 3
+    spatial_kernel_size: 3
+    dropout: 0.1
+    residual: true
+    norm: groupnorm
+    activation: silu
+
+  temporal_aggregation:
+    mode: last
+
+  decoder:
+    type: shallow_cnn
+    in_dim: 64
+    hidden_dim: 64
+    num_blocks: 2
+    dropout: 0.1
+    norm: groupnorm
+    activation: silu
+
+  heads:
+    surface:
+      activation: none
+    canopy:
+      activation: none
+    mask:
+      activation: logits
+    energy:
+      activation: none
+
+  auxiliary:
+    fire_support_head:
+      enabled: true
+      source: fused_local
+      weight: 0.2
+      loss: bce_dice
+      detach_source: false
+
 architectures:
   available:
     - convlstm_unet
     - earthformer_lite
     - cawfe_st_mamba
     - weatherformer_lite
+    - cawfe_latte
     - current_frame_unet
     - temporal_3d_unet
     - convgru_unet
@@ -850,11 +1093,12 @@ normalization:
   # Saved normalization-stats files. compute_normalization.py writes
   # timestamped train_normalization_stats_<config>_<timestamp>.json/.npz files
   # and updates these normalization_stats aliases in the patch-cache directory.
-  output_dir: ${paths.patch_cache_root}
-  path: ${paths.patch_cache_root}/normalization_stats.json
-  stats_path: ${paths.patch_cache_root}/normalization_stats.json
-  npz_path: ${paths.patch_cache_root}/normalization_stats.npz
+  output_dir: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1/normalization
+  path: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1/normalization/latest_normalization.json
+  stats_path: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1/normalization/latest_normalization.json
+  npz_path: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1/normalization/latest_normalization.npz
   fit_split: train
+  sample_pattern: consecutive5_h10
   apply_to_splits:
     - train
     - val
@@ -864,7 +1108,7 @@ normalization:
 
   # Compute normalization from the precomputed train patch cache.
   # Options: true, false
-  compute_from_patch_cache: true
+  compute_from_patch_cache: false
 
   # Normalization sampling mode.
   # Supported options:
@@ -892,7 +1136,7 @@ normalization:
 
   # Apply input normalization on the training device when stats are available.
   # Options: cpu, cuda/device/gpu, none
-  input_normalization_device: cuda
+  input_normalization_device: cpu
 
   # Use in-place CUDA normalization to avoid extra GPU allocations.
   in_place_cuda_normalization: true
@@ -1023,6 +1267,27 @@ training:
     keep_last_n_epoch_checkpoints: 3
 
   loss:
+    surface:
+      type: huber
+      weight: 1.0
+      delta: 1.0
+    canopy:
+      type: huber
+      weight: 1.0
+      delta: 1.0
+    mask:
+      type: bce_dice
+      weight: 5.0
+      bce_weight: 1.0
+      dice_weight: 1.0
+    energy:
+      type: huber
+      weight: 1.0
+      delta: 1.0
+    auxiliary_fire_support:
+      enabled: true
+      weight: 0.2
+
     background_suppression:
       enabled: true
       architectures: [convlstm_unet]
@@ -1114,7 +1379,7 @@ training:
   # Run input normalization after the batch is moved to the training device.
   # This avoids per-sample CPU normalization in DataLoader workers.
   # Options: cpu, cuda/device/gpu, none
-  input_normalization_device: cuda
+  input_normalization_device: cpu
 
   # Number of micro-batches to accumulate before each optimizer step.
   # Options: integer >= 1

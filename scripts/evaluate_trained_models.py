@@ -32,6 +32,8 @@ from src.evaluation.qualitative import (
 )
 from src.training.checkpoints import load_checkpoint
 from src.training.input_normalization import normalization_config, resolve_input_normalization_stats_path
+from src.training.model_outputs import extract_prediction
+from src.training.batch_utils import unpack_batch
 from src.training.train import _ensure_config_path
 
 
@@ -54,8 +56,8 @@ ARCHITECTURE_ALIASES = {
 	"cawfe_st_mamba": "st_mamba_lite",
 }
 BASELINE_ARCHITECTURES = ["persistence", "linear_extrapolation"]
-REMOVED_MODEL_ARCHITECTURES = {"cawfe_latte", "cawfe_latte_lite"}
-REMOVED_MODEL_ARCHITECTURE_MESSAGE = "The old CAWFE-Latte implementation has been removed. A new design will be added later."
+REMOVED_MODEL_ARCHITECTURES = {"cawfe_latte_lite"}
+REMOVED_MODEL_ARCHITECTURE_MESSAGE = "The old CAWFE-Latte-Lite implementation has been removed. A new design will be added later."
 SUPPORTED_MODEL_ARCHITECTURES = {
 	"all",
 	"baseline",
@@ -64,6 +66,7 @@ SUPPORTED_MODEL_ARCHITECTURES = {
 	"linear_extrapolation",
 	*DEFAULT_ARCHITECTURES,
 	*ARCHITECTURE_ALIASES.keys(),
+	"cawfe_latte",
 }
 DISPLAY_NAMES = {
 	"persistence": "Persistence",
@@ -73,6 +76,7 @@ DISPLAY_NAMES = {
 	"st_mamba_lite": "CAWFE-ST-Mamba",
 	"cawfe_st_mamba": "CAWFE-ST-Mamba",
 	"weatherformer_lite": "WeatherFormer-lite",
+	"cawfe_latte": "CAWFE-Latte Encoders + Fusion",
 }
 
 PAPER_COLUMNS = [
@@ -1373,10 +1377,12 @@ def _run_qualitative_learned_predictions(
 	with torch.inference_mode():
 		for dataset_index in sample_indices:
 			item = dataset[int(dataset_index)]
-			if not isinstance(item, (tuple, list)) or len(item) < 2:
+			if isinstance(item, dict):
+				x = item["x"]; target = coerce_chw4(item["y"]); terrain = item.get("terrain")
+			elif isinstance(item, (tuple, list)) and len(item) >= 2:
+				x = item[0]; target = coerce_chw4(item[1]); terrain = None
+			else:
 				raise TypeError("Qualitative dataset items must contain at least input and target tensors.")
-			x = item[0]
-			target = coerce_chw4(item[1])
 			if not torch.is_tensor(x):
 				x = torch.as_tensor(x, dtype=torch.float32)
 			if x.ndim == 4:
@@ -1386,13 +1392,11 @@ def _run_qualitative_learned_predictions(
 			else:
 				raise ValueError(f"Expected input sample shape (T, C, H, W), got {tuple(x.shape)}.")
 			x_batch = x_batch.to(device, non_blocking=True)
+			terrain_batch = terrain.to(device, non_blocking=True) if terrain is not None else None
 			x_batch = apply_input_normalization(x_batch, input_normalizer, config)
 			with autocast_context(device, amp_dtype):
-				output = model(x_batch)
-			if isinstance(output, (tuple, list)):
-				if not output:
-					raise ValueError("Model returned an empty output tuple/list.")
-				output = output[0]
+				output = model(x_batch, terrain=terrain_batch) if terrain_batch is not None else model(x_batch)
+			output = extract_prediction(output)
 			if not torch.is_tensor(output):
 				raise TypeError(f"Model output must be a torch Tensor, got {type(output)!r}.")
 			prediction = coerce_chw4(output.detach().float().cpu())
