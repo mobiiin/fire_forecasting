@@ -49,10 +49,21 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
 			future_index = current_index + horizon
 			current_path = root / "fires" / fire_name / "frames" / f"frame_{current_index:06d}.npz"
 			future_path = root / "fires" / fire_name / "frames" / f"frame_{future_index:06d}.npz"
-			with np.load(current_path, allow_pickle=False) as current_archive, np.load(future_path, allow_pickle=False) as future_archive:
-				if "x_raw" not in current_archive or "x_raw" not in future_archive:
-					raise KeyError("Target construction requires x_raw in processed frame files; rebuild with save_raw_channels=true")
-				target = build_processed_target(current_archive["x_raw"], future_archive["x_raw"], area, config, thresholds=thresholds)
+			try:
+				with np.load(current_path, allow_pickle=False) as current_archive, np.load(future_path, allow_pickle=False) as future_archive:
+					if "x_raw" not in current_archive or "x_raw" not in future_archive:
+						raise KeyError("Target construction requires x_raw in processed frame files; rebuild with save_raw_channels=true")
+					current_raw = current_archive["x_raw"]
+					future_raw = future_archive["x_raw"]
+			except Exception as exc:
+				raise RuntimeError(
+					f"Failed to read processed frame archive while building target for "
+					f"split={split!r} fire={fire_name!r} current_index={current_index} "
+					f"future_index={future_index}. "
+					f"current_path={current_path} future_path={future_path}. "
+					"The .npz is likely corrupt/truncated; rebuild engineered frames for this fire."
+				) from exc
+			target = build_processed_target(current_raw, future_raw, area, config, thresholds=thresholds)
 			out = fire_dir / f"target_current_{current_index:06d}_future_{future_index:06d}.npz"
 			np.savez_compressed(out, **target)
 			row = {"fire_name": fire_name, "split": split, "current_index": current_index, "future_index": future_index, "horizon": horizon, "path": str(out.relative_to(root)), "source_current_frame_path": str(current_path.relative_to(root)), "source_future_frame_path": str(future_path.relative_to(root)), "mask_thresholds": thresholds, "threshold_source": threshold_meta.get("source"), "threshold_file": threshold_meta.get("threshold_file"), "threshold_version": threshold_meta.get("threshold_version")}

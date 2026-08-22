@@ -135,6 +135,48 @@ def validate_checkpoint_model_compatibility(model, checkpoint: Mapping[str, Any]
 			)
 
 
+
+def load_model_state_dict_compatible(model, checkpoint: Mapping[str, Any], checkpoint_path: str | Path | None = None):
+	"""Load model weights while tolerating narrowly-known legacy CAWFE-Latte keys."""
+	state_dict = checkpoint.get("model_state_dict")
+	if not isinstance(state_dict, Mapping):
+		raise KeyError("Checkpoint does not contain a mapping model_state_dict.")
+	architecture = str(checkpoint.get("architecture", "")).lower()
+	if not architecture:
+		checkpoint_config = checkpoint.get("config", {})
+		if isinstance(checkpoint_config, Mapping):
+			model_config = checkpoint_config.get("model", {})
+			if isinstance(model_config, Mapping):
+				architecture = str(model_config.get("architecture", model_config.get("name", ""))).lower()
+	model_architecture = str(getattr(model, "architecture", getattr(model, "name", ""))).lower()
+	if not model_architecture:
+		model_architecture = model.__class__.__name__.lower()
+	legacy_unexpected: set[str] = set()
+	if architecture == "cawfe_latte" or "cawfelatte" in model_architecture or "cawfe_latte" in model_architecture:
+		legacy_unexpected.add("alignment.spatial_pos")
+	if legacy_unexpected:
+		result = model.load_state_dict(state_dict, strict=False)
+		missing = list(getattr(result, "missing_keys", []))
+		unexpected = list(getattr(result, "unexpected_keys", []))
+		unhandled_unexpected = [key for key in unexpected if key not in legacy_unexpected]
+		if missing or unhandled_unexpected:
+			path_text = f" ({Path(checkpoint_path).expanduser().resolve()})" if checkpoint_path is not None else ""
+			raise RuntimeError(
+				"Checkpoint state_dict is incompatible with the current model"
+				f"{path_text}. missing_keys={missing} unexpected_keys={unhandled_unexpected}"
+			)
+		ignored = [key for key in unexpected if key in legacy_unexpected]
+		if ignored:
+			path_text = f" ({Path(checkpoint_path).expanduser().resolve()})" if checkpoint_path is not None else ""
+			warnings.warn(
+				"Ignoring legacy CAWFE-Latte checkpoint key(s)"
+				f"{path_text}: {ignored}. This is expected for older alignment checkpoints.",
+				RuntimeWarning,
+				stacklevel=2,
+			)
+		return result
+	return model.load_state_dict(state_dict)
+
 def latest_and_best_checkpoint_paths(path: str | Path) -> tuple[Path, Path]:
 	"""Return the latest and best checkpoint paths derived from a base path."""
 

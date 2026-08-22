@@ -16,8 +16,9 @@ except ImportError:  # pragma: no cover - environment-specific fallback
 from src.config import load_config
 from src.data.cache import target_definition_version, temporal_target_offsets
 from src.data.dataset import create_dataloaders, metadata_batch_to_list
+from src.training.batch_utils import unpack_batch
 from src.models.model_factory import build_model_from_config
-from src.training.checkpoints import load_checkpoint, validate_checkpoint_model_compatibility
+from src.training.checkpoints import load_checkpoint, load_model_state_dict_compatible, validate_checkpoint_model_compatibility
 from src.training.losses import extract_aux_outputs, extract_prediction, get_loss_function
 from src.training.metrics import compute_metrics
 from src.training.hardware import autocast_context, choose_amp_dtype
@@ -193,7 +194,7 @@ def evaluate_checkpoint_on_split(
 		else:
 			raise ValueError(message + "\nPass --allow_normalization_mismatch only for intentional compatibility/debug runs.")
 	validate_checkpoint_model_compatibility(model, checkpoint, resolved_checkpoint_path)
-	model.load_state_dict(checkpoint["model_state_dict"])
+	load_model_state_dict_compatible(model, checkpoint, resolved_checkpoint_path)
 	model.eval()
 	amp_dtype = choose_amp_dtype(config, device)
 
@@ -215,7 +216,8 @@ def evaluate_checkpoint_on_split(
 			y_batch = y_raw.to(device, non_blocking=True)
 			terrain_batch = terrain_raw.to(device, non_blocking=True) if terrain_raw is not None else None
 			x_batch = apply_input_normalization(x_batch, input_normalizer, config)
-			metadata_items = metadata_batch_to_list(batch[2], batch_size=int(x_batch.shape[0])) if len(batch) >= 3 else [{} for _ in range(int(x_batch.shape[0]))]
+			metadata_payload = batch_extra.get("metadata")
+			metadata_items = metadata_batch_to_list(metadata_payload, batch_size=int(x_batch.shape[0])) if metadata_payload is not None else [{} for _ in range(int(x_batch.shape[0]))]
 			with autocast_context(device, amp_dtype):
 				model_output = model(x_batch, terrain=terrain_batch) if terrain_batch is not None else model(x_batch)
 			y_pred = extract_prediction(model_output)

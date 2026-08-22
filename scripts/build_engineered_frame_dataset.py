@@ -201,9 +201,17 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
 		frame_rows = []
 		for local, frame_path in enumerate(tqdm(selected_files, desc=f"{split}/{fire_name} frames", unit="frame", leave=False)):
 			out_path = frames_dir / f"frame_{local:06d}.npz"
+			rebuild_frame = True
 			if args.skip_existing and out_path.exists():
-				with np.load(out_path, allow_pickle=False) as z: x = np.asarray(z["x_engineered"])
-			else:
+				try:
+					with np.load(out_path, allow_pickle=False) as z:
+						x = np.asarray(z["x_engineered"])
+						if bool(pc.get("save_raw_channels", True)) and "x_raw" in z:
+							_ = np.asarray(z["x_raw"])
+					rebuild_frame = False
+				except Exception as exc:
+					logging.warning("Existing processed frame is unreadable and will be rebuilt: %s (%s: %s)", out_path, type(exc).__name__, exc)
+			if rebuild_frame:
 				raw = np.asarray(np.load(frame_path, allow_pickle=False), dtype=np.float32)
 				base = raw[:, :, input_indices]
 				eng = build_engineered_features(np.expand_dims(raw, 0), files, start_index=start + local, config=config, energy_geometry={"area_2d_m2": area})[0]

@@ -895,11 +895,17 @@ def _validate_shapes(x_batch: torch.Tensor, y_batch: torch.Tensor, pred: torch.T
 		raise ValueError(f"Prediction shape {tuple(pred.shape)} does not match target shape {tuple(y_batch.shape)}.")
 
 
-def _metadata_items(batch: Sequence[Any], batch_size: int) -> list[dict[str, Any]]:
-	if len(batch) < 3:
+def _metadata_items(batch: Sequence[Any] | Mapping[str, Any], batch_size: int) -> list[dict[str, Any]]:
+	if isinstance(batch, Mapping):
+		metadata_payload = batch.get("metadata")
+	elif len(batch) >= 3:
+		metadata_payload = batch[2]
+	else:
+		metadata_payload = None
+	if metadata_payload is None:
 		return [{} for _ in range(batch_size)]
 	try:
-		items = metadata_batch_to_list(batch[2], batch_size=batch_size)
+		items = metadata_batch_to_list(metadata_payload, batch_size=batch_size)
 	except Exception:
 		return [{} for _ in range(batch_size)]
 	if len(items) < batch_size:
@@ -1829,10 +1835,11 @@ def main() -> None:
 		for batch_index, batch in enumerate(selected_loader):
 			if batch_index >= int(args.num_batches):
 				break
-			if not isinstance(batch, (tuple, list)) or len(batch) < 2:
-				raise TypeError("Expected DataLoader batches with at least input and target tensors.")
-			x_batch = batch[0].to(device, non_blocking=True)
-			y_batch = batch[1].to(device, non_blocking=True)
+			x_raw, y_raw, batch_extra = unpack_batch(batch)
+			terrain_raw = batch_extra.get("terrain")
+			x_batch = x_raw.to(device, non_blocking=True)
+			y_batch = y_raw.to(device, non_blocking=True)
+			terrain_batch = terrain_raw.to(device, non_blocking=True) if terrain_raw is not None else None
 			raw_x_for_comparison = x_batch.clone() if bool(args.compare_without_normalization) and normalizer is not None else None
 			normalization_row: dict[str, Any] = {"batch_index": int(batch_index), "normalizer_applied": normalizer is not None}
 			normalization_row.update(input_batch_summary(x_batch, prefix="raw_x"))
@@ -1845,7 +1852,7 @@ def main() -> None:
 			pred = pred.float()
 			if raw_x_for_comparison is not None:
 				with autocast_context(device, amp_dtype):
-					raw_model_output = model(raw_x_for_comparison)
+					raw_model_output = model(raw_x_for_comparison, terrain=terrain_batch) if terrain_batch is not None else model(raw_x_for_comparison)
 				raw_pred, _raw_aux = _extract_prediction_and_aux(raw_model_output)
 				raw_pred = raw_pred.float()
 				comparison_row: dict[str, Any] = {"batch_index": int(batch_index)}

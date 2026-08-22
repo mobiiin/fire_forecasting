@@ -30,7 +30,7 @@ from src.evaluation.qualitative import (
 	save_qualitative_summary_image,
 	select_qualitative_sample_indices,
 )
-from src.training.checkpoints import load_checkpoint
+from src.training.checkpoints import load_checkpoint, load_model_state_dict_compatible
 from src.training.input_normalization import normalization_config, resolve_input_normalization_stats_path
 from src.training.model_outputs import extract_prediction
 from src.training.batch_utils import unpack_batch
@@ -1324,7 +1324,7 @@ def _run_qualitative_learned_predictions(
 		_validate_checkpoint_sequence,
 	)
 	from src.models.model_factory import build_model_from_config
-	from src.training.checkpoints import validate_checkpoint_model_compatibility
+	from src.training.checkpoints import load_model_state_dict_compatible, validate_checkpoint_model_compatibility
 	from src.training.hardware import autocast_context, choose_amp_dtype
 	from src.training.input_normalization import (
 		apply_input_normalization,
@@ -1369,7 +1369,7 @@ def _run_qualitative_learned_predictions(
 		else:
 			raise ValueError(message + "\nPass --allow_normalization_mismatch only for intentional compatibility/debug runs.")
 	validate_checkpoint_model_compatibility(model, checkpoint, checkpoint_path)
-	model.load_state_dict(checkpoint["model_state_dict"])
+	load_model_state_dict_compatible(model, checkpoint, checkpoint_path)
 	model.eval()
 	amp_dtype = choose_amp_dtype(config, device)
 
@@ -1393,6 +1393,8 @@ def _run_qualitative_learned_predictions(
 				raise ValueError(f"Expected input sample shape (T, C, H, W), got {tuple(x.shape)}.")
 			x_batch = x_batch.to(device, non_blocking=True)
 			terrain_batch = terrain.to(device, non_blocking=True) if terrain is not None else None
+			if terrain_batch is not None and terrain_batch.ndim == 3:
+				terrain_batch = terrain_batch.unsqueeze(0)
 			x_batch = apply_input_normalization(x_batch, input_normalizer, config)
 			with autocast_context(device, amp_dtype):
 				output = model(x_batch, terrain=terrain_batch) if terrain_batch is not None else model(x_batch)
@@ -1499,18 +1501,45 @@ def run_qualitative_mode(args: argparse.Namespace | None = None) -> Path:
 	learned_targets, baseline_targets, all_model_mode = _resolve_requested_targets(args.model_architecture, include_baselines=bool(args.include_baselines))
 	_validate_checkpoint_arg(args.checkpoint, learned_targets, baseline_targets, args.model_architecture)
 	runs_root = Path(args.runs_root).expanduser().resolve()
-	base_context = _build_qualitative_loader_context(args.config, args.split, config_override=_num_worker_override(args.num_workers))
+	warnings_list: list[str] = []
+	failures: list[dict[str, Any]] = []
+	skipped_models: list[str] = []
+	successful_models: list[str] = []
+	selected_models: list[dict[str, Any]] = []
+	selected_learned = _resolve_qualitative_learned_runs(
+		args=args,
+		learned_targets=learned_targets,
+		all_model_mode=all_model_mode,
+		runs_root=runs_root,
+		logger=logger,
+		warnings_list=warnings_list,
+		skipped_models=skipped_models,
+		selected_models=selected_models,
+	)
+	sample_config_path = args.config
+	sample_config_override: Mapping[str, Any] = _num_worker_override(args.num_workers)
+	if not baseline_targets and len(selected_learned) == 1:
+		selected_architecture, selected_run, _selection_source = selected_learned[0]
+		if selected_run.resolved_config_path not in (None, "", "null"):
+			sample_config_path = selected_run.resolved_config_path
+			sample_config_override = _model_config_override(
+				selected_architecture,
+				selected_run.checkpoint_path,
+				args.num_workers,
+				run_dir=selected_run.run_dir,
+			)
+			logger.info(
+				"Selecting qualitative samples from checkpoint resolved config %s instead of CLI base config %s.",
+				sample_config_path,
+				args.config,
+			)
+	base_context = _build_qualitative_loader_context(sample_config_path, args.split, config_override=sample_config_override)
 	base_config = base_context["config"]
 	sequence_setup = _sequence_metadata(base_config)
 	normalization_setup = _normalization_setup_metadata(base_config)
 	baseline_settings = dict(base_config.get("baselines", {})) if isinstance(base_config.get("baselines"), Mapping) else {}
 	dataset = base_context["dataset"]
 	dataset_length = len(dataset)
-	warnings_list: list[str] = []
-	failures: list[dict[str, Any]] = []
-	skipped_models: list[str] = []
-	successful_models: list[str] = []
-	selected_models: list[dict[str, Any]] = []
 	if args.max_batches is not None:
 		warnings_list.append("--max_batches is ignored in qualitative mode; use --num_samples to control image count.")
 	if int(args.num_samples) > dataset_length:
@@ -1564,16 +1593,6 @@ def run_qualitative_mode(args: argparse.Namespace | None = None) -> Path:
 				raise
 			warnings_list.append(f"Baseline {method_name} failed: {exc}")
 
-	selected_learned = _resolve_qualitative_learned_runs(
-		args=args,
-		learned_targets=learned_targets,
-		all_model_mode=all_model_mode,
-		runs_root=runs_root,
-		logger=logger,
-		warnings_list=warnings_list,
-		skipped_models=skipped_models,
-		selected_models=selected_models,
-	)
 	for architecture, best_run, selection_source in selected_learned:
 		logger.info("Running qualitative learned predictions for %s from %s", architecture, best_run.checkpoint_path)
 		metadata = {

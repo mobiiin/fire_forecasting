@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import platform
 from pathlib import Path
 from typing import Any, Mapping
@@ -28,11 +29,12 @@ from src.data.dataset import (
 )
 from src.data.discovery import discover_multiple_datasets
 from src.data.spatial_transforms import infer_with_external_test_spatial_handling
-from src.models.convlstm_unet import build_model_from_config
+from src.models.model_factory import build_model_from_config
 from src.training.input_normalization import apply_input_normalization, build_input_normalizer_for_loader, normalization_metadata_from_loader
 from src.training.losses import get_loss_function
 from src.training.batch_utils import unpack_batch
 from src.training.metrics import compute_metrics
+from src.training.model_outputs import extract_prediction
 from src.training.train import resolve_validation_policy
 
 
@@ -162,10 +164,31 @@ def main() -> None:
 		checks = [root, root / "dataset_manifest.json", root / "channel_manifest.json", root / "indices" / "temporal" / f"samples_{pattern}.jsonl"]
 		for path in checks:
 			if not path.exists(): raise FileNotFoundError(f"Processed dataset sanity check failed; missing: {path}")
+		manifest = json.loads((root / "dataset_manifest.json").read_text(encoding="utf-8"))
+		channel_manifest = json.loads((root / "channel_manifest.json").read_text(encoding="utf-8"))
+		if int(channel_manifest.get("num_channels", channel_manifest.get("channels", 0) if isinstance(channel_manifest.get("channels"), int) else len(channel_manifest.get("channels", [])))) <= 0:
+			print("WARNING: channel_manifest did not expose a positive channel count; continuing with DataLoader inference.")
+		manifest_split_fires = {}
+		manifest_splits = manifest.get("splits", {}) if isinstance(manifest.get("splits"), Mapping) else {}
+		for split in ("train", "val", "test"):
+			fires = manifest_splits.get(f"{split}_fires", manifest_splits.get(split, []))
+			manifest_split_fires[split] = {str(fire) for fire in fires} if isinstance(fires, list) else set()
+			if not manifest_split_fires[split]:
+				print(f"WARNING: dataset_manifest has no {split} fire list; DataLoader split records will be authoritative.")
 		train_loader, val_loader, test_loader = create_dataloaders(config)
 		if not len(train_loader.dataset) or not len(val_loader.dataset) or not len(test_loader.dataset): raise ValueError("Processed dataset sanity check requires non-empty train/val/test splits.")
+		loader_fire_sets = {split: {str(record.get("fire_name")) for record in loader.dataset.records} for split, loader in (("train", train_loader), ("val", val_loader), ("test", test_loader))}
+		for split, manifest_fires in manifest_split_fires.items():
+			if manifest_fires and loader_fire_sets[split] != manifest_fires:
+				raise ValueError(f"Processed {split} fires in sample index do not match dataset_manifest: index={sorted(loader_fire_sets[split])} manifest={sorted(manifest_fires)}")
+		for split, fire_set in loader_fire_sets.items():
+			for fire in sorted(fire_set):
+				terrain_path = root / "fires" / fire / "terrain" / "terrain_features.npy"
+				if bool(config.get("cawfe_latte", {}).get("use_terrain_conditioning", False)) and not terrain_path.exists():
+					raise FileNotFoundError(f"Missing terrain features for {split} fire {fire}: {terrain_path}")
 		batch = next(iter(train_loader)); x_batch, y_batch, batch_extra = unpack_batch(batch); terrain_batch = batch_extra.get("terrain")
 		if x_batch.ndim != 5 or y_batch.ndim != 4 or y_batch.shape[1] != 4: raise ValueError(f"Processed batch shapes must be X=(B,T,C,H,W), y=(B,4,H,W); got {tuple(x_batch.shape)}, {tuple(y_batch.shape)}")
+		if not torch.isfinite(x_batch).all(): raise ValueError("Processed inputs contain NaN/Inf values.")
 		expected_t = int(config.get("input_sequence_length", config.get("training", {}).get("input_sequence_length", x_batch.shape[1])))
 		if int(x_batch.shape[1]) != expected_t: raise ValueError(f"Processed input T={x_batch.shape[1]} does not match configured T={expected_t}")
 		mask_values = torch.unique(y_batch[:, 2])
@@ -176,15 +199,23 @@ def main() -> None:
 		if not getattr(train_loader.dataset, "inputs_are_normalized", False) and bool(config.get("dataloader", {}).get("normalize_inputs", True)): raise ValueError("Processed inputs were not normalized in the Dataset.")
 		model = build_model_from_config(config, input_channels=int(x_batch.shape[2]))
 		if bool(config.get("cawfe_latte", {}).get("use_terrain_conditioning", False)) and terrain_batch is None: raise ValueError("CAWFE-Latte terrain conditioning is enabled but sanity batch has no terrain.")
-		with torch.no_grad(): prediction = model(x_batch, terrain=terrain_batch) if terrain_batch is not None else model(x_batch)
+		if terrain_batch is not None:
+			if terrain_batch.ndim != 4 or int(terrain_batch.shape[1]) != 4 or tuple(terrain_batch.shape[-2:]) != tuple(y_batch.shape[-2:]): raise ValueError(f"Terrain batch must be B,4,H,W aligned with targets; got terrain={tuple(terrain_batch.shape)} y={tuple(y_batch.shape)}")
+			if not torch.isfinite(terrain_batch).all(): raise ValueError("Terrain batch contains NaN/Inf values.")
+			ranges = [(0.0, 1.0), (0.0, 1.0), (-1.0, 1.0), (-1.0, 1.0)]
+			for channel, (lo, hi) in enumerate(ranges):
+				ch = terrain_batch[:, channel]
+				if float(ch.min()) < lo - 1.0e-4 or float(ch.max()) > hi + 1.0e-4: raise ValueError(f"Terrain channel {channel} outside expected range [{lo}, {hi}]: min={float(ch.min())} max={float(ch.max())}")
+		with torch.no_grad(): model_output = model(x_batch, terrain=terrain_batch) if terrain_batch is not None else model(x_batch)
+		prediction = extract_prediction(model_output)
 		if tuple(prediction.shape) != (int(x_batch.shape[0]), 4, int(y_batch.shape[2]), int(y_batch.shape[3])): raise ValueError(f"Processed model output shape mismatch: {tuple(prediction.shape)}")
 		criterion = get_loss_function(config)
-		loss_result = criterion(prediction, y_batch)
+		loss_result = criterion(model_output, y_batch)
 		loss_value = loss_result["total_loss"] if isinstance(loss_result, Mapping) else loss_result
 		if not torch.isfinite(loss_value): raise ValueError("Processed loss is not finite.")
 		metric_values = compute_metrics(prediction, y_batch, config)
 		if args.deep:
-			model.zero_grad(set_to_none=True); deep_prediction = model(x_batch, terrain=terrain_batch) if terrain_batch is not None else model(x_batch); deep_loss_result = criterion(deep_prediction, y_batch); deep_loss = deep_loss_result["total_loss"] if isinstance(deep_loss_result, Mapping) else deep_loss_result; deep_loss.backward()
+			model.zero_grad(set_to_none=True); deep_output = model(x_batch, terrain=terrain_batch) if terrain_batch is not None else model(x_batch); deep_loss_result = criterion(deep_output, y_batch); deep_loss = deep_loss_result["total_loss"] if isinstance(deep_loss_result, Mapping) else deep_loss_result; deep_loss.backward()
 		print("Data pipeline mode: processed_full_frames")
 		print(f"  root: {root}")
 		print(f"  pattern: {pattern}")

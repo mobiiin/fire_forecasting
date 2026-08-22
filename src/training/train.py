@@ -916,6 +916,35 @@ def _run_epoch(
 						f"Model output channels {y_pred.shape[1]} do not match target channels {y_batch.shape[1]}."
 					)
 
+				if batch_number == 1:
+					with torch.no_grad():
+						debug_parts = [
+							f"{desc} first batch debug",
+							f"x_shape={tuple(x_batch.shape)}",
+							f"terrain_shape={tuple(terrain_batch.shape) if terrain_batch is not None else None}",
+							f"prediction_shape={tuple(y_pred.shape)}",
+						]
+						if y_pred.shape[1] >= 3:
+							mask_logits = y_pred[:, 2].detach().float()
+							finite_mask_logits = mask_logits[torch.isfinite(mask_logits)]
+							if finite_mask_logits.numel():
+								debug_parts.append(
+									f"mask_logits_minmax=({float(finite_mask_logits.min().item()):.6g}, {float(finite_mask_logits.max().item()):.6g})"
+								)
+						if y_batch.shape[1] >= 3:
+							target_mask = y_batch[:, 2].detach().float()
+							finite_target_mask = target_mask[torch.isfinite(target_mask)]
+							if finite_target_mask.numel():
+								debug_parts.append(
+									f"target_mask_minmax=({float(finite_target_mask.min().item()):.6g}, {float(finite_target_mask.max().item()):.6g})"
+								)
+								debug_parts.append(f"target_mask_active_fraction={float((target_mask > 0.5).float().mean().item()):.6g}")
+					message = " | ".join(debug_parts)
+					if logger is not None:
+						logger.info(message)
+					else:
+						print(message)
+
 				loss_start_time = time.perf_counter()
 				loss_result = criterion(model_output, y_batch)
 				loss, batch_loss_components = _coerce_loss_result(loss_result)

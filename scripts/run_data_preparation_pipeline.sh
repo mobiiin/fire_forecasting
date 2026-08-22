@@ -7,18 +7,18 @@ Usage: bash scripts/run_data_preparation_pipeline.sh CONFIG [OPTIONS]
 
 Options:
   --derived-config PATH       Derived threshold config path
-  --percentile FLOAT          Threshold percentile (default: 1.0)
-  --pattern PATTERN           Normalization/sample pattern (default: consecutive5_h10)
+  --percentile FLOAT          Threshold percentile (default: 5.0)
+  --pattern PATTERN           Normalization/sample pattern (default: sparse5_h10)
   --all-patterns              Build all enabled temporal patterns (default)
   --skip-engineered           Skip engineered full-frame build
   --skip-thresholds           Skip threshold estimation
   --skip-targets              Skip target construction
-  --skip-patches              Skip patch-index construction
+  --skip-patches              Skip patch-index construction; otherwise patch index metadata is rebuilt
   --skip-samples              Skip temporal sample-index construction
   --skip-normalization        Skip normalization
   --skip-inspection           Skip inspection
   --make-quicklooks           Save debug visualizations
-  --overwrite                 Pass overwrite where supported
+  --overwrite                 Pass overwrite where supported; disables engineered --skip_existing
   --max-frames-per-fire N     Debug-only frame limit
   --dry-run                   Print commands without running them
   --help                      Show this help
@@ -43,7 +43,7 @@ CONFIG_STEM="${CONFIG_STEM%.*}"
 
 DERIVED_CONFIG=""
 PERCENTILE="5.0"
-PATTERN="single1_h10"
+PATTERN="sparse5_h10"
 ALL_PATTERNS=1
 MAKE_QUICKLOOKS=0
 DRY_RUN=0
@@ -150,13 +150,126 @@ run_cmd() {
     "$@"
 }
 
+normalization_output_dir() {
+    python - "$1" <<'PY'
+import sys
+from pathlib import Path
+from src.config import load_config
+
+config_path = Path(sys.argv[1]).resolve()
+config = load_config(str(config_path))
+processed = config.get("processed_dataset", {}) if isinstance(config.get("processed_dataset"), dict) else {}
+root = Path(processed.get("root", "/scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1")).expanduser()
+if not root.is_absolute():
+    root = (config_path.parent / root).resolve()
+normalization = config.get("normalization", {}) if isinstance(config.get("normalization"), dict) else {}
+output = Path(normalization.get("output_dir", root / "normalization")).expanduser()
+if not output.is_absolute():
+    output = root / output
+print(output.resolve())
+PY
+}
+
+verify_normalization_outputs() {
+    local config="$1"
+    local pattern="$2"
+    local pattern_alias="${pattern//\//_}"
+    local norm_dir
+    norm_dir="$(normalization_output_dir "$config")"
+    local json_path="$norm_dir/latest_normalization_${pattern_alias}.json"
+    local npz_path="$norm_dir/latest_normalization_${pattern_alias}.npz"
+
+    echo
+    echo "Verifying normalization aliases for pattern '${pattern}' in ${norm_dir}"
+    if [[ ! -s "$json_path" || ! -s "$npz_path" ]]; then
+        echo "ERROR: Expected normalization alias files were not created:" >&2
+        echo "  $json_path" >&2
+        echo "  $npz_path" >&2
+        echo "Re-run manually with:" >&2
+        echo "  python scripts/compute_processed_dataset_normalization.py --config $config --pattern $pattern" >&2
+        exit 1
+    fi
+    python - "$json_path" "$pattern" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+json_path = Path(sys.argv[1])
+expected_pattern = sys.argv[2]
+payload = json.loads(json_path.read_text())
+actual_pattern = payload.get("sample_pattern")
+if actual_pattern != expected_pattern:
+    raise SystemExit(
+        f"Normalization alias {json_path} has sample_pattern={actual_pattern!r}, "
+        f"expected {expected_pattern!r}."
+    )
+print(f"Verified normalization alias: {json_path}")
+PY
+}
+
+
+verify_temporal_sample_index_fires() {
+    local config="$1"
+    local pattern="$2"
+    python - "$config" "$pattern" <<'PY'
+import json
+import sys
+from pathlib import Path
+from src.config import load_config
+
+config_path = Path(sys.argv[1]).resolve()
+pattern_arg = sys.argv[2]
+config = load_config(str(config_path))
+processed = config.get("processed_dataset", {}) if isinstance(config.get("processed_dataset"), dict) else {}
+root = Path(processed.get("root", "/scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1")).expanduser()
+if not root.is_absolute():
+    root = (config_path.parent / root).resolve()
+manifest_path = root / "dataset_manifest.json"
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+manifest_splits = manifest.get("splits", {}) if isinstance(manifest.get("splits"), dict) else {}
+patterns = ["consecutive5_h10", "single1_h10", "sparse5_h10"] if pattern_arg == "all" else [pattern_arg]
+failed = False
+for pattern in patterns:
+    sample_path = root / "indices" / "temporal" / f"samples_{pattern}.jsonl"
+    if not sample_path.exists():
+        print(f"ERROR: missing temporal sample index for pattern {pattern}: {sample_path}", file=sys.stderr)
+        failed = True
+        continue
+    index_fires = {"train": set(), "val": set(), "test": set()}
+    for line in sample_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        split = str(row.get("split"))
+        if split in index_fires:
+            index_fires[split].add(str(row.get("fire_name")))
+    for split in ("train", "val", "test"):
+        manifest_fires = manifest_splits.get(f"{split}_fires", manifest_splits.get(split, []))
+        manifest_fire_set = {str(fire) for fire in manifest_fires} if isinstance(manifest_fires, list) else set()
+        if manifest_fire_set and index_fires[split] != manifest_fire_set:
+            print(
+                f"ERROR: samples_{pattern}.jsonl {split} fires do not match dataset_manifest: "
+                f"index={sorted(index_fires[split])} manifest={sorted(manifest_fire_set)}",
+                file=sys.stderr,
+            )
+            failed = True
+if failed:
+    raise SystemExit(1)
+print(f"Verified temporal sample indices against dataset_manifest for pattern={pattern_arg}")
+PY
+}
+
 if [[ -n "$MAX_FRAMES_PER_FIRE" ]]; then
     echo "DEBUG MODE: max frames per fire is set. Dataset is incomplete."
 fi
 
 if [[ "$SKIP_ENGINEERED" == "0" ]]; then
     cmd=(python scripts/build_engineered_frame_dataset.py --config "$CONFIG")
-    [[ "$OVERWRITE" == "1" ]] && cmd+=(--overwrite)
+    if [[ "$OVERWRITE" == "1" ]]; then
+        cmd+=(--overwrite)
+    else
+        cmd+=(--skip_existing)
+    fi
     [[ -n "$MAX_FRAMES_PER_FIRE" ]] && cmd+=(--max_frames_per_fire "$MAX_FRAMES_PER_FIRE")
     run_cmd "${cmd[@]}"
 fi
@@ -195,19 +308,38 @@ if [[ "$SKIP_TARGETS" == "0" ]]; then
     run_cmd "${cmd[@]}"
 fi
 if [[ "$SKIP_PATCHES" == "0" ]]; then
-    cmd=(python scripts/build_patch_index.py --config "$TARGET_CONFIG")
-    [[ "$OVERWRITE" == "1" ]] && cmd+=(--overwrite)
+    # Patch indices are metadata derived from dataset_manifest/fire manifests.
+    # Always rebuild them on incremental dataset-prep reruns so newly added fires
+    # are included even while engineered frame generation uses --skip_existing.
+    cmd=(python scripts/build_patch_index.py --config "$TARGET_CONFIG" --overwrite)
     run_cmd "${cmd[@]}"
 fi
 if [[ "$SKIP_SAMPLES" == "0" ]]; then
     if [[ "$ALL_PATTERNS" == "1" ]]; then
         run_cmd python scripts/build_temporal_sample_index.py --config "$TARGET_CONFIG" --pattern all
+        SAMPLE_PATTERN_TO_VERIFY="all"
     else
         run_cmd python scripts/build_temporal_sample_index.py --config "$TARGET_CONFIG" --pattern "$PATTERN"
+        SAMPLE_PATTERN_TO_VERIFY="$PATTERN"
+    fi
+    if [[ "$DRY_RUN" == "0" ]]; then
+        if ! verify_temporal_sample_index_fires "$TARGET_CONFIG" "$SAMPLE_PATTERN_TO_VERIFY"; then
+            echo "Temporal sample indices are stale or incomplete. Rebuilding patch and temporal indices once..." >&2
+            run_cmd python scripts/build_patch_index.py --config "$TARGET_CONFIG" --overwrite
+            if [[ "$ALL_PATTERNS" == "1" ]]; then
+                run_cmd python scripts/build_temporal_sample_index.py --config "$TARGET_CONFIG" --pattern all
+            else
+                run_cmd python scripts/build_temporal_sample_index.py --config "$TARGET_CONFIG" --pattern "$PATTERN"
+            fi
+            verify_temporal_sample_index_fires "$TARGET_CONFIG" "$SAMPLE_PATTERN_TO_VERIFY"
+        fi
     fi
 fi
 if [[ "$SKIP_NORMALIZATION" == "0" ]]; then
     run_cmd python scripts/compute_processed_dataset_normalization.py --config "$TARGET_CONFIG" --pattern "$PATTERN"
+    if [[ "$DRY_RUN" == "0" ]]; then
+        verify_normalization_outputs "$TARGET_CONFIG" "$PATTERN"
+    fi
 fi
 if [[ "$SKIP_INSPECTION" == "0" ]]; then
     run_cmd python scripts/inspect_processed_dataset.py --config "$TARGET_CONFIG"

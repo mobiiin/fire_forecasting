@@ -218,6 +218,7 @@ def build_model_from_config(config: Mapping[str, Any], input_channels: int):
 			fire_fuel=section.get("fire_fuel", {}),
 			flux_energy=section.get("flux_energy", {}),
 			fusion=section.get("fusion", {}),
+			alignment=section.get("alignment", {}),
 			backbone=section.get("backbone", {}),
 			temporal_aggregation=section.get("temporal_aggregation", {}),
 			decoder=section.get("decoder", {}),

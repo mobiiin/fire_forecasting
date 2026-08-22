@@ -61,8 +61,10 @@ def test_cawfe_latte_v1_forward_returns_prediction_and_aux() -> None:
 def test_cawfe_latte_v1_return_features() -> None:
 	model = CAWFELatte(input_channels=CHANNELS, input_sequence_length=TIME, output_channels=4)
 	features = model(_x(), return_features=True)
-	for key in ("atmosphere", "wind", "fire_fuel", "flux_energy", "fused", "local"):
+	for key in ("atmosphere", "wind", "fire_fuel", "flux_energy", "fused", "fused_grid", "local"):
 		assert tuple(features[key].shape) == (BATCH, TIME, 64, HEIGHT, WIDTH)
+	for key in ("aligned_atmosphere", "aligned_wind", "aligned_fire_fuel", "aligned_flux_energy", "fused_tokens"):
+		assert tuple(features[key].shape) == (BATCH, TIME, HEIGHT * WIDTH, 64)
 	assert tuple(features["aggregated"].shape) == (BATCH, 64, HEIGHT, WIDTH)
 	assert tuple(features["decoded"].shape) == (BATCH, 64, HEIGHT, WIDTH)
 	assert tuple(features["prediction"].shape) == (BATCH, 4, HEIGHT, WIDTH)

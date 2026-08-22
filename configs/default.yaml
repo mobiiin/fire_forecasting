@@ -218,17 +218,17 @@ manual_fire_split:
   # These defaults are examples and should be updated to match the fires currently available in your mounted dataset tree.
   # train_fires:
   #   - ARCHIECREEK
-  #   - CALWOOD
-  #   - CAMP
+  #   - CALWOOD  wind driven
+  #   - CAMP wind driven
   #   - CARR_FIRENADO
   #   - CARR_GROWTHDAY
-  #   - CHIMNEYTOPS2
+  #   - CHIMNEYTOPS2 wind driven
   #   - CREEK
   #   - ESPERANZA
   #   - KING__period1__keepz_08
   #   - KING__period2__keepz_08
   #   - KING__period3__keepz_08
-  #   - MARSHALL
+  #   - MARSHALL  wind driven
   #   - MOSQUITO
   #   - NORTHCOMPLX
   #   - RIM__0820__keepz_08
@@ -238,17 +238,17 @@ manual_fire_split:
   #   - THOMAS__1208__keepz_08
   #   - THOMAS__1209__keepz_08
   #   - THOMAS__1210__keepz_08
-  #   - REDWOODVALLEY
+  #   - REDWOODVALLEY  wind driven
   #   - GLASS
   #   - LITTLEBEAR__lbvaa__keepz_08
   #   - LITTLEBEAR__lbvab__keepz_08
-  #   - LITTLEBEAR__lbvac__keepz_08
+  #   - LITTLEBEAR__lbvac__keepz_08 wind driven
 
   # val_fires:
   #   - EASTTROUBLESOME
   #   - PARKCTY_HYPOTHETICAL
-  #   - Tubbs
-  #   - WITCHCREEK
+  #   - Tubbs  wind driven
+  #   - WITCHCREEK 
 
   # test_fires:
   #   - MCKINNEY
@@ -261,12 +261,18 @@ manual_fire_split:
   train_fires:
     - THOMAS__1204__keepz_08
     - THOMAS__1208__keepz_08
+    - CALWOOD
+    - Tubbs
+    - REDWOODVALLEY
 
   val_fires:
     - THOMAS__1209__keepz_08
+    - WITCHCREEK 
+    - MARSHALL
 
   test_fires:
     - THOMAS__1210__keepz_08
+    - CHIMNEYTOPS2
 
 
 
@@ -970,6 +976,26 @@ cawfe_latte:
     scale_init_zero: true
     shift_init_zero: true
 
+  alignment:
+    enabled: true
+    spatial:
+      enabled: true
+      assert_same_grid: true
+      flatten_order: row_major
+      add_positional_embedding: true
+      learned_positional_embedding: true
+    distribution:
+      enabled: true
+      norm_type: layernorm
+      separate_norm_per_modality: true
+      eps: 1.0e-5
+    temporal:
+      enabled: true
+      max_time: 16
+      add_positional_embedding: true
+      learned_positional_embedding: true
+      shared_across_modalities: true
+
   atmosphere:
     out_dim: 64
     num_levels: 8
@@ -1018,6 +1044,7 @@ cawfe_latte:
       - energy
 
   fusion:
+    input_format: tokens
     dim: 64
     num_heads: 4
     dropout: 0.1

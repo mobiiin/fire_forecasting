@@ -152,10 +152,17 @@ def load_qualitative_samples(
 	samples: list[dict[str, Any]] = []
 	for sample_number, dataset_index in enumerate(indices):
 		item = dataset[int(dataset_index)]
-		if not isinstance(item, (tuple, list)) or len(item) < 2:
-			raise TypeError("Qualitative dataset items must contain at least input and target tensors.")
-		metadata = dict(item[2]) if len(item) >= 3 and isinstance(item[2], Mapping) else {}
-		target = coerce_chw4(item[1])
+		if isinstance(item, Mapping):
+			if "y" not in item:
+				raise KeyError("Qualitative mapping dataset items must contain a 'y' target tensor.")
+			metadata = dict(item.get("metadata", {})) if isinstance(item.get("metadata"), Mapping) else {}
+			target_source = item["y"]
+		elif isinstance(item, (tuple, list)) and len(item) >= 2:
+			metadata = dict(item[2]) if len(item) >= 3 and isinstance(item[2], Mapping) else {}
+			target_source = item[1]
+		else:
+			raise TypeError("Qualitative dataset items must contain at least input and target tensors or mapping keys 'x'/'y'.")
+		target = coerce_chw4(target_source)
 		record = selected_sample_record(
 			sample_number=sample_number,
 			dataset_index=int(dataset_index),

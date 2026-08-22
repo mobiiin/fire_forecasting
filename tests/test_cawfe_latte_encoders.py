@@ -13,6 +13,7 @@ from src.models.cawfe_latte import (  # noqa: E402
 	FireFuelEncoder,
 	FireQueryCrossAttentionFusion,
 	FluxEnergyEncoder,
+	MultimodalAlignment,
 	WindEncoder,
 )
 from src.models.model_factory import build_model_from_config  # noqa: E402
@@ -52,24 +53,26 @@ def test_flux_energy_encoder_output_shape() -> None:
 
 def test_fusion_output_shape_and_attention_shape() -> None:
 	fusion = FireQueryCrossAttentionFusion(dim=DIM, num_heads=4, dropout=0.0)
-	features = [torch.randn(BATCH, TIME, DIM, HEIGHT, WIDTH) for _ in range(4)]
-	z, weights = fusion(*features, return_attention=True)
-	assert tuple(z.shape) == (BATCH, TIME, DIM, HEIGHT, WIDTH)
-	assert tuple(weights.shape) == (BATCH, TIME, HEIGHT, WIDTH, 3)
+	tokens = [torch.randn(BATCH, TIME, HEIGHT * WIDTH, DIM) for _ in range(4)]
+	z, weights = fusion(*tokens, return_attention=True)
+	assert tuple(z.shape) == (BATCH, TIME, HEIGHT * WIDTH, DIM)
+	assert tuple(weights.shape) == (BATCH, TIME, HEIGHT * WIDTH, 3)
 
 
 def test_cawfe_latte_forward_return_features_keys() -> None:
 	model = CAWFELatte(input_channels=CHANNELS, input_sequence_length=TIME, output_dim=DIM)
 	features = model(_input(), return_features=True)
-	assert set(features) == {"atmosphere", "wind", "fire_fuel", "flux_energy", "fused"}
-	for value in features.values():
-		assert tuple(value.shape) == (BATCH, TIME, DIM, HEIGHT, WIDTH)
+	for key in ("atmosphere", "wind", "fire_fuel", "flux_energy", "fused", "fused_grid", "local"):
+		assert tuple(features[key].shape) == (BATCH, TIME, DIM, HEIGHT, WIDTH)
+	for key in ("aligned_atmosphere", "aligned_wind", "aligned_fire_fuel", "aligned_flux_energy", "fused_tokens"):
+		assert tuple(features[key].shape) == (BATCH, TIME, HEIGHT * WIDTH, DIM)
+	assert features["spatial_shape"] == (HEIGHT, WIDTH)
 
 
 def test_cawfe_latte_attention_weights_are_driver_modalities() -> None:
 	model = CAWFELatte(input_channels=CHANNELS, input_sequence_length=TIME, output_dim=DIM)
 	features = model(_input(), return_features=True, return_attention=True)
-	assert tuple(features["fusion_attention"].shape) == (BATCH, TIME, HEIGHT, WIDTH, 3)
+	assert tuple(features["fusion_attention"].shape) == (BATCH, TIME, HEIGHT * WIDTH, 3)
 	assert FireQueryCrossAttentionFusion.modalities == ("atmosphere", "wind", "flux_energy")
 
 

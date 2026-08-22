@@ -6,6 +6,7 @@ atmosphere, wind, fire/fuel, flux/energy encoders and fire-query modality fusion
 
 from __future__ import annotations
 
+import contextlib
 import math
 import warnings
 from types import SimpleNamespace
@@ -39,6 +40,57 @@ def _as_str_list(values: Sequence[Any] | None) -> list[str]:
 	if values is None:
 		return []
 	return [str(value).lower() for value in values]
+
+
+def _manual_multihead_attention(
+	module: nn.MultiheadAttention,
+	query: torch.Tensor,
+	key: torch.Tensor,
+	value: torch.Tensor,
+	*,
+	training: bool,
+	need_weights: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+	"""Small-sequence MHA using explicit matmul/softmax instead of SDPA kernels."""
+	if query.ndim != 3 or key.ndim != 3 or value.ndim != 3:
+		raise ValueError("Manual MHA expects batch-first B,L,D tensors.")
+	if key.shape != value.shape:
+		raise ValueError(f"Manual MHA key/value shapes differ: key={tuple(key.shape)} value={tuple(value.shape)}")
+	embed_dim = int(module.embed_dim)
+	num_heads = int(module.num_heads)
+	head_dim = embed_dim // num_heads
+	if embed_dim % num_heads != 0:
+		raise ValueError(f"embed_dim={embed_dim} must be divisible by num_heads={num_heads}.")
+	if int(query.shape[-1]) != embed_dim or int(key.shape[-1]) != embed_dim:
+		raise ValueError(f"Manual MHA expected D={embed_dim}, got query={tuple(query.shape)} key={tuple(key.shape)}")
+	weight = module.in_proj_weight
+	bias = module.in_proj_bias
+	if weight is None:
+		raise ValueError("Manual MHA requires in_proj_weight.")
+	q_bias = None if bias is None else bias[:embed_dim]
+	k_bias = None if bias is None else bias[embed_dim : 2 * embed_dim]
+	v_bias = None if bias is None else bias[2 * embed_dim :]
+	q_proj = F.linear(query, weight[:embed_dim], q_bias)
+	k_proj = F.linear(key, weight[embed_dim : 2 * embed_dim], k_bias)
+	v_proj = F.linear(value, weight[2 * embed_dim :], v_bias)
+	batch = int(query.shape[0])
+	q_len = int(query.shape[1])
+	k_len = int(key.shape[1])
+	q_proj = q_proj.reshape(batch, q_len, num_heads, head_dim).transpose(1, 2)
+	k_proj = k_proj.reshape(batch, k_len, num_heads, head_dim).transpose(1, 2)
+	v_proj = v_proj.reshape(batch, k_len, num_heads, head_dim).transpose(1, 2)
+	# These attentions have tiny sequence lengths (vertical: 8, fusion: 1x3).
+	# Use broadcasted multiply/reduce instead of matmul/bmm so backward does not route
+	# through Triton-backed bmm kernels on clusters where libcuda discovery is brittle.
+	scores = (q_proj.unsqueeze(3) * k_proj.unsqueeze(2)).sum(dim=-1) / math.sqrt(float(head_dim))
+	weights = torch.softmax(scores, dim=-1)
+	weights_for_values = F.dropout(weights, p=float(module.dropout), training=training) if float(module.dropout) > 0.0 else weights
+	out = (weights_for_values.unsqueeze(-1) * v_proj.unsqueeze(2)).sum(dim=3)
+	out = out.transpose(1, 2).contiguous().reshape(batch, q_len, embed_dim)
+	out = module.out_proj(out)
+	if need_weights:
+		return out, weights.mean(dim=1)
+	return out, None
 
 
 def select_channels_by_keywords(channel_names: Mapping[int, str] | None, keywords: Sequence[str], *, input_channels: int | None = None) -> list[int]:
@@ -186,6 +238,8 @@ class AtmosphereEncoder(nn.Module):
 		hidden_dim: int = 64,
 		num_blocks: int = 2,
 		vertical_mixing: str = "attention",
+		vertical_attention_chunk_size: int | None = 32768,
+		vertical_attention_force_math: bool = True,
 	) -> None:
 		super().__init__()
 		self.out_dim = int(out_dim)
@@ -194,6 +248,8 @@ class AtmosphereEncoder(nn.Module):
 		self.hidden_dim = int(hidden_dim)
 		self.required_channels = self.num_levels * self.vars_per_level
 		self.vertical_mixing = str(vertical_mixing).lower()
+		self.vertical_attention_chunk_size = None if vertical_attention_chunk_size in (None, 0, "", "null") else int(vertical_attention_chunk_size)
+		self.vertical_attention_force_math = bool(vertical_attention_force_math)
 		if self.vertical_mixing not in {"attention", "mlp"}:
 			raise ValueError(f"vertical_mixing must be 'attention' or 'mlp', got {vertical_mixing!r}.")
 		self.variable_projection = nn.Linear(self.vars_per_level, self.hidden_dim)
@@ -214,6 +270,35 @@ class AtmosphereEncoder(nn.Module):
 			)
 		self.refine = SequenceSpatialEncoder(self.hidden_dim, self.out_dim, self.out_dim, int(num_blocks))
 
+	def _vertical_attention_context(self):
+		if not self.vertical_attention_force_math or torch is None:
+			return contextlib.nullcontext()
+		try:
+			from torch.nn.attention import SDPBackend, sdpa_kernel
+
+			return sdpa_kernel(SDPBackend.MATH)
+		except Exception:
+			pass
+		if not hasattr(torch.backends, "cuda"):
+			return contextlib.nullcontext()
+		try:
+			return torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True)
+		except Exception:
+			return contextlib.nullcontext()
+
+	def _apply_vertical_attention(self, tokens: torch.Tensor) -> torch.Tensor:
+		assert self.vertical_attention is not None
+		chunk_size = self.vertical_attention_chunk_size
+		if chunk_size is None or int(chunk_size) <= 0 or int(tokens.shape[0]) <= int(chunk_size):
+			out, _ = _manual_multihead_attention(self.vertical_attention, tokens, tokens, tokens, training=self.training, need_weights=False)
+			return out
+		chunks = []
+		for start in range(0, int(tokens.shape[0]), int(chunk_size)):
+			chunk = tokens[start : start + int(chunk_size)]
+			out, _ = _manual_multihead_attention(self.vertical_attention, chunk, chunk, chunk, training=self.training, need_weights=False)
+			chunks.append(out)
+		return torch.cat(chunks, dim=0)
+
 	def forward(self, x: torch.Tensor) -> torch.Tensor:
 		if x.ndim != 5:
 			raise ValueError(f"AtmosphereEncoder expects B x T x C x H x W, got {tuple(x.shape)}.")
@@ -228,7 +313,7 @@ class AtmosphereEncoder(nn.Module):
 		tokens = self.variable_projection(tokens)
 		if self.vertical_mixing == "attention":
 			assert self.vertical_attention is not None and self.pool_score is not None
-			tokens, _ = self.vertical_attention(tokens, tokens, tokens, need_weights=False)
+			tokens = self._apply_vertical_attention(tokens)
 			weights = torch.softmax(self.pool_score(tokens), dim=1)
 			mixed = (tokens * weights).sum(dim=1)
 		else:
@@ -369,16 +454,156 @@ class FluxEnergyEncoder(nn.Module):
 		return self.temporal(self.encoder(x[:, :, self.indices]))
 
 
+def tokens_to_grid(tokens: torch.Tensor, spatial_shape: tuple[int, int]) -> torch.Tensor:
+	"""Convert B x T x N x D row-major tokens back to B x T x D x H x W."""
+	if tokens.ndim != 4:
+		raise ValueError(f"tokens_to_grid expects B x T x N x D tokens, got {tuple(tokens.shape)}.")
+	height, width = (int(value) for value in spatial_shape)
+	batch, time_steps, num_tokens, dim = (int(value) for value in tokens.shape)
+	if num_tokens != height * width:
+		raise ValueError(f"Token count N={num_tokens} does not match spatial shape {(height, width)}.")
+	return tokens.transpose(-1, -2).reshape(batch, time_steps, dim, height, width).contiguous()
+
+
+class MultimodalAlignment(nn.Module):
+	"""Align encoded CAWFE-Latte modalities before token fusion."""
+
+	def __init__(
+		self,
+		*,
+		dim: int = 64,
+		max_time: int = 16,
+		use_spatial_pos: bool = True,
+		use_temporal_pos: bool = True,
+		separate_layernorms: bool = True,
+		eps: float = 1.0e-5,
+		learned_spatial_pos: bool = True,
+		learned_temporal_pos: bool = True,
+		flatten_order: str = "row_major",
+	) -> None:
+		super().__init__()
+		self.dim = int(dim)
+		self.max_time = int(max_time)
+		self.use_spatial_pos = bool(use_spatial_pos)
+		self.use_temporal_pos = bool(use_temporal_pos)
+		self.separate_layernorms = bool(separate_layernorms)
+		self.learned_spatial_pos = bool(learned_spatial_pos)
+		self.learned_temporal_pos = bool(learned_temporal_pos)
+		self.flatten_order = str(flatten_order).lower()
+		if self.flatten_order != "row_major":
+			raise ValueError(f"CAWFE-Latte alignment supports only flatten_order='row_major', got {flatten_order!r}.")
+		if self.dim < 1:
+			raise ValueError(f"alignment.dim must be positive, got {self.dim}.")
+		if self.max_time < 1:
+			raise ValueError(f"alignment.max_time must be positive, got {self.max_time}.")
+		if not self.learned_spatial_pos and self.use_spatial_pos:
+			raise ValueError("CAWFE-Latte alignment v1 currently supports only learned spatial positional embeddings.")
+		if not self.learned_temporal_pos and self.use_temporal_pos:
+			raise ValueError("CAWFE-Latte alignment v1 currently supports only learned temporal positional embeddings.")
+		if self.separate_layernorms:
+			self.norm_atm = nn.LayerNorm(self.dim, eps=float(eps))
+			self.norm_wind = nn.LayerNorm(self.dim, eps=float(eps))
+			self.norm_fire = nn.LayerNorm(self.dim, eps=float(eps))
+			self.norm_flux = nn.LayerNorm(self.dim, eps=float(eps))
+		else:
+			shared = nn.LayerNorm(self.dim, eps=float(eps))
+			self.norm_atm = shared
+			self.norm_wind = shared
+			self.norm_fire = shared
+			self.norm_flux = shared
+		if self.use_spatial_pos:
+			self.register_parameter("spatial_pos", None)
+			self._spatial_shape: tuple[int, int] | None = None
+		else:
+			self.register_parameter("spatial_pos", None)
+			self._spatial_shape = None
+		if self.use_temporal_pos:
+			self.temporal_pos = nn.Parameter(torch.zeros(1, self.max_time, 1, self.dim))
+			nn.init.trunc_normal_(self.temporal_pos, std=0.02)
+		else:
+			self.register_parameter("temporal_pos", None)
+
+	@staticmethod
+	def to_tokens(x: torch.Tensor) -> torch.Tensor:
+		# B,T,D,H,W -> B,T,N,D. flatten(-2) preserves row-major token order:
+		# token index = y * W + x.
+		return x.flatten(-2).transpose(-1, -2).contiguous()
+
+	def _validate_inputs(self, tensors: Mapping[str, torch.Tensor]) -> tuple[int, int, int, int, int]:
+		shapes = {name: tuple(tensor.shape) for name, tensor in tensors.items()}
+		for name, tensor in tensors.items():
+			if tensor.ndim != 5:
+				raise ValueError(f"Alignment input {name} must be B x T x D x H x W, got {tuple(tensor.shape)}.")
+		first = next(iter(tensors.values()))
+		batch, time_steps, dim, height, width = (int(value) for value in first.shape)
+		for name, tensor in tensors.items():
+			if tuple(tensor.shape[:2]) != (batch, time_steps):
+				raise ValueError(f"Alignment inputs must share B,T dimensions; got {shapes}.")
+			if int(tensor.shape[2]) != self.dim:
+				raise ValueError(f"Alignment input {name} has D={int(tensor.shape[2])}; expected {self.dim}.")
+			if tuple(tensor.shape[-2:]) != (height, width):
+				raise ValueError(f"Alignment inputs must share the same spatial grid; got {shapes}.")
+		if time_steps > self.max_time:
+			raise ValueError(f"Alignment received T={time_steps}, but max_time={self.max_time}.")
+		return batch, time_steps, dim, height, width
+
+	def _spatial_position(self, height: int, width: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+		if not self.use_spatial_pos:
+			return torch.zeros(1, 1, int(height) * int(width), self.dim, device=device, dtype=dtype)
+		shape = (int(height), int(width))
+		num_tokens = shape[0] * shape[1]
+		if self.spatial_pos is None:
+			param = nn.Parameter(torch.zeros(1, 1, num_tokens, self.dim, device=device, dtype=dtype))
+			nn.init.trunc_normal_(param, std=0.02)
+			self.spatial_pos = param
+			self._spatial_shape = shape
+		elif self._spatial_shape != shape:
+			raise ValueError(f"Alignment learned spatial_pos was initialized for {self._spatial_shape}, got {shape}.")
+		return self.spatial_pos.to(device=device, dtype=dtype)
+
+	def forward(self, A: torch.Tensor, W: torch.Tensor, F: torch.Tensor, Q: torch.Tensor) -> dict[str, torch.Tensor | tuple[int, int]]:
+		_, time_steps, _, height, width = self._validate_inputs({"atmosphere": A, "wind": W, "fire_fuel": F, "flux_energy": Q})
+		A_tokens = self.norm_atm(self.to_tokens(A))
+		W_tokens = self.norm_wind(self.to_tokens(W))
+		F_tokens = self.norm_fire(self.to_tokens(F))
+		Q_tokens = self.norm_flux(self.to_tokens(Q))
+		spatial_pos = self._spatial_position(height, width, device=A_tokens.device, dtype=A_tokens.dtype)
+		if self.use_temporal_pos:
+			assert self.temporal_pos is not None
+			temporal_pos = self.temporal_pos[:, :time_steps].to(device=A_tokens.device, dtype=A_tokens.dtype)
+		else:
+			temporal_pos = torch.zeros(1, time_steps, 1, self.dim, device=A_tokens.device, dtype=A_tokens.dtype)
+		return {
+			"atmosphere": A_tokens + spatial_pos + temporal_pos,
+			"wind": W_tokens + spatial_pos + temporal_pos,
+			"fire_fuel": F_tokens + spatial_pos + temporal_pos,
+			"flux_energy": Q_tokens + spatial_pos + temporal_pos,
+			"spatial_shape": (height, width),
+		}
+
+
 class FireQueryCrossAttentionFusion(nn.Module):
-	"""Fuse modalities per pixel/time using fire/fuel as the query."""
+	"""Fuse modalities per spatial token/time using fire/fuel as the query."""
 
 	modalities = ("atmosphere", "wind", "flux_energy")
 
-	def __init__(self, *, dim: int = 64, num_heads: int = 4, dropout: float = 0.1, use_layer_norm: bool = True, residual: bool = True) -> None:
+	def __init__(
+		self,
+		*,
+		dim: int = 64,
+		num_heads: int = 4,
+		dropout: float = 0.1,
+		use_layer_norm: bool = True,
+		residual: bool = True,
+		attention_chunk_size: int | None = 32768,
+		attention_force_math: bool = True,
+	) -> None:
 		super().__init__()
 		self.dim = int(dim)
 		self.residual = bool(residual)
 		self.use_layer_norm = bool(use_layer_norm)
+		self.attention_chunk_size = None if attention_chunk_size in (None, 0, "", "null") else int(attention_chunk_size)
+		self.attention_force_math = bool(attention_force_math)
 		if self.dim % int(num_heads) != 0:
 			raise ValueError(f"fusion.num_heads={num_heads} must divide fusion.dim={self.dim}.")
 		self.q_norm = nn.LayerNorm(self.dim) if self.use_layer_norm else nn.Identity()
@@ -388,12 +613,46 @@ class FireQueryCrossAttentionFusion(nn.Module):
 		self.out_norm = nn.LayerNorm(self.dim) if self.use_layer_norm else nn.Identity()
 		self.mlp = nn.Sequential(nn.Linear(self.dim, self.dim * 2), nn.SiLU(), nn.Dropout(float(dropout)), nn.Linear(self.dim * 2, self.dim))
 
-	def _flatten(self, x: torch.Tensor) -> torch.Tensor:
-		return x.permute(0, 1, 3, 4, 2).contiguous().reshape(-1, self.dim)
+	def _attention_context(self):
+		if not self.attention_force_math or torch is None:
+			return contextlib.nullcontext()
+		try:
+			from torch.nn.attention import SDPBackend, sdpa_kernel
 
-	def _unflatten(self, x: torch.Tensor, shape: tuple[int, int, int, int]) -> torch.Tensor:
-		batch, time_steps, height, width = shape
-		return x.reshape(batch, time_steps, height, width, self.dim).permute(0, 1, 4, 2, 3).contiguous()
+			return sdpa_kernel(SDPBackend.MATH)
+		except Exception:
+			pass
+		if not hasattr(torch.backends, "cuda"):
+			return contextlib.nullcontext()
+		try:
+			return torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True)
+		except Exception:
+			return contextlib.nullcontext()
+
+	def _apply_attention(self, q: torch.Tensor, kv: torch.Tensor, *, return_attention: bool) -> tuple[torch.Tensor, torch.Tensor | None]:
+		chunk_size = self.attention_chunk_size
+		if chunk_size is None or int(chunk_size) <= 0 or int(q.shape[0]) <= int(chunk_size):
+			attended, weights = _manual_multihead_attention(self.attention, q, kv, kv, training=self.training, need_weights=return_attention)
+			return attended, weights if return_attention else None
+		attended_chunks = []
+		weight_chunks = [] if return_attention else None
+		for start in range(0, int(q.shape[0]), int(chunk_size)):
+			end = start + int(chunk_size)
+			attended, weights = _manual_multihead_attention(
+				self.attention,
+				q[start:end],
+				kv[start:end],
+				kv[start:end],
+				training=self.training,
+				need_weights=return_attention,
+			)
+			attended_chunks.append(attended)
+			if return_attention and weights is not None:
+				assert weight_chunks is not None
+				weight_chunks.append(weights)
+		attended_all = torch.cat(attended_chunks, dim=0)
+		weights_all = torch.cat(weight_chunks, dim=0) if weight_chunks else None
+		return attended_all, weights_all
 
 	def forward(
 		self,
@@ -405,25 +664,24 @@ class FireQueryCrossAttentionFusion(nn.Module):
 		return_attention: bool = False,
 	) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
 		for name, tensor in {"atmosphere": atmosphere, "wind": wind, "fire_fuel": fire_fuel, "flux_energy": flux_energy}.items():
-			if tensor.ndim != 5:
-				raise ValueError(f"Fusion input {name} must be B x T x D x H x W, got {tuple(tensor.shape)}.")
-			if int(tensor.shape[2]) != self.dim:
-				raise ValueError(f"Fusion input {name} has dim={int(tensor.shape[2])}; expected {self.dim}.")
+			if tensor.ndim != 4:
+				raise ValueError(f"Fusion input {name} must be B x T x N x D tokens, got {tuple(tensor.shape)}.")
+			if int(tensor.shape[-1]) != self.dim:
+				raise ValueError(f"Fusion input {name} has D={int(tensor.shape[-1])}; expected {self.dim}.")
 		if not (atmosphere.shape == wind.shape == fire_fuel.shape == flux_energy.shape):
-			raise ValueError("Fusion inputs must all have the same B x T x D x H x W shape.")
-		batch, time_steps, _, height, width = (int(value) for value in fire_fuel.shape)
-		q = self.q_norm(self._flatten(fire_fuel)).unsqueeze(1)
-		kv = torch.stack([self._flatten(atmosphere), self._flatten(wind), self._flatten(flux_energy)], dim=1)
+			raise ValueError("Fusion token inputs must all have the same B x T x N x D shape.")
+		batch, time_steps, num_tokens, dim = (int(value) for value in fire_fuel.shape)
+		q = self.q_norm(fire_fuel.reshape(batch * time_steps * num_tokens, 1, dim))
+		kv = torch.stack([atmosphere, wind, flux_energy], dim=3).reshape(batch * time_steps * num_tokens, 3, dim)
 		kv = self.kv_norm(kv)
-		attended, weights = self.attention(q, kv, kv, need_weights=return_attention, average_attn_weights=True)
-		f_flat = self._flatten(fire_fuel)
-		z = f_flat + self.dropout(attended.squeeze(1)) if self.residual else self.dropout(attended.squeeze(1))
+		attended, weights = self._apply_attention(q, kv, return_attention=return_attention)
+		attended = attended.reshape(batch, time_steps, num_tokens, dim)
+		z = fire_fuel + self.dropout(attended) if self.residual else self.dropout(attended)
 		z = z + self.dropout(self.mlp(self.out_norm(z)))
-		z_maps = self._unflatten(z, (batch, time_steps, height, width))
 		if return_attention:
-			attention_maps = weights.squeeze(1).reshape(batch, time_steps, height, width, 3)
-			return z_maps, attention_maps
-		return z_maps
+			attention_tokens = weights.squeeze(1).reshape(batch, time_steps, num_tokens, 3)
+			return z, attention_tokens
+		return z
 
 
 class TemporalSpatialResidualBlock(nn.Module):
@@ -592,6 +850,7 @@ class CAWFELatte(nn.Module):
 		fire_fuel: Mapping[str, Any] | None = None,
 		flux_energy: Mapping[str, Any] | None = None,
 		fusion: Mapping[str, Any] | None = None,
+		alignment: Mapping[str, Any] | None = None,
 		backbone: Mapping[str, Any] | None = None,
 		temporal_aggregation: Mapping[str, Any] | None = None,
 		decoder: Mapping[str, Any] | None = None,
@@ -619,6 +878,7 @@ class CAWFELatte(nn.Module):
 		fire_config = dict(fire_fuel or {})
 		flux_config = dict(flux_energy or {})
 		fusion_config = dict(fusion or {})
+		alignment_config = dict(alignment or {})
 		backbone_config = dict(backbone or {})
 		aggregation_config = dict(temporal_aggregation or {})
 		decoder_config = dict(decoder or {})
@@ -636,9 +896,31 @@ class CAWFELatte(nn.Module):
 		self.wind_encoder = WindEncoder(input_channels=self.input_channels, out_dim=int(wind_config.get("out_dim", self.output_dim)), channel_names=channel_names, **{key: value for key, value in wind_config.items() if key != "out_dim"})
 		self.fire_fuel_encoder = FireFuelEncoder(input_channels=self.input_channels, out_dim=int(fire_config.get("out_dim", self.output_dim)), channel_names=channel_names, **{key: value for key, value in fire_config.items() if key != "out_dim"})
 		self.flux_energy_encoder = FluxEnergyEncoder(input_channels=self.input_channels, out_dim=int(flux_config.get("out_dim", self.output_dim)), channel_names=channel_names, **{key: value for key, value in flux_config.items() if key != "out_dim"})
+		alignment_enabled = bool(alignment_config.get("enabled", True))
+		if not alignment_enabled:
+			raise ValueError("CAWFE-Latte multimodal alignment is mandatory before fusion.")
+		spatial_alignment = dict(alignment_config.get("spatial", {})) if isinstance(alignment_config.get("spatial", {}), Mapping) else {}
+		distribution_alignment = dict(alignment_config.get("distribution", {})) if isinstance(alignment_config.get("distribution", {}), Mapping) else {}
+		temporal_alignment = dict(alignment_config.get("temporal", {})) if isinstance(alignment_config.get("temporal", {}), Mapping) else {}
+		if str(distribution_alignment.get("norm_type", "layernorm")).lower() != "layernorm":
+			raise ValueError("CAWFE-Latte alignment.distribution.norm_type must be 'layernorm'.")
+		self.alignment = MultimodalAlignment(
+			dim=self.output_dim,
+			max_time=int(temporal_alignment.get("max_time", max(16, self.input_sequence_length))),
+			use_spatial_pos=bool(spatial_alignment.get("add_positional_embedding", True)),
+			use_temporal_pos=bool(temporal_alignment.get("add_positional_embedding", True)),
+			separate_layernorms=bool(distribution_alignment.get("separate_norm_per_modality", True)),
+			eps=float(distribution_alignment.get("eps", 1.0e-5)),
+			learned_spatial_pos=bool(spatial_alignment.get("learned_positional_embedding", True)),
+			learned_temporal_pos=bool(temporal_alignment.get("learned_positional_embedding", True)),
+			flatten_order=str(spatial_alignment.get("flatten_order", "row_major")),
+		)
 		fusion_dim = int(fusion_config.get("dim", self.output_dim))
 		if fusion_dim != self.output_dim:
 			raise ValueError(f"fusion.dim must match output_dim for CAWFE-Latte v1, got {fusion_dim} and {self.output_dim}.")
+		input_format = str(fusion_config.get("input_format", "tokens")).lower()
+		if input_format != "tokens":
+			raise ValueError(f"CAWFE-Latte fusion.input_format must be 'tokens', got {input_format!r}.")
 		query_source = str(fusion_config.get("query_source", "fire_fuel"))
 		if query_source != "fire_fuel":
 			raise ValueError("CAWFE-Latte fusion currently supports only query_source='fire_fuel'.")
@@ -699,17 +981,28 @@ class CAWFELatte(nn.Module):
 		wind = self.wind_encoder(x)
 		fire_fuel = self.fire_fuel_encoder(x)
 		flux_energy = self.flux_energy_encoder(x)
-		fusion_result = self.fusion(atmosphere, wind, fire_fuel, flux_energy, return_attention=return_attention)
+		aligned = self.alignment(atmosphere, wind, fire_fuel, flux_energy)
+		fusion_result = self.fusion(
+			aligned["atmosphere"],
+			aligned["wind"],
+			aligned["fire_fuel"],
+			aligned["flux_energy"],
+			return_attention=return_attention,
+		)
 		if return_attention:
-			fused, attention = fusion_result
+			fused_tokens, attention = fusion_result
 		else:
-			fused = fusion_result
+			fused_tokens = fusion_result
 			attention = None
+		spatial_shape = aligned["spatial_shape"]
+		fused_dynamic = tokens_to_grid(fused_tokens, spatial_shape)
+		fused = fused_dynamic
 		terrain_embedding = None
-		fused_dynamic = fused
 		if self.use_terrain_conditioning:
 			if terrain is None: raise ValueError("CAWFE-Latte terrain conditioning is enabled but terrain input is missing.")
 			terrain_embedding = self.terrain_encoder(terrain)
+			if tuple(terrain_embedding.shape[-2:]) != tuple(fused_dynamic.shape[-2:]):
+				raise ValueError(f"Terrain encoder grid {tuple(terrain_embedding.shape[-2:])} does not match fused dynamic grid {tuple(fused_dynamic.shape[-2:])}.")
 			fused = self.terrain_film(fused_dynamic, terrain_embedding)
 		local = self.temporal_backbone(fused)
 		aux_source = local[:, -1]
@@ -727,9 +1020,17 @@ class CAWFELatte(nn.Module):
 				"wind": wind,
 				"fire_fuel": fire_fuel,
 				"flux_energy": flux_energy,
+				"aligned_atmosphere": aligned["atmosphere"],
+				"aligned_wind": aligned["wind"],
+				"aligned_fire_fuel": aligned["fire_fuel"],
+				"aligned_flux_energy": aligned["flux_energy"],
+				"fused_tokens": fused_tokens,
+				"fused_grid": fused_dynamic,
+				"spatial_shape": spatial_shape,
 				"fused": fused,
 				"fused_dynamic": fused_dynamic,
 				"terrain_features": terrain_embedding,
+				"fused_after_terrain": fused if self.use_terrain_conditioning else None,
 				"fused_terrain": fused,
 				"local": local,
 				"aggregated": aggregated,
@@ -751,6 +1052,7 @@ __all__ = [
 	"FireFuelEncoder",
 	"FireQueryCrossAttentionFusion",
 	"FluxEnergyEncoder",
+	"MultimodalAlignment",
 	"PredictionHead",
 	"ShallowDecoder",
 	"TemporalAggregator",
@@ -759,4 +1061,5 @@ __all__ = [
 	"TemporalConvBlock",
 	"WindEncoder",
 	"select_channels_by_keywords",
+	"tokens_to_grid",
 ]

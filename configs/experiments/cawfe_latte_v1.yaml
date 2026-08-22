@@ -1,11 +1,23 @@
-base_config: ../default.yaml
+base_config: ../derived/default_with_fire_mask_thresholds.yaml
 
 experiment:
   name: cawfe_latte_v1
-  description: First end-to-end CAWFE-Latte with four encoders, modality fusion, temporal CNN backbone, shallow decoder, and auxiliary fire-support head.
+  description: End-to-end CAWFE-Latte on rebuilt processed temporal patches with terrain conditioning.
 
 model:
   architecture: cawfe_latte
+  input_channels: 129
+  output_channels: 4
+
+energy_release:
+  enabled: true
+  output_mode: total
+  target_transform: log1p
+
+input_sequence_length: 5
+prediction_horizon: 10
+batch_size: 8
+learning_rate: 0.0003
 
 processed_dataset:
   root: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1
@@ -13,37 +25,98 @@ processed_dataset:
 
 dataloader:
   source: processed_full_frames
-  sample_pattern: consecutive5_h10
-  return_terrain: auto
+  dataset_root: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1
+  sample_pattern: sparse5_h10
+  target_horizon: 10
   normalize_inputs: true
-
-paths:
-  patch_cache_root: /scratch/mhabibp/fire_forecasting_patch_cache/cawfe_latte_v1
-  normalization_root: /scratch/mhabibp/fire_forecasting_normalization/cawfe_latte_v1
+  return_metadata: false
+  return_terrain: auto
+  terrain_key: terrain_features
+  input_key: x_engineered
 
 cache:
   enabled: false
   use_precomputed_patches: false
-  cache_version: v5_manual_trim_T5_H10_stride60_cawfe_latte_v1
-  cache_dir: /scratch/mhabibp/fire_forecasting_patch_cache/cawfe_latte_v1
 
 normalization:
   enabled: true
   require_stats: true
   output_dir: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1/normalization
-  stats_path: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1/normalization/latest_normalization.json
-  path: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1/normalization/latest_normalization.json
-  npz_path: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1/normalization/latest_normalization.npz
+  stats_path: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1/normalization/latest_normalization_sparse5_h10.json
+  path: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1/normalization/latest_normalization_sparse5_h10.json
+  npz_path: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1/normalization/latest_normalization_sparse5_h10.npz
+  allow_val_test_fit: false
 
 cawfe_latte:
-  use_terrain_conditioning: true
   enabled: true
   version: v1_end_to_end
   input_channels: 129
   input_sequence_length: 5
   output_channels: 4
   output_dim: 64
+  use_terrain_conditioning: true
   debug_prediction_head: false
+
+  atmosphere:
+    out_dim: 64
+    vertical_mixing: attention
+    vertical_attention_chunk_size: 32768
+    vertical_attention_force_math: true
+  wind:
+    out_dim: 64
+  fire_fuel:
+    out_dim: 64
+  flux_energy:
+    out_dim: 64
+
+  alignment:
+    enabled: true
+    spatial:
+      enabled: true
+      assert_same_grid: true
+      flatten_order: row_major
+      add_positional_embedding: true
+      learned_positional_embedding: true
+    distribution:
+      enabled: true
+      norm_type: layernorm
+      separate_norm_per_modality: true
+      eps: 1.0e-5
+    temporal:
+      enabled: true
+      max_time: 16
+      add_positional_embedding: true
+      learned_positional_embedding: true
+      shared_across_modalities: true
+
+  fusion:
+    input_format: tokens
+    dim: 64
+    num_heads: 4
+    dropout: 0.1
+    use_layer_norm: true
+    residual: true
+    attention_chunk_size: 32768
+    attention_force_math: true
+    query_source: fire_fuel
+    key_value_sources:
+      - atmosphere
+      - wind
+      - flux_energy
+
+  terrain_encoder:
+    in_channels: 4
+    hidden_dim: 32
+    out_dim: 64
+    activation: gelu
+    norm: groupnorm
+
+  terrain_film:
+    dim: 64
+    use_scale: true
+    use_shift: true
+    scale_init_zero: true
+    shift_init_zero: true
 
   backbone:
     type: temporal_cnn
@@ -86,7 +159,85 @@ cawfe_latte:
       loss: bce_dice
       detach_source: false
 
+data_loader:
+  batch_size: 8
+  num_workers: 8
+  train:
+    num_workers: 8
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 2
+    drop_last: false
+  val:
+    num_workers: 8
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 2
+    drop_last: false
+  test:
+    num_workers: 8
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 2
+    drop_last: false
+
 training:
+  batch_size: 8
+  input_sequence_length: 5
+  prediction_horizon: 10
+  max_epochs: 50
+  epochs: 50
+  learning_rate: 0.0003
+  optimizer: adamw
+  weight_decay: 0.0001
+  gradient_clip_norm: 1.0
+  mixed_precision: true
+  input_normalization_device: none
+  gradient_accumulation_steps: 1
+  run_external_test_after_training: false
+  run_test_after_training: false
+
+  early_stopping:
+    enabled: true
+    monitor: val_loss
+    mode: min
+    patience: 8
+    min_delta: 0.001
+    start_epoch: 5
+    restore_best_weights: false
+    checkpoint_best: true
+    save_latest_on_stop: true
+    verbose: true
+    stop_on_nan: true
+
+  checkpointing:
+    monitor: val_loss
+    mode: min
+    save_best: true
+    save_latest: true
+    save_every_n_epochs: null
+    keep_last_n_epoch_checkpoints: 3
+
+  output:
+    root_dir: artifacts/runs
+    checkpoint_root: artifacts/checkpoints
+    log_root: artifacts/logs
+    save_compatibility_checkpoints: true
+    update_architecture_latest_checkpoint: true
+    save_epoch_checkpoints: false
+    save_best_checkpoint: true
+    save_latest_checkpoint: true
+    save_training_curves: true
+    save_metric_curves: true
+    save_timing_plots: true
+    save_resolved_config: true
+    save_original_config: true
+    save_run_summary: true
+    save_hardware_summary: true
+    save_cache_manifest_copy: false
+    save_normalization_stats_copy: true
+    copy_normalization_npz: false
+
   loss:
     surface:
       type: huber
@@ -108,3 +259,36 @@ training:
     auxiliary_fire_support:
       enabled: true
       weight: 0.2
+    background_suppression:
+      enabled: false
+
+  performance:
+    precision: auto
+    allow_tf32: true
+    cudnn_benchmark: true
+    torch_compile: false
+    auto_batch_size: false
+    prefetch_to_cuda: false
+    non_blocking_transfer: true
+    log_timing: true
+    timing_log_every_n_batches: 50
+    show_progress_bar: true
+    progress_log_percent_step: 0
+    compute_train_metrics_every_batch: false
+    cheap_train_metrics_every_n_batches: 100
+    compute_val_metrics: true
+    max_train_batches_per_epoch: 200
+    max_val_batches_per_epoch: 50
+
+  validation:
+    mode: fixed_subset_every_epoch
+    max_val_batches_per_epoch: 50
+    fixed_subset_seed: 42
+    fixed_subset_shuffle: false
+    use_same_metric_for_checkpointing: true
+
+evaluation:
+  split: test
+  batch_size: 8
+  num_workers: 8
+  save_predictions: false
