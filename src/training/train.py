@@ -46,6 +46,7 @@ try:
 	import torch  # type: ignore[import-not-found]
 	import torch.nn as nn  # type: ignore[import-not-found]
 	from torch.cuda.amp import GradScaler as CudaGradScaler, autocast as cuda_autocast  # type: ignore[import-not-found]
+	from torch.utils.data import DataLoader, Subset  # type: ignore[import-not-found]
 except ImportError:  # pragma: no cover - environment-specific fallback
 	torch = None
 	nn = None
@@ -628,7 +629,7 @@ def _loader_summary(loader) -> dict[str, Any]:
 	}
 
 
-SUPPORTED_VALIDATION_MODES = {"full_every_epoch", "fixed_subset_every_epoch"}
+SUPPORTED_VALIDATION_MODES = {"full_every_epoch", "fixed_subset_every_epoch", "random_subset_every_epoch"}
 
 
 def _coerce_optional_positive_int(value: Any, *, name: str) -> int | None:
@@ -640,12 +641,23 @@ def _coerce_optional_positive_int(value: Any, *, name: str) -> int | None:
 	return resolved
 
 
+def _resolve_validation_seed(value: Any, *, default: int = 42, random_when_missing: bool = False) -> int:
+	"""Resolve a validation-subset seed, optionally generating a fresh run seed."""
+
+	if value in (None, "", "null", "None", "random", "Random", "RANDOM"):
+		if random_when_missing:
+			return int.from_bytes(os.urandom(8), "little") % (2**63 - 1)
+		return int(default)
+	return int(value)
+
+
 def resolve_validation_policy(config: Mapping[str, Any], val_loader=None, logger=None) -> dict[str, Any]:
 	"""Resolve the training validation protocol.
 
-	Only two modes are supported:
+	Supported modes:
 	- full_every_epoch: use the complete validation loader every epoch.
 	- fixed_subset_every_epoch: choose one deterministic batch-index subset once.
+	- random_subset_every_epoch: sample a fresh deterministic-random validation subset each epoch.
 	"""
 
 	training_config = _get_section(config, "training")
@@ -668,7 +680,7 @@ def resolve_validation_policy(config: Mapping[str, Any], val_loader=None, logger
 	if mode not in SUPPORTED_VALIDATION_MODES:
 		raise ValueError(
 			"Unsupported training.validation.mode. "
-			"Expected one of: full_every_epoch, fixed_subset_every_epoch. "
+			"Expected one of: full_every_epoch, fixed_subset_every_epoch, random_subset_every_epoch. "
 			f"Got {mode!r}."
 		)
 
@@ -692,35 +704,62 @@ def resolve_validation_policy(config: Mapping[str, Any], val_loader=None, logger
 			"use_same_metric_for_checkpointing": bool(validation_config.get("use_same_metric_for_checkpointing", True)),
 		}
 
+	max_samples = _coerce_optional_positive_int(validation_config.get("max_val_samples_per_epoch"), name="training.validation.max_val_samples_per_epoch")
+	batch_size = getattr(val_loader, "batch_size", None) if val_loader is not None else None
+	if batch_size is None and val_loader is not None and hasattr(getattr(val_loader, "batch_sampler", None), "batch_size"):
+		batch_size = getattr(val_loader.batch_sampler, "batch_size")
+	max_batches_from_samples = None
+	if max_samples is not None:
+		if batch_size is None:
+			raise ValueError("training.validation.max_val_samples_per_epoch requires a validation DataLoader with a known batch_size.")
+		max_batches_from_samples = max(1, int(math.ceil(float(max_samples) / float(batch_size))))
 	max_batches_value = validation_config.get("max_val_batches_per_epoch", performance_config.get("max_val_batches_per_epoch", 50))
 	max_batches = _coerce_optional_positive_int(max_batches_value, name="training.validation.max_val_batches_per_epoch")
+	if max_batches_from_samples is not None:
+		max_batches = max_batches_from_samples
 	if max_batches is None:
 		max_batches = len(val_loader) if val_loader is not None else None
 	if max_batches is None:
-		raise ValueError("fixed_subset_every_epoch requires max_val_batches_per_epoch or a validation loader.")
+		raise ValueError(f"{mode} requires max_val_batches_per_epoch, max_val_samples_per_epoch, or a validation loader.")
+
+	fixed_subset_shuffle = bool(validation_config.get("fixed_subset_shuffle", False))
+	fixed_subset_seed = _resolve_validation_seed(
+		validation_config.get("fixed_subset_seed", 42),
+		default=42,
+		random_when_missing=(mode == "fixed_subset_every_epoch" and fixed_subset_shuffle),
+	)
+	random_subset_seed = _resolve_validation_seed(
+		validation_config.get("random_subset_seed", validation_config.get("fixed_subset_seed", 42)),
+		default=fixed_subset_seed,
+		random_when_missing=(mode == "random_subset_every_epoch"),
+	)
 
 	total_batches = len(val_loader) if val_loader is not None else None
 	if total_batches is None:
 		used_batches = int(max_batches)
-		selected_batch_indices = list(range(used_batches))
+		selected_batch_indices = list(range(used_batches)) if mode == "fixed_subset_every_epoch" else None
 	elif int(total_batches) <= int(max_batches):
 		used_batches = int(total_batches)
-		selected_batch_indices = list(range(used_batches))
+		selected_batch_indices = list(range(used_batches)) if mode == "fixed_subset_every_epoch" else None
 	else:
 		used_batches = int(max_batches)
-		if bool(validation_config.get("fixed_subset_shuffle", False)):
+		if mode == "random_subset_every_epoch":
+			selected_batch_indices = None
+		elif fixed_subset_shuffle:
 			generator = torch.Generator()
-			generator.manual_seed(int(validation_config.get("fixed_subset_seed", 42)))
+			generator.manual_seed(fixed_subset_seed)
 			selected_batch_indices = sorted(torch.randperm(int(total_batches), generator=generator)[:used_batches].tolist())
 		else:
 			selected_batch_indices = list(range(used_batches))
 
 	return {
 		"validation_mode": mode,
-		"validation_scope": "fixed_subset",
+		"validation_scope": "random_subset" if mode == "random_subset_every_epoch" else "fixed_subset",
 		"max_val_batches_per_epoch": int(max_batches),
-		"fixed_subset_seed": int(validation_config.get("fixed_subset_seed", 42)),
-		"fixed_subset_shuffle": bool(validation_config.get("fixed_subset_shuffle", False)),
+		"max_val_samples_per_epoch": max_samples,
+		"fixed_subset_seed": fixed_subset_seed,
+		"fixed_subset_shuffle": fixed_subset_shuffle,
+		"random_subset_seed": random_subset_seed,
 		"selected_batch_indices": selected_batch_indices,
 		"validation_batches_total": total_batches,
 		"validation_batches_used": used_batches,
@@ -736,6 +775,8 @@ def _validation_subset_metadata(policy: Mapping[str, Any], val_loader) -> dict[s
 		"fixed_subset_seed": policy.get("fixed_subset_seed"),
 		"fixed_subset_shuffle": policy.get("fixed_subset_shuffle"),
 		"max_val_batches_per_epoch": policy.get("max_val_batches_per_epoch"),
+		"max_val_samples_per_epoch": policy.get("max_val_samples_per_epoch"),
+		"random_subset_seed": policy.get("random_subset_seed"),
 		"selected_batch_indices": policy.get("selected_batch_indices"),
 		"selected_sample_indices": None,
 		"validation_dataset_length": len(getattr(val_loader, "dataset", [])),
@@ -757,6 +798,62 @@ def save_validation_subset_metadata(run_manager: RunManager, policy: Mapping[str
 	with path.open("w", encoding="utf-8") as handle:
 		json.dump(_validation_subset_metadata(policy, val_loader), handle, indent=2, sort_keys=True, default=str)
 	return path
+
+
+def validation_batch_indices_for_epoch(policy: Mapping[str, Any], epoch_number: int | None) -> list[int] | None:
+	"""Return the validation batch-index subset for one epoch."""
+
+	if str(policy.get("validation_mode")) != "random_subset_every_epoch":
+		selected = policy.get("selected_batch_indices")
+		return None if selected is None else [int(index) for index in selected]
+	if policy.get("max_val_samples_per_epoch") is not None:
+		return None
+	total_batches = policy.get("validation_batches_total")
+	used_batches = int(policy.get("validation_batches_used", 0))
+	if total_batches is None:
+		return list(range(used_batches))
+	total_batches = int(total_batches)
+	if total_batches <= used_batches:
+		return list(range(total_batches))
+	seed = int(policy.get("random_subset_seed", 42)) + max(0, int(epoch_number or 0))
+	generator = torch.Generator()
+	generator.manual_seed(seed)
+	return sorted(torch.randperm(total_batches, generator=generator)[:used_batches].tolist())
+
+
+def validation_loader_for_epoch(val_loader, policy: Mapping[str, Any], epoch_number: int | None):
+	"""Return an exact random validation sample-subset DataLoader for one epoch when configured."""
+
+	if str(policy.get("validation_mode")) != "random_subset_every_epoch" or policy.get("max_val_samples_per_epoch") is None:
+		return val_loader, None
+	dataset = getattr(val_loader, "dataset", None)
+	if dataset is None:
+		raise ValueError("Random validation sample subset requires val_loader.dataset.")
+	dataset_length = len(dataset)
+	if dataset_length <= 0:
+		raise ValueError("Random validation sample subset requires a non-empty validation dataset.")
+	requested_samples = int(policy["max_val_samples_per_epoch"])
+	used_samples = min(dataset_length, requested_samples)
+	seed = int(policy.get("random_subset_seed", 42)) + max(0, int(epoch_number or 0))
+	generator = torch.Generator()
+	generator.manual_seed(seed)
+	selected_sample_indices = sorted(torch.randperm(dataset_length, generator=generator)[:used_samples].tolist())
+	subset = Subset(dataset, selected_sample_indices)
+	num_workers = int(getattr(val_loader, "num_workers", 0) or 0)
+	loader_kwargs = {
+		"batch_size": getattr(val_loader, "batch_size", None),
+		"shuffle": False,
+		"num_workers": num_workers,
+		"collate_fn": getattr(val_loader, "collate_fn", None),
+		"pin_memory": bool(getattr(val_loader, "pin_memory", False)),
+		"drop_last": False,
+	}
+	if num_workers > 0:
+		prefetch_factor = getattr(val_loader, "prefetch_factor", None)
+		if prefetch_factor is not None:
+			loader_kwargs["prefetch_factor"] = prefetch_factor
+		loader_kwargs["persistent_workers"] = False
+	return DataLoader(subset, **loader_kwargs), selected_sample_indices
 
 
 def _run_epoch(
@@ -1825,6 +1922,10 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 	if validation_policy["validation_mode"] == "full_every_epoch":
 		logger.info("Validation mode: full_every_epoch")
 		logger.info("Validation batches this epoch: all")
+	elif validation_policy["validation_mode"] == "random_subset_every_epoch":
+		logger.info("Validation mode: random_subset_every_epoch")
+		logger.info("Random validation subset: %s batch(es) per epoch", validation_policy["validation_batches_used"])
+		logger.info("Random validation base seed: %s", validation_policy["random_subset_seed"])
 	else:
 		logger.info("Validation mode: fixed_subset_every_epoch")
 		logger.info("Fixed validation subset: %s batch(es)", validation_policy["validation_batches_used"])
@@ -2054,13 +2155,20 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 			epoch_number=epoch_number,
 			timing_csv_path=timing_log_path,
 		)
+		validation_epoch_loader, validation_sample_indices = validation_loader_for_epoch(val_loader, validation_policy, epoch_number)
+		validation_batch_indices = validation_batch_indices_for_epoch(validation_policy, epoch_number)
 		if validation_policy["validation_mode"] == "fixed_subset_every_epoch":
 			logger.info("Validation using fixed subset: %s batch(es)", validation_policy["validation_batches_used"])
+		elif validation_policy["validation_mode"] == "random_subset_every_epoch":
+			if validation_sample_indices is not None:
+				logger.info("Validation using random sample subset: %s sample(s), %s batch(es)", len(validation_sample_indices), len(validation_epoch_loader))
+			else:
+				logger.info("Validation using random batch subset: %s batch(es)", validation_policy["validation_batches_used"])
 		else:
 			logger.info("Validation batches this epoch: all")
 		val_results = _run_epoch(
 			model=model,
-			loader=val_loader,
+			loader=validation_epoch_loader,
 			criterion=criterion,
 			config=config,
 			device=device,
@@ -2069,7 +2177,7 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 			output_channels=output_channels,
 			train=False,
 			max_batches=None,
-			batch_indices=validation_policy.get("selected_batch_indices"),
+			batch_indices=validation_batch_indices,
 			logger=logger,
 			epoch_number=epoch_number,
 			amp_dtype=amp_dtype,

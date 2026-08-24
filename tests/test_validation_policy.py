@@ -59,6 +59,26 @@ def test_fixed_subset_every_epoch_selects_same_batch_indices() -> None:
 	assert first["validation_batches_used"] == 4
 
 
+def test_fixed_subset_with_null_seed_randomizes_once_per_run() -> None:
+	loader = _loader(length=100, batch_size=1)
+	config = _config({
+		"mode": "fixed_subset_every_epoch",
+		"max_val_batches_per_epoch": 10,
+		"fixed_subset_seed": None,
+		"fixed_subset_shuffle": True,
+	})
+	first = resolve_validation_policy(config, val_loader=loader)
+	second = resolve_validation_policy(config, val_loader=loader)
+
+	assert first["validation_mode"] == "fixed_subset_every_epoch"
+	assert first["fixed_subset_shuffle"] is True
+	assert isinstance(first["fixed_subset_seed"], int)
+	assert len(first["selected_batch_indices"]) == 10
+	assert len(second["selected_batch_indices"]) == 10
+	assert first["fixed_subset_seed"] != second["fixed_subset_seed"]
+	assert first["selected_batch_indices"] != second["selected_batch_indices"]
+
+
 def test_fixed_subset_every_epoch_saves_validation_subset_json(tmp_path) -> None:
 	config = _config()
 	config["training"]["output"] = {

@@ -282,9 +282,11 @@ training:
 
   validation:
     mode: fixed_subset_every_epoch
+    max_val_samples_per_epoch: null
     max_val_batches_per_epoch: 50
-    fixed_subset_seed: 42
-    fixed_subset_shuffle: false
+    random_subset_seed: 42
+    fixed_subset_seed: null
+    fixed_subset_shuffle: true
     use_same_metric_for_checkpointing: true
 
 evaluation:
