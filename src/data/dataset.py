@@ -2100,7 +2100,9 @@ def create_dataloaders(config):
 		return_terrain_value = dataloader_config.get("return_terrain", "auto")
 		architecture = str(_get_section(config, "model").get("architecture", "")).lower()
 		cawfe_config = _get_section(config, "cawfe_latte")
-		return_terrain = bool(return_terrain_value) if not isinstance(return_terrain_value, str) or return_terrain_value.lower() != "auto" else (architecture == "cawfe_latte" and bool(cawfe_config.get("use_terrain_conditioning", False)))
+		cawfe_v11_config = _get_section(config, "cawfe_latte_v1_1")
+		terrain_conditioning_enabled = bool(cawfe_v11_config.get("use_terrain_conditioning", cawfe_config.get("use_terrain_conditioning", False))) if architecture in {"cawfe_latte_v1_1", "cawfe_latte_v1_2"} else bool(cawfe_config.get("use_terrain_conditioning", False))
+		return_terrain = bool(return_terrain_value) if not isinstance(return_terrain_value, str) or return_terrain_value.lower() != "auto" else (architecture in {"cawfe_latte", "cawfe_latte_v1_1", "cawfe_latte_v1_2"} and terrain_conditioning_enabled)
 		common = {"dataset_root": root, "sample_index_path": sample_path, "normalization_stats_path": stats_path, "normalize_inputs": normalize_inputs, "input_key": str(dataloader_config.get("input_key", "x_engineered")), "return_metadata": bool(config.get("return_metadata", dataloader_config.get("return_metadata", False))), "single_frame_mode": str(dataloader_config.get("single_frame_mode", "as_is")), "repeat_to_length": dataloader_config.get("repeat_to_length"), "return_terrain": return_terrain, "terrain_key": str(dataloader_config.get("terrain_key", "terrain_features"))}
 		train_dataset = ProcessedTemporalPatchDataset(split="train", **common)
 		val_dataset = ProcessedTemporalPatchDataset(split="val", **common)

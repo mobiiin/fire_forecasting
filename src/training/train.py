@@ -2066,8 +2066,8 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 
 	def _checkpoint_extra_state() -> dict[str, Any]:
 		cawfe_latte_metadata = {}
-		if architecture == "cawfe_latte":
-			cawfe_config = _get_section(config, "cawfe_latte")
+		if architecture in {"cawfe_latte", "cawfe_latte_v1_1", "cawfe_latte_v1_2"}:
+			cawfe_config = _get_section(config, "cawfe_latte_v1_1") if architecture == "cawfe_latte_v1_1" else (_get_section(config, "cawfe_latte_v1_2") if architecture == "cawfe_latte_v1_2" else _get_section(config, "cawfe_latte"))
 			loss_config_for_meta = _get_section(_get_section(config, "training"), "loss")
 			cawfe_latte_metadata = {
 				"version": cawfe_config.get("version", "v1_end_to_end"),

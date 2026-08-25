@@ -1,0 +1,29 @@
+base_config: cawfe_latte_v1_1.yaml
+
+experiment:
+  name: cawfe_latte_v1_2
+  description: CAWFE-Latte v1.2 with temporal attention pooling after post-fusion ResBlocks.
+
+model:
+  architecture: cawfe_latte_v1_2
+  output_channels: 4
+
+cawfe_latte_v1_2:
+  enabled: true
+  version: v1_2_temporal_attention_pooling
+  inherit_from: cawfe_latte_v1_1
+
+  temporal_pooling:
+    type: attention
+    enabled: true
+    dim: 64
+    hidden_dim: 16
+    score_kernel_size: 1
+    softmax_dim: time
+    initialize_uniform: true
+    return_attention: true
+
+training:
+  loss:
+    background_suppression:
+      enabled: false

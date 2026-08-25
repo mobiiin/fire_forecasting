@@ -119,6 +119,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--energy_active_threshold_mw", type=float, default=1.0e-3)
 	parser.add_argument("--consumed_active_threshold", type=float, default=1.0e-3)
 	parser.add_argument("--save_npz", action="store_true", help="Save raw y/pred arrays for plotted samples.")
+	parser.add_argument(
+		"--return_features",
+		action="store_true",
+		help="Ask models that support it to return intermediate feature/attention tensors and save compact summaries.",
+	)
 	parser.add_argument("--run_background_diagnostics", action="store_true", help="Compute inactive-vs-active prediction diagnostics.")
 	parser.add_argument("--run_mask_gating_diagnostics", action="store_true", help="Evaluate diagnostic predicted-mask gating of regression outputs.")
 	parser.add_argument("--run_oracle_gating_diagnostics", action="store_true", help="Evaluate diagnostic target-mask oracle gating of regression outputs.")
@@ -158,6 +163,43 @@ def build_argument_parser() -> argparse.ArgumentParser:
 		help="Continue despite checkpoint T/horizon metadata mismatch with the config.",
 	)
 	return parser
+
+
+def _call_model_for_debug(
+	model: torch.nn.Module,
+	x_batch: torch.Tensor,
+	terrain_batch: torch.Tensor | None,
+	*,
+	return_features: bool = False,
+) -> Any:
+	kwargs: dict[str, Any] = {}
+	if terrain_batch is not None:
+		kwargs["terrain"] = terrain_batch
+	if return_features:
+		kwargs["return_features"] = True
+	try:
+		return model(x_batch, **kwargs)
+	except TypeError:
+		if not return_features:
+			raise
+		kwargs.pop("return_features", None)
+		return model(x_batch, **kwargs)
+
+
+def _feature_summary(model_output: Any) -> dict[str, Any]:
+	if not isinstance(model_output, Mapping):
+		return {}
+	summary: dict[str, Any] = {}
+	for key, value in model_output.items():
+		if key in {"prediction", "aux_fire_support_logits"}:
+			continue
+		if torch.is_tensor(value):
+			row = tensor_stats(key, value)
+			row["shape"] = list(value.shape)
+			summary[key] = row
+		elif isinstance(value, Mapping):
+			summary[key] = _to_jsonable(value)
+	return summary
 
 
 def _to_jsonable(value: Any) -> Any:
@@ -1627,7 +1669,7 @@ def _collect_checkpoint_predictions(
 			terrain_batch = terrain_raw.to(device, non_blocking=True) if terrain_raw is not None else None
 			x_batch = _apply_input_normalizer(x_batch, normalizer)
 			with autocast_context(device, amp_dtype):
-				model_output = model(x_batch, terrain=terrain_batch) if terrain_batch is not None else model(x_batch)
+				model_output = _call_model_for_debug(model, x_batch, terrain_batch, return_features=bool(args.return_features))
 			pred, _aux = _extract_prediction_and_aux(model_output)
 			pred = pred.float()
 			_validate_shapes(x_batch, y_batch, pred)
@@ -1827,6 +1869,7 @@ def main() -> None:
 	pred_batches: list[torch.Tensor] = []
 	y_batches: list[torch.Tensor] = []
 	aux_summaries: list[dict[str, Any]] = []
+	feature_summaries: list[dict[str, Any]] = []
 	metadata_rows: list[dict[str, Any]] = []
 	all_metadata_items: list[dict[str, Any]] = []
 	plotted_count = 0
@@ -1847,12 +1890,12 @@ def main() -> None:
 			normalization_row.update(input_batch_summary(x_batch, prefix="model_x"))
 			normalization_rows.append(normalization_row)
 			with autocast_context(device, amp_dtype):
-				model_output = model(x_batch, terrain=terrain_batch) if terrain_batch is not None else model(x_batch)
+				model_output = _call_model_for_debug(model, x_batch, terrain_batch, return_features=bool(args.return_features))
 			pred, aux = _extract_prediction_and_aux(model_output)
 			pred = pred.float()
 			if raw_x_for_comparison is not None:
 				with autocast_context(device, amp_dtype):
-					raw_model_output = model(raw_x_for_comparison, terrain=terrain_batch) if terrain_batch is not None else model(raw_x_for_comparison)
+					raw_model_output = _call_model_for_debug(model, raw_x_for_comparison, terrain_batch, return_features=bool(args.return_features))
 				raw_pred, _raw_aux = _extract_prediction_and_aux(raw_model_output)
 				raw_pred = raw_pred.float()
 				comparison_row: dict[str, Any] = {"batch_index": int(batch_index)}
@@ -1882,6 +1925,8 @@ def main() -> None:
 				print(f"WARNING: batch {batch_index} has no active pixels for active_energy_mw_mae_safe.")
 
 			aux_summaries.append({"batch_index": int(batch_index), "aux": aux})
+			if bool(args.return_features):
+				feature_summaries.append({"batch_index": int(batch_index), "features": _feature_summary(model_output)})
 			pred_cpu = pred.detach().cpu()
 			y_cpu = y_batch.detach().cpu()
 			pred_batches.append(pred_cpu)
@@ -1984,6 +2029,8 @@ def main() -> None:
 	_write_csv(output_dir / "sample_metadata.csv", metadata_rows)
 	save_json(output_dir / "metrics_summary.json", metrics_summary)
 	save_json(output_dir / "aux_summaries.json", aux_summaries)
+	if feature_summaries:
+		save_json(output_dir / "feature_summaries.json", feature_summaries)
 	_save_histograms(figures_dir, aggregate_tensors)
 
 	summary = _summary_text(output_dir, checkpoint_metadata, config_debug, aggregate_stats, metrics_summary, warnings)

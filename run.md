@@ -624,6 +624,93 @@ python scripts/evaluate_trained_models.py \
   --model_architecture cawfe_latte
 ```
 
+## CAWFE-Latte v1.1 Ablation
+
+CAWFE-Latte v1.1 is a separate ablation architecture from v1. It keeps the four encoders, multimodal alignment, fire-query attention fusion, and terrain FiLM conditioning unchanged, then replaces the post-fusion temporal CNN with six residual spatiotemporal blocks and adds a soft fire-support gate before the surface, canopy, and energy regression heads. The mask channel remains raw logits and is not gated.
+
+The support gate is computed as `0.05 + 0.95 * sigmoid(support_logits)` and is supervised with the existing auxiliary fire-support BCE+Dice loss.
+
+Sanity-check v1.1 with:
+
+```bash
+python scripts/sanity_check_project.py \
+  --config configs/experiments/cawfe_latte_v1_1.yaml \
+  --deep
+```
+
+Train with:
+
+```bash
+python scripts/train_forecasting_model.py \
+  --config configs/experiments/cawfe_latte_v1_1.yaml
+```
+
+Run on Slurm with:
+
+```bash
+sbatch scripts/slurm_train_cawfe_latte_v1_1_a10080.sh \
+  configs/experiments/cawfe_latte_v1_1.yaml
+```
+
+Evaluate with:
+
+```bash
+python scripts/evaluate_trained_models.py \
+  --config configs/experiments/cawfe_latte_v1_1.yaml \
+  --mode quantitative \
+  --split test \
+  --model_architecture cawfe_latte_v1_1
+```
+
+## CAWFE-Latte v1.2 Ablation
+
+CAWFE-Latte v1.2 is a separate ablation architecture from v1.1. It keeps the same input data, encoders, multimodal alignment, terrain FiLM conditioning, fire-query fusion, six post-fusion residual spatiotemporal blocks, support-gated regression heads, target construction, and losses. The only architectural change is temporal attention pooling after the v1.1 post-fusion ResBlocks.
+
+The temporal pooling scores each timestep at each pixel with a small 1x1-conv MLP, applies softmax over time, and pools the fused sequence to a single `(B,D,H,W)` feature map for the existing decoder. The final attention-score conv is zero-initialized, so the model starts close to uniform averaging over timesteps.
+
+Sanity-check v1.2 with:
+
+```bash
+python scripts/sanity_check_project.py \
+  --config configs/experiments/cawfe_latte_v1_2.yaml \
+  --deep
+```
+
+Train with:
+
+```bash
+python scripts/train_forecasting_model.py \
+  --config configs/experiments/cawfe_latte_v1_2.yaml
+```
+
+Run on Slurm with:
+
+```bash
+sbatch scripts/slurm_train_cawfe_latte_v1_2_a10080.sh \
+  configs/experiments/cawfe_latte_v1_2.yaml
+```
+
+Evaluate with:
+
+```bash
+python scripts/evaluate_trained_models.py \
+  --config configs/experiments/cawfe_latte_v1_2.yaml \
+  --mode quantitative \
+  --split test \
+  --model_architecture cawfe_latte_v1_2
+```
+
+Inspect temporal-attention features with:
+
+```bash
+python scripts/debug_model_predictions.py \
+  --config configs/experiments/cawfe_latte_v1_2.yaml \
+  --model_architecture cawfe_latte_v1_2 \
+  --split test \
+  --checkpoint artifacts/runs/cawfe_latte_v1_2/<run_name>/checkpoints/best_model.pt \
+  --return_features
+```
+
 ## Rebuilding The Sliding-Window Patch Cache
 Train, validation, and test now all use sliding-window patchification with `patch_size=64` and `stride=60`.
 

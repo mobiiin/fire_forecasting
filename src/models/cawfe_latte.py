@@ -712,6 +712,53 @@ class TemporalSpatialResidualBlock(nn.Module):
 		return y.permute(0, 2, 1, 3, 4).contiguous()
 
 
+class ResidualSpatiotemporalBlock(TemporalSpatialResidualBlock):
+	"""CAWFE-Latte v1.1 residual spatiotemporal block.
+
+	Input and output layout is B x T x D x H x W. Internally the block uses
+	Conv3d over B x D x T x H x W, first mixing time and then local space.
+	"""
+
+	def __init__(self, dim: int, *, temporal_kernel_size: int = 3, spatial_kernel_size: int = 3, dropout: float = 0.1, norm: str = "groupnorm", activation: str = "silu", residual: bool = True) -> None:
+		if str(norm).lower() != "groupnorm":
+			raise ValueError(f"CAWFE-Latte v1.1 supports only post_fusion_backbone.norm='groupnorm', got {norm!r}.")
+		if str(activation).lower() != "silu":
+			raise ValueError(f"CAWFE-Latte v1.1 supports only post_fusion_backbone.activation='silu', got {activation!r}.")
+		super().__init__(
+			dim=int(dim),
+			temporal_kernel_size=int(temporal_kernel_size),
+			spatial_kernel_size=int(spatial_kernel_size),
+			dropout=float(dropout),
+			residual=bool(residual),
+		)
+
+
+class ResidualSpatiotemporalBackbone(nn.Module):
+	"""Six-block same-resolution post-fusion backbone for CAWFE-Latte v1.1."""
+
+	def __init__(self, *, dim: int = 64, num_blocks: int = 6, temporal_kernel_size: int = 3, spatial_kernel_size: int = 3, dropout: float = 0.1, residual: bool = True, type: str = "residual_spatiotemporal", norm: str = "groupnorm", activation: str = "silu") -> None:
+		super().__init__()
+		if str(type).lower() != "residual_spatiotemporal":
+			raise ValueError(f"CAWFE-Latte v1.1 supports only post_fusion_backbone.type='residual_spatiotemporal', got {type!r}.")
+		self.blocks = nn.Sequential(
+			*(
+				ResidualSpatiotemporalBlock(
+					int(dim),
+					temporal_kernel_size=int(temporal_kernel_size),
+					spatial_kernel_size=int(spatial_kernel_size),
+					dropout=float(dropout),
+					norm=str(norm),
+					activation=str(activation),
+					residual=bool(residual),
+				)
+				for _ in range(max(0, int(num_blocks)))
+			)
+		)
+
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		return self.blocks(x)
+
+
 class TemporalCNNBackbone(nn.Module):
 	"""Small temporal CNN backbone over fused sequence features."""
 
@@ -1044,9 +1091,290 @@ class CAWFELatte(nn.Module):
 		return prediction
 
 
+class TemporalAttentionPooling(nn.Module):
+	"""Per-pixel temporal attention pooling for B x T x D x H x W features."""
+
+	def __init__(self, *, dim: int = 64, hidden_dim: int | None = None, score_kernel_size: int = 1, type: str = "attention", enabled: bool = True, softmax_dim: str = "time", initialize_uniform: bool = True, return_attention: bool = True) -> None:
+		super().__init__()
+		if str(type).lower() != "attention":
+			raise ValueError(f"TemporalAttentionPooling supports only type='attention', got {type!r}.")
+		if str(softmax_dim).lower() != "time":
+			raise ValueError(f"TemporalAttentionPooling supports only softmax_dim='time', got {softmax_dim!r}.")
+		self.dim = int(dim)
+		self.hidden_dim = int(hidden_dim or max(1, self.dim // 4))
+		self.enabled = bool(enabled)
+		self.return_attention = bool(return_attention)
+		padding = int(score_kernel_size) // 2
+		self.score_head = nn.Sequential(
+			nn.Conv2d(self.dim, self.hidden_dim, kernel_size=int(score_kernel_size), padding=padding),
+			nn.SiLU(inplace=True),
+			nn.Conv2d(self.hidden_dim, 1, kernel_size=1),
+		)
+		if bool(initialize_uniform):
+			final = self.score_head[-1]
+			if isinstance(final, nn.Conv2d):
+				nn.init.zeros_(final.weight)
+				nn.init.zeros_(final.bias)
+
+	def forward(self, z: torch.Tensor, *, return_attention: bool = False) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+		if z.ndim != 5:
+			raise ValueError(f"TemporalAttentionPooling expects B x T x D x H x W, got {tuple(z.shape)}.")
+		batch, time_steps, dim, height, width = (int(value) for value in z.shape)
+		if dim != self.dim:
+			raise ValueError(f"TemporalAttentionPooling expected D={self.dim}, got D={dim}.")
+		if not self.enabled:
+			pooled = z[:, -1]
+			alpha = torch.zeros(batch, time_steps, 1, height, width, dtype=z.dtype, device=z.device)
+			alpha[:, -1] = 1.0
+			return (pooled, alpha) if return_attention else pooled
+		score = self.score_head(z.reshape(batch * time_steps, dim, height, width)).reshape(batch, time_steps, 1, height, width)
+		alpha = torch.softmax(score, dim=1)
+		pooled = (alpha * z).sum(dim=1)
+		return (pooled, alpha) if return_attention else pooled
+
+
+class CAWFELatteV11(CAWFELatte):
+	"""CAWFE-Latte v1.1 ablation with residual spatiotemporal backbone and support-gated regression heads."""
+
+	def __init__(self, *, post_fusion_backbone: Mapping[str, Any] | None = None, support_gate: Mapping[str, Any] | None = None, **kwargs) -> None:
+		kwargs = dict(kwargs)
+		kwargs.setdefault("version", "v1_1_resblocks_support_gate")
+		super().__init__(**kwargs)
+
+		backbone_config = dict(post_fusion_backbone or {})
+		backbone_config.setdefault("type", "residual_spatiotemporal")
+		backbone_config.setdefault("dim", self.output_dim)
+		backbone_config.setdefault("num_blocks", 6)
+		self.temporal_backbone = ResidualSpatiotemporalBackbone(**backbone_config)
+
+		support_config = dict(support_gate or {})
+		self.support_gate_enabled = bool(support_config.get("enabled", True))
+		self.support_gate_min = float(support_config.get("gate_min", 0.05))
+		self.support_gate_max = float(support_config.get("gate_max", 1.0))
+		if not 0.0 <= self.support_gate_min <= self.support_gate_max:
+			raise ValueError(f"support_gate requires 0 <= gate_min <= gate_max, got {self.support_gate_min}, {self.support_gate_max}.")
+		apply_to = support_config.get("apply_to", ["surface", "canopy", "energy"])
+		self.support_gate_apply_to = {str(name).lower() for name in apply_to}
+		if "mask" in self.support_gate_apply_to:
+			raise ValueError("CAWFE-Latte v1.1 support gate must not be applied to mask logits.")
+		support_head_config = dict(support_config.get("support_head", {})) if isinstance(support_config.get("support_head", {}), Mapping) else {}
+		decoder_out_dim = int(getattr(self.surface_head.proj, "in_channels", self.output_dim))
+		in_dim = int(support_head_config.get("in_dim", decoder_out_dim))
+		if in_dim != decoder_out_dim:
+			raise ValueError(f"support_gate.support_head.in_dim={in_dim} must match decoder feature dim={decoder_out_dim}.")
+		out_channels = int(support_head_config.get("out_channels", 1))
+		if out_channels != 1:
+			raise ValueError("CAWFE-Latte v1.1 support head must output one channel.")
+		kernel_size = int(support_head_config.get("kernel_size", 1))
+		self.support_head = nn.Conv2d(in_dim, 1, kernel_size=kernel_size, padding=kernel_size // 2)
+		# v1.1 uses support_head(decoded) for both the gate and auxiliary fire-support loss.
+		self.aux_fire_support_head = None
+
+	def _gate_regression_heads(self, decoded: torch.Tensor) -> dict[str, torch.Tensor]:
+		raw_surface = self.surface_head(decoded)
+		raw_canopy = self.canopy_head(decoded)
+		raw_mask_logits = self.mask_head(decoded)
+		raw_energy = self.energy_head(decoded)
+		support_logits = self.support_head(decoded)
+		support_prob = torch.sigmoid(support_logits)
+		support_gate = self.support_gate_min + (self.support_gate_max - self.support_gate_min) * support_prob
+		if self.support_gate_enabled:
+			surface = raw_surface * support_gate if "surface" in self.support_gate_apply_to else raw_surface
+			canopy = raw_canopy * support_gate if "canopy" in self.support_gate_apply_to else raw_canopy
+			energy = raw_energy * support_gate if "energy" in self.support_gate_apply_to else raw_energy
+		else:
+			surface, canopy, energy = raw_surface, raw_canopy, raw_energy
+		prediction = torch.cat([surface, canopy, raw_mask_logits, energy], dim=1)
+		return {
+			"prediction": prediction,
+			"support_logits": support_logits,
+			"support_prob": support_prob,
+			"support_gate": support_gate,
+			"raw_surface": raw_surface,
+			"raw_canopy": raw_canopy,
+			"raw_mask_logits": raw_mask_logits,
+			"raw_energy": raw_energy,
+		}
+
+	def forward(self, x: torch.Tensor, terrain: torch.Tensor | None = None, *, return_features: bool = False, return_attention: bool = False):
+		self._validate_input(x)
+		atmosphere = self.atmosphere_encoder(x)
+		wind = self.wind_encoder(x)
+		fire_fuel = self.fire_fuel_encoder(x)
+		flux_energy = self.flux_energy_encoder(x)
+		aligned = self.alignment(atmosphere, wind, fire_fuel, flux_energy)
+		fusion_result = self.fusion(
+			aligned["atmosphere"],
+			aligned["wind"],
+			aligned["fire_fuel"],
+			aligned["flux_energy"],
+			return_attention=return_attention,
+		)
+		if return_attention:
+			fused_tokens, attention = fusion_result
+		else:
+			fused_tokens = fusion_result
+			attention = None
+		spatial_shape = aligned["spatial_shape"]
+		fused_dynamic = tokens_to_grid(fused_tokens, spatial_shape)
+		fused = fused_dynamic
+		terrain_embedding = None
+		if self.use_terrain_conditioning:
+			if terrain is None:
+				raise ValueError("CAWFE-Latte terrain conditioning is enabled but terrain input is missing.")
+			terrain_embedding = self.terrain_encoder(terrain)
+			if tuple(terrain_embedding.shape[-2:]) != tuple(fused_dynamic.shape[-2:]):
+				raise ValueError(f"Terrain encoder grid {tuple(terrain_embedding.shape[-2:])} does not match fused dynamic grid {tuple(fused_dynamic.shape[-2:])}.")
+			fused = self.terrain_film(fused_dynamic, terrain_embedding)
+		local = self.temporal_backbone(fused)
+		aggregated = self.temporal_aggregator(local)
+		decoded = self.decoder(aggregated)
+		head_outputs = self._gate_regression_heads(decoded)
+		prediction = head_outputs["prediction"]
+		support_logits = head_outputs["support_logits"]
+		aux_logits = support_logits if self.aux_fire_support_enabled else None
+		if return_features:
+			features = {
+				"prediction": prediction,
+				"aux_fire_support_logits": aux_logits,
+				"support_logits": support_logits,
+				"support_prob": head_outputs["support_prob"],
+				"support_gate": head_outputs["support_gate"],
+				"raw_surface": head_outputs["raw_surface"],
+				"raw_canopy": head_outputs["raw_canopy"],
+				"raw_mask_logits": head_outputs["raw_mask_logits"],
+				"raw_energy": head_outputs["raw_energy"],
+				"atmosphere": atmosphere,
+				"wind": wind,
+				"fire_fuel": fire_fuel,
+				"flux_energy": flux_energy,
+				"aligned_atmosphere": aligned["atmosphere"],
+				"aligned_wind": aligned["wind"],
+				"aligned_fire_fuel": aligned["fire_fuel"],
+				"aligned_flux_energy": aligned["flux_energy"],
+				"fused_tokens": fused_tokens,
+				"fused_grid": fused_dynamic,
+				"spatial_shape": spatial_shape,
+				"fused": fused,
+				"fused_dynamic": fused_dynamic,
+				"terrain_features": terrain_embedding,
+				"fused_after_terrain": fused if self.use_terrain_conditioning else None,
+				"fused_terrain": fused,
+				"local": local,
+				"post_fusion_features": local,
+				"aggregated": aggregated,
+				"decoded": decoded,
+			}
+			if return_attention:
+				features["fusion_attention"] = attention
+			return features
+		if aux_logits is not None:
+			return {"prediction": prediction, "aux_fire_support_logits": aux_logits, "support_logits": support_logits}
+		return prediction
+
+
+class CAWFELatteV12(CAWFELatteV11):
+	"""CAWFE-Latte v1.2 ablation: v1.1 plus temporal attention pooling after ResBlocks."""
+
+	def __init__(self, *, temporal_pooling: Mapping[str, Any] | None = None, **kwargs) -> None:
+		kwargs = dict(kwargs)
+		kwargs.setdefault("version", "v1_2_temporal_attention_pooling")
+		super().__init__(**kwargs)
+		pooling_config = dict(temporal_pooling or {})
+		pooling_config.setdefault("type", "attention")
+		pooling_config.setdefault("dim", self.output_dim)
+		pooling_config.setdefault("hidden_dim", max(1, self.output_dim // 4))
+		self.temporal_pooling = TemporalAttentionPooling(**pooling_config)
+
+	@staticmethod
+	def _temporal_attention_entropy(alpha: torch.Tensor, eps: float = 1.0e-8) -> torch.Tensor:
+		return -(alpha * torch.log(alpha.clamp_min(float(eps)))).sum(dim=1)
+
+	def forward(self, x: torch.Tensor, terrain: torch.Tensor | None = None, *, return_features: bool = False, return_attention: bool = False):
+		self._validate_input(x)
+		atmosphere = self.atmosphere_encoder(x)
+		wind = self.wind_encoder(x)
+		fire_fuel = self.fire_fuel_encoder(x)
+		flux_energy = self.flux_energy_encoder(x)
+		aligned = self.alignment(atmosphere, wind, fire_fuel, flux_energy)
+		fusion_result = self.fusion(
+			aligned["atmosphere"],
+			aligned["wind"],
+			aligned["fire_fuel"],
+			aligned["flux_energy"],
+			return_attention=return_attention,
+		)
+		if return_attention:
+			fused_tokens, attention = fusion_result
+		else:
+			fused_tokens = fusion_result
+			attention = None
+		spatial_shape = aligned["spatial_shape"]
+		fused_dynamic = tokens_to_grid(fused_tokens, spatial_shape)
+		fused = fused_dynamic
+		terrain_embedding = None
+		if self.use_terrain_conditioning:
+			if terrain is None:
+				raise ValueError("CAWFE-Latte terrain conditioning is enabled but terrain input is missing.")
+			terrain_embedding = self.terrain_encoder(terrain)
+			if tuple(terrain_embedding.shape[-2:]) != tuple(fused_dynamic.shape[-2:]):
+				raise ValueError(f"Terrain encoder grid {tuple(terrain_embedding.shape[-2:])} does not match fused dynamic grid {tuple(fused_dynamic.shape[-2:])}.")
+			fused = self.terrain_film(fused_dynamic, terrain_embedding)
+		local = self.temporal_backbone(fused)
+		pooled, temporal_alpha = self.temporal_pooling(local, return_attention=True)
+		decoded = self.decoder(pooled)
+		head_outputs = self._gate_regression_heads(decoded)
+		prediction = head_outputs["prediction"]
+		support_logits = head_outputs["support_logits"]
+		aux_logits = support_logits if self.aux_fire_support_enabled else None
+		if return_features:
+			features = {
+				"prediction": prediction,
+				"aux_fire_support_logits": aux_logits,
+				"support_logits": support_logits,
+				"support_prob": head_outputs["support_prob"],
+				"support_gate": head_outputs["support_gate"],
+				"temporal_attention_alpha": temporal_alpha,
+				"temporal_attention_entropy": self._temporal_attention_entropy(temporal_alpha),
+				"raw_surface": head_outputs["raw_surface"],
+				"raw_canopy": head_outputs["raw_canopy"],
+				"raw_mask_logits": head_outputs["raw_mask_logits"],
+				"raw_energy": head_outputs["raw_energy"],
+				"atmosphere": atmosphere,
+				"wind": wind,
+				"fire_fuel": fire_fuel,
+				"flux_energy": flux_energy,
+				"aligned_atmosphere": aligned["atmosphere"],
+				"aligned_wind": aligned["wind"],
+				"aligned_fire_fuel": aligned["fire_fuel"],
+				"aligned_flux_energy": aligned["flux_energy"],
+				"fused_tokens": fused_tokens,
+				"fused_grid": fused_dynamic,
+				"spatial_shape": spatial_shape,
+				"fused": fused,
+				"fused_dynamic": fused_dynamic,
+				"terrain_features": terrain_embedding,
+				"fused_after_terrain": fused if self.use_terrain_conditioning else None,
+				"fused_terrain": fused,
+				"local": local,
+				"post_fusion_features": local,
+				"aggregated": pooled,
+				"temporal_pooled_features": pooled,
+				"decoded": decoded,
+			}
+			if return_attention:
+				features["fusion_attention"] = attention
+			return features
+		if aux_logits is not None:
+			return {"prediction": prediction, "aux_fire_support_logits": aux_logits, "support_logits": support_logits}
+		return prediction
+
+
 __all__ = [
 	"AtmosphereEncoder",
 	"CAWFELatte",
+	"CAWFELatteV11",
+	"CAWFELatteV12",
 	"TerrainEncoder",
 	"TerrainFiLMConditioner",
 	"FireFuelEncoder",
@@ -1056,7 +1384,10 @@ __all__ = [
 	"PredictionHead",
 	"ShallowDecoder",
 	"TemporalAggregator",
+	"TemporalAttentionPooling",
 	"TemporalCNNBackbone",
+	"ResidualSpatiotemporalBackbone",
+	"ResidualSpatiotemporalBlock",
 	"TemporalSpatialResidualBlock",
 	"TemporalConvBlock",
 	"WindEncoder",

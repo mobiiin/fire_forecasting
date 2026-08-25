@@ -248,7 +248,7 @@ class MultiTaskLoss(nn.Module):
 		self.background_suppression_reduction = str(background_suppression_config.get("reduction", "mean")).lower()
 		if self.background_suppression_reduction != "mean":
 			raise ValueError("training.loss.background_suppression.reduction currently supports only 'mean'.")
-		self.cawfe_latte_loss_enabled = self.architecture == "cawfe_latte"
+		self.cawfe_latte_loss_enabled = self.architecture in {"cawfe_latte", "cawfe_latte_v1_1", "cawfe_latte_v1_2"}
 		if self.cawfe_latte_loss_enabled:
 			surface_config = _get_section(self.training_loss_config, "surface")
 			canopy_config = _get_section(self.training_loss_config, "canopy")

@@ -74,8 +74,9 @@ def main() -> None:
     config = _ensure_config_path(load_config(config_path), config_path)
     config = _apply_overrides(config, max(1, args.batch_size), max(0, args.num_workers), args.device)
 
-    if str(config.get("model", {}).get("architecture", "")).lower() != "cawfe_latte":
-        raise ValueError("This smoke test expects model.architecture=cawfe_latte.")
+    architecture = str(config.get("model", {}).get("architecture", "")).lower()
+    if architecture not in {"cawfe_latte", "cawfe_latte_v1_1", "cawfe_latte_v1_2"}:
+        raise ValueError("This smoke test expects model.architecture=cawfe_latte, cawfe_latte_v1_1, or cawfe_latte_v1_2.")
     if not bool(config.get("cawfe_latte", {}).get("use_terrain_conditioning", False)):
         raise ValueError("This smoke test expects cawfe_latte.use_terrain_conditioning=true.")
 

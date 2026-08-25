@@ -12,7 +12,7 @@ from src.models.architecture_registry import (
 	get_architecture_spec,
 	resolve_model_architecture,
 )
-from src.models.cawfe_latte import CAWFELatte
+from src.models.cawfe_latte import CAWFELatte, CAWFELatteV11, CAWFELatteV12
 from src.models.convlstm_unet import ConvLSTMUNet, build_convlstm_unet_from_config
 from src.models.earthformer_lite import EarthformerLite
 from src.models.st_mamba_lite import STMamba
@@ -223,6 +223,76 @@ def build_model_from_config(config: Mapping[str, Any], input_channels: int):
 			temporal_aggregation=section.get("temporal_aggregation", {}),
 			decoder=section.get("decoder", {}),
 			heads=section.get("heads", {}),
+			auxiliary=section.get("auxiliary", {}),
+			use_terrain_conditioning=bool(section.get("use_terrain_conditioning", False)),
+			terrain_encoder=section.get("terrain_encoder", {}),
+			terrain_film=section.get("terrain_film", {}),
+			channel_names=_load_channel_names(config),
+			debug_prediction_head=bool(section.get("debug_prediction_head", False)),
+		)
+	if architecture == "cawfe_latte_v1_1":
+		base_section = config.get("cawfe_latte", {})
+		if not isinstance(base_section, Mapping):
+			base_section = {}
+		section = dict(base_section)
+		v11_section = config.get("cawfe_latte_v1_1", {})
+		if isinstance(v11_section, Mapping):
+			section.update({key: value for key, value in v11_section.items() if key not in {"enabled", "inherit_from"}})
+		return CAWFELatteV11(
+			input_channels=int(input_channels),
+			input_sequence_length=int(section.get("input_sequence_length", config.get("input_sequence_length", 1))),
+			output_channels=int(section.get("output_channels", model_config.get("output_channels", 4))),
+			output_dim=int(section.get("output_dim", 64)),
+			version=str(section.get("version", "v1_1_resblocks_support_gate")),
+			atmosphere=section.get("atmosphere", {}),
+			wind=section.get("wind", {}),
+			fire_fuel=section.get("fire_fuel", {}),
+			flux_energy=section.get("flux_energy", {}),
+			fusion=section.get("fusion", {}),
+			alignment=section.get("alignment", {}),
+			backbone=section.get("backbone", {}),
+			post_fusion_backbone=section.get("post_fusion_backbone", {}),
+			temporal_aggregation=section.get("temporal_aggregation", {}),
+			decoder=section.get("decoder", {}),
+			heads=section.get("heads", {}),
+			support_gate=section.get("support_gate", {}),
+			auxiliary=section.get("auxiliary", {}),
+			use_terrain_conditioning=bool(section.get("use_terrain_conditioning", False)),
+			terrain_encoder=section.get("terrain_encoder", {}),
+			terrain_film=section.get("terrain_film", {}),
+			channel_names=_load_channel_names(config),
+			debug_prediction_head=bool(section.get("debug_prediction_head", False)),
+		)
+	if architecture == "cawfe_latte_v1_2":
+		base_section = config.get("cawfe_latte", {})
+		if not isinstance(base_section, Mapping):
+			base_section = {}
+		section = dict(base_section)
+		v11_section = config.get("cawfe_latte_v1_1", {})
+		if isinstance(v11_section, Mapping):
+			section.update({key: value for key, value in v11_section.items() if key not in {"enabled", "inherit_from"}})
+		v12_section = config.get("cawfe_latte_v1_2", {})
+		if isinstance(v12_section, Mapping):
+			section.update({key: value for key, value in v12_section.items() if key not in {"enabled", "inherit_from"}})
+		return CAWFELatteV12(
+			input_channels=int(input_channels),
+			input_sequence_length=int(section.get("input_sequence_length", config.get("input_sequence_length", 1))),
+			output_channels=int(section.get("output_channels", model_config.get("output_channels", 4))),
+			output_dim=int(section.get("output_dim", 64)),
+			version=str(section.get("version", "v1_2_temporal_attention_pooling")),
+			atmosphere=section.get("atmosphere", {}),
+			wind=section.get("wind", {}),
+			fire_fuel=section.get("fire_fuel", {}),
+			flux_energy=section.get("flux_energy", {}),
+			fusion=section.get("fusion", {}),
+			alignment=section.get("alignment", {}),
+			backbone=section.get("backbone", {}),
+			post_fusion_backbone=section.get("post_fusion_backbone", {}),
+			temporal_aggregation=section.get("temporal_aggregation", {}),
+			temporal_pooling=section.get("temporal_pooling", {}),
+			decoder=section.get("decoder", {}),
+			heads=section.get("heads", {}),
+			support_gate=section.get("support_gate", {}),
 			auxiliary=section.get("auxiliary", {}),
 			use_terrain_conditioning=bool(section.get("use_terrain_conditioning", False)),
 			terrain_encoder=section.get("terrain_encoder", {}),

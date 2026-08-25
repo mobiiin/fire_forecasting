@@ -1,0 +1,57 @@
+base_config: cawfe_latte_v1.yaml
+
+experiment:
+  name: cawfe_latte_v1_1
+  description: CAWFE-Latte v1.1 with post-fusion residual spatiotemporal blocks and soft fire-support-gated regression heads.
+
+model:
+  architecture: cawfe_latte_v1_1
+  output_channels: 4
+
+cawfe_latte_v1_1:
+  enabled: true
+  version: v1_1_resblocks_support_gate
+  inherit_from: cawfe_latte
+
+  post_fusion_backbone:
+    type: residual_spatiotemporal
+    dim: 64
+    num_blocks: 6
+    temporal_kernel_size: 3
+    spatial_kernel_size: 3
+    dropout: 0.1
+    norm: groupnorm
+    activation: silu
+    residual: true
+
+  support_gate:
+    enabled: true
+    source: decoder_feature
+    gate_min: 0.05
+    gate_max: 1.0
+    apply_to:
+      - surface
+      - canopy
+      - energy
+    do_not_apply_to:
+      - mask
+    support_head:
+      in_dim: 64
+      out_channels: 1
+      kernel_size: 1
+
+  auxiliary:
+    fire_support_head:
+      enabled: true
+      source: support_logits
+      weight: 0.2
+      loss: bce_dice
+      detach_source: false
+
+training:
+  loss:
+    auxiliary_fire_support:
+      enabled: true
+      weight: 0.2
+    background_suppression:
+      enabled: false
