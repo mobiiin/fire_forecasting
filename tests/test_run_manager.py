@@ -92,16 +92,16 @@ def test_run_manager_saves_exact_and_resolved_config_artifacts(tmp_path: Path) -
 	assert metadata["experiment_name"] == "artifact_demo"
 
 
-def test_run_manager_copies_compatibility_checkpoints_atomically(tmp_path: Path) -> None:
+def test_run_manager_does_not_write_compatibility_checkpoints(tmp_path: Path) -> None:
 	manager = RunManager(_config(tmp_path, run_name="copy_test"), "weatherformer_lite")
 	source = manager.checkpoint_path("best")
 	source.write_bytes(b"checkpoint")
 
 	written = manager.copy_checkpoint_to_compatibility(source, "best")
 
-	assert tmp_path / "checkpoints" / "weatherformer_lite" / "copy_test" / "best_model.pt" in written
-	assert tmp_path / "checkpoints" / "weatherformer_lite" / "best_model.pt" in written
-	assert all(path.read_bytes() == b"checkpoint" for path in written)
+	assert written == []
+	assert not (tmp_path / "checkpoints" / "weatherformer_lite" / "copy_test" / "best_model.pt").exists()
+	assert not (tmp_path / "checkpoints" / "weatherformer_lite" / "best_model.pt").exists()
 
 
 def test_apply_training_cli_overrides_sets_nested_output() -> None:

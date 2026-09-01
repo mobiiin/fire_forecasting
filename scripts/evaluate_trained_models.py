@@ -45,8 +45,6 @@ DEFAULT_ARCHITECTURES = [
 ]
 OPTIONAL_ARCHITECTURES = [
 	"cawfe_latte",
-	"cawfe_latte_v1_1",
-	"cawfe_latte_v1_2",
 	"current_frame_unet",
 	"temporal_3d_unet",
 	"convgru_unet",
@@ -70,8 +68,6 @@ SUPPORTED_MODEL_ARCHITECTURES = {
 	*DEFAULT_ARCHITECTURES,
 	*ARCHITECTURE_ALIASES.keys(),
 	"cawfe_latte",
-	"cawfe_latte_v1_1",
-	"cawfe_latte_v1_2",
 }
 DISPLAY_NAMES = {
 	"persistence": "Persistence",
@@ -82,8 +78,6 @@ DISPLAY_NAMES = {
 	"cawfe_st_mamba": "CAWFE-ST-Mamba",
 	"weatherformer_lite": "WeatherFormer-lite",
 	"cawfe_latte": "CAWFE-Latte v1",
-	"cawfe_latte_v1_1": "CAWFE-Latte v1.1",
-	"cawfe_latte_v1_2": "CAWFE-Latte v1.2",
 }
 
 PAPER_COLUMNS = [

@@ -169,3 +169,11 @@ def test_deprecated_full_validation_every_n_epochs_is_warned_and_ignored(caplog)
 def test_unknown_validation_mode_raises_clear_error() -> None:
 	with pytest.raises(ValueError, match="Unsupported training.validation.mode"):
 		resolve_validation_policy(_config({"mode": "full_periodic"}), val_loader=_loader())
+
+
+def test_cawfe_latte_experiment_uses_fixed_sequential_validation_subset() -> None:
+	from src.config import load_config
+	config = load_config("configs/experiments/cawfe_latte_v1.yaml")
+	policy = resolve_validation_policy(config, val_loader=_loader(length=100, batch_size=1))
+	assert policy["fixed_subset_shuffle"] is False
+	assert policy["selected_batch_indices"] == list(range(50))

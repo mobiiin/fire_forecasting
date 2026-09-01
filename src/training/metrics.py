@@ -153,6 +153,19 @@ def compute_metrics(y_pred: torch.Tensor, y_true: torch.Tensor, config) -> dict[
 				"canopy_mae": float(canopy_abs_error.mean().item()),
 				"canopy_rmse": float(torch.sqrt(torch.mean((pred_canopy - true_canopy) ** 2) + eps).item()),
 			}
+			# Patch-level no-fire metrics expose false positives that aggregate Dice can hide.
+			active_fraction = true_mask.flatten(1).mean(dim=1)
+			no_fire_patches = active_fraction < float(metric_config.get("no_fire_active_fraction_threshold", 0.001))
+			active_patches = ~no_fire_patches
+			results["no_fire_patch_count"] = float(no_fire_patches.sum().item())
+			results["active_patch_count"] = float(active_patches.sum().item())
+			if no_fire_patches.any():
+				results["no_fire_mask_prob_mean"] = float(mask_prob[no_fire_patches].mean().item())
+				results["no_fire_mask_false_positive_rate"] = float(mask_pred[no_fire_patches].mean().item())
+				results["no_fire_surface_pred_mean"] = float(pred_surface[no_fire_patches].mean().item())
+				results["no_fire_canopy_pred_mean"] = float(pred_canopy[no_fire_patches].mean().item())
+			else:
+				for name in ("no_fire_mask_prob_mean", "no_fire_mask_false_positive_rate", "no_fire_surface_pred_mean", "no_fire_canopy_pred_mean"): results[name] = math.nan
 			if energy_output_names:
 				pred_energy_log = y_pred[:, 3:4]
 				true_energy_log = y_true[:, 3:4]
@@ -225,6 +238,8 @@ def compute_metrics(y_pred: torch.Tensor, y_true: torch.Tensor, config) -> dict[
 				results["energy_total_pred_MW_sum"] = float(pred_sum.item())
 				results["energy_total_sum_relative_error"] = float((torch.abs(pred_sum - true_sum) / (torch.abs(true_sum) + eps)).item())
 				results["energy_active_fraction"] = float(true_energy_active.mean().item())
+				if no_fire_patches.any(): results["no_fire_energy_log_pred_mean"] = float(pred_energy_log[no_fire_patches].mean().item())
+				else: results["no_fire_energy_log_pred_mean"] = math.nan
 			return results
 
 		raise ValueError(f"Unsupported task_type: {task_type}")

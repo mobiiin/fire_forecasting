@@ -1,0 +1,53 @@
+base_config: cawfe_latte_v1_2.yaml
+
+experiment:
+  name: cawfe_latte_v1_3
+  description: CAWFE-Latte v1.3 with separate regression support head trained on dilated fire mask.
+
+model:
+  architecture: cawfe_latte_v1_3
+  output_channels: 4
+
+cawfe_latte_v1_3:
+  enabled: true
+  version: v1_3_separate_support_head
+  inherit_from: cawfe_latte_v1_2
+
+  support_gate:
+    enabled: true
+    source: separate_support_head
+    gate_min: 0.05
+    gate_max: 1.0
+    apply_to:
+      - surface
+      - canopy
+      - energy
+    do_not_apply_to:
+      - mask
+    support_head:
+      in_dim: 64
+      out_channels: 1
+      kernel_size: 1
+      bias_init: -2.0
+    support_target:
+      type: dilated_fire_mask
+      dilation_radius: 2
+      dilation_kernel: square
+      include_original_mask: true
+
+  heads:
+    regression_activation: softplus
+    regression_bias_init: 0.1
+    mask_bias_init: -2.0
+
+training:
+  loss:
+    auxiliary_fire_support:
+      enabled: true
+      weight: 0.2
+      target: dilated_fire_mask
+      dilation_radius: 2
+      bce_weight: 1.0
+      dice_weight: 1.0
+    background_suppression:
+      enabled: false

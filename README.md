@@ -319,7 +319,7 @@ The run directory is the source of truth for checkpoints, logs, configs, metadat
 artifacts/runs/convlstm_unet/<run_name>/checkpoints/best_model.pt
 ```
 
-Each run stores `checkpoints/best_model.pt`, `checkpoints/latest_model.pt`, `logs/training_log.csv`, `logs/validation_log.csv`, `logs/timing_log.csv`, `figures/loss_curves.png`, `figures/metric_curves.png`, `configs/resolved_config.yaml`, and `metadata/run_summary.json`. Compatibility checkpoint copies are still written under `artifacts/checkpoints/<architecture>/`, but those files are only conveniences for older evaluation commands and can be replaced by the next run of the same architecture.
+Each run stores `checkpoints/best_model.pt`, `checkpoints/latest_model.pt`, `logs/training_log.csv`, `logs/validation_log.csv`, `logs/timing_log.csv`, `figures/loss_curves.png`, `figures/metric_curves.png`, `configs/resolved_config.yaml`, and `metadata/run_summary.json`. Training no longer writes duplicate compatibility checkpoint copies under `artifacts/checkpoints/<architecture>/`; use the checkpoint inside the specific run directory.
 
 Useful commands:
 
@@ -694,12 +694,12 @@ python scripts/train_earthformer_lite.py --config configs/default.yaml
 
 Test:
 ```bash
-python scripts/test_earthformer_lite.py --config configs/default.yaml --checkpoint artifacts/checkpoints/earthformer_lite/best_model.pt --split test
+python scripts/test_earthformer_lite.py --config configs/default.yaml --checkpoint artifacts/runs/earthformer_lite/<run_name>/checkpoints/best_model.pt --split test
 ```
 
 Compare baselines and model:
 ```bash
-python scripts/evaluate_all_baselines.py --config configs/default.yaml --split test --include_model --checkpoint artifacts/checkpoints/earthformer_lite/best_model.pt --model_architecture earthformer_lite
+python scripts/evaluate_all_baselines.py --config configs/default.yaml --split test --include_model --checkpoint artifacts/runs/earthformer_lite/<run_name>/checkpoints/best_model.pt --model_architecture earthformer_lite
 ```
 
 ## ST-Mamba-Lite Architecture
@@ -736,12 +736,12 @@ python scripts/train_st_mamba_lite.py --config configs/default.yaml
 
 Test:
 ```bash
-python scripts/test_st_mamba_lite.py --config configs/default.yaml --checkpoint artifacts/checkpoints/st_mamba_lite/best_model.pt --split test
+python scripts/test_st_mamba_lite.py --config configs/default.yaml --checkpoint artifacts/runs/st_mamba_lite/<run_name>/checkpoints/best_model.pt --split test
 ```
 
 Compare with baselines:
 ```bash
-python scripts/evaluate_all_baselines.py --config configs/default.yaml --split test --include_model --checkpoint artifacts/checkpoints/st_mamba_lite/best_model.pt --model_architecture st_mamba_lite
+python scripts/evaluate_all_baselines.py --config configs/default.yaml --split test --include_model --checkpoint artifacts/runs/st_mamba_lite/<run_name>/checkpoints/best_model.pt --model_architecture st_mamba_lite
 ```
 
 For real training, install `mamba-ssm` and set `st_mamba_lite.mamba_backend: mamba_ssm`. If `mamba_backend: auto` and `mamba-ssm` is unavailable, the code falls back to a gated sequence block meant for smoke testing and debugging only. Do not treat fallback-backend results as a publishable Mamba comparison.
@@ -789,12 +789,12 @@ python scripts/train_weatherformer_lite.py --config configs/default.yaml
 
 Test:
 ```bash
-python scripts/test_weatherformer_lite.py --config configs/default.yaml --checkpoint artifacts/checkpoints/weatherformer_lite/best_model.pt --split test
+python scripts/test_weatherformer_lite.py --config configs/default.yaml --checkpoint artifacts/runs/weatherformer_lite/<run_name>/checkpoints/best_model.pt --split test
 ```
 
 Compare with baselines:
 ```bash
-python scripts/evaluate_all_baselines.py --config configs/default.yaml --split test --include_model --checkpoint artifacts/checkpoints/weatherformer_lite/best_model.pt --model_architecture weatherformer_lite
+python scripts/evaluate_all_baselines.py --config configs/default.yaml --split test --include_model --checkpoint artifacts/runs/weatherformer_lite/<run_name>/checkpoints/best_model.pt --model_architecture weatherformer_lite
 ```
 
 Notes:
@@ -865,12 +865,12 @@ python scripts/train_st_mamba_lite.py --config configs/default.yaml
 
 Test:
 ```bash
-python scripts/test_st_mamba_lite.py --config configs/default.yaml --checkpoint artifacts/checkpoints/st_mamba_lite/best_model.pt --split test
+python scripts/test_st_mamba_lite.py --config configs/default.yaml --checkpoint artifacts/runs/st_mamba_lite/<run_name>/checkpoints/best_model.pt --split test
 ```
 
 Expected comparison command once the architecture scripts are present:
 ```bash
-python scripts/evaluate_all_baselines.py --config configs/default.yaml --split test --include_model --checkpoint artifacts/checkpoints/st_mamba_lite/best_model.pt --model_architecture st_mamba_lite
+python scripts/evaluate_all_baselines.py --config configs/default.yaml --split test --include_model --checkpoint artifacts/runs/st_mamba_lite/<run_name>/checkpoints/best_model.pt --model_architecture st_mamba_lite
 ```
 
 ## Multitask Labels
@@ -1039,93 +1039,11 @@ python scripts/evaluate_trained_models.py \
   --model_architecture cawfe_latte
 ```
 
-## CAWFE-Latte v1.1 Ablation
+## Archived CAWFE-Latte variants
 
-CAWFE-Latte v1.1 is a separate ablation architecture from v1. It keeps the four encoders, multimodal alignment, fire-query attention fusion, and terrain FiLM conditioning unchanged, then replaces the post-fusion temporal CNN with six residual spatiotemporal blocks and adds a soft fire-support gate before the surface, canopy, and energy regression heads. The mask channel remains raw logits and is not gated.
+Experimental CAWFE-Latte v1.1/v1.2/v1.3 variants were archived after poor validation generalization compared with the original CAWFE-Latte v1. They are not active architectures. Future CAWFE-Latte variants should be reintroduced progressively with one isolated change at a time.
 
-The support gate is computed as `0.05 + 0.95 * sigmoid(support_logits)` and is supervised with the existing auxiliary fire-support BCE+Dice loss.
-
-Sanity-check v1.1 with:
-
-```bash
-python scripts/sanity_check_project.py \
-  --config configs/experiments/cawfe_latte_v1_1.yaml \
-  --deep
-```
-
-Train with:
-
-```bash
-python scripts/train_forecasting_model.py \
-  --config configs/experiments/cawfe_latte_v1_1.yaml
-```
-
-Run on Slurm with:
-
-```bash
-sbatch scripts/slurm_train_cawfe_latte_v1_1_a10080.sh \
-  configs/experiments/cawfe_latte_v1_1.yaml
-```
-
-Evaluate with:
-
-```bash
-python scripts/evaluate_trained_models.py \
-  --config configs/experiments/cawfe_latte_v1_1.yaml \
-  --mode quantitative \
-  --split test \
-  --model_architecture cawfe_latte_v1_1
-```
-
-## CAWFE-Latte v1.2 Ablation
-
-CAWFE-Latte v1.2 is a separate ablation architecture from v1.1. It keeps the same input data, encoders, multimodal alignment, terrain FiLM conditioning, fire-query fusion, six post-fusion residual spatiotemporal blocks, support-gated regression heads, target construction, and losses. The only architectural change is temporal attention pooling after the v1.1 post-fusion ResBlocks.
-
-The temporal pooling scores each timestep at each pixel with a small 1x1-conv MLP, applies softmax over time, and pools the fused sequence to a single `(B,D,H,W)` feature map for the existing decoder. The final attention-score conv is zero-initialized, so the model starts close to uniform averaging over timesteps.
-
-Sanity-check v1.2 with:
-
-```bash
-python scripts/sanity_check_project.py \
-  --config configs/experiments/cawfe_latte_v1_2.yaml \
-  --deep
-```
-
-Train with:
-
-```bash
-python scripts/train_forecasting_model.py \
-  --config configs/experiments/cawfe_latte_v1_2.yaml
-```
-
-Run on Slurm with:
-
-```bash
-sbatch scripts/slurm_train_cawfe_latte_v1_2_a10080.sh \
-  configs/experiments/cawfe_latte_v1_2.yaml
-```
-
-Evaluate with:
-
-```bash
-python scripts/evaluate_trained_models.py \
-  --config configs/experiments/cawfe_latte_v1_2.yaml \
-  --mode quantitative \
-  --split test \
-  --model_architecture cawfe_latte_v1_2
-```
-
-Inspect temporal-attention features with:
-
-```bash
-python scripts/debug_model_predictions.py \
-  --config configs/experiments/cawfe_latte_v1_2.yaml \
-  --model_architecture cawfe_latte_v1_2 \
-  --split test \
-  --checkpoint artifacts/runs/cawfe_latte_v1_2/<run_name>/checkpoints/best_model.pt \
-  --return_features
-```
-
+Archived implementation/config/script/test snapshots live under `archive/failed_cawfe_latte_variants/`.
 
 ## Rebuilt Dataset Pipeline
 
@@ -1186,3 +1104,27 @@ python scripts/visualize_processed_samples.py \
   --config configs/experiments/cawfe_latte_v1.yaml \
   --pattern consecutive5_h10 --split train
 ```
+
+## CAWFE-Latte Ablations
+
+CAWFE-Latte now has one active architecture, `model.architecture: cawfe_latte`. Named A/B/C ablations in `configs/ablations/cawfe_latte_ablations.yaml` change only configurable modules: post-fusion backbone, temporal pooling, regression activation, and optional support gating. Fast mode is only for ranking candidates; use full mode for scientific results.
+
+```bash
+python scripts/run_cawfe_latte_ablations.py --ablations all --mode fast --dry-run
+python scripts/run_cawfe_latte_ablations.py --ablations baseline A_resblocks_only B1_softplus_only C_temporal_attention_only --mode fast
+sbatch scripts/slurm_run_cawfe_latte_ablations_a10080.sh "baseline A_resblocks_only B1_softplus_only C_temporal_attention_only" fast
+```
+
+## Per-epoch CAWFE-Latte fusion vectors
+
+Optionally save one representative post-fusion vector at the start of each epoch:
+
+```yaml
+training:
+  save_fusion_vectors:
+    enabled: true
+    output_name: fusion_vectors_by_epoch.npy
+    vector_reduce: mean_bt_hw
+```
+
+The run writes `features/fusion_vectors_by_epoch.npy` with shape `(num_epochs_completed, fusion_dim)`, plus metadata JSON by default.

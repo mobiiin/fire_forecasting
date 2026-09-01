@@ -208,8 +208,8 @@ python scripts/inspect_patch_cache.py --config configs/default.yaml
 python scripts/compute_normalization.py --config configs/default.yaml --from_cache
 python scripts/smoke_test_earthformer_lite.py --config configs/default.yaml
 python scripts/train_earthformer_lite.py --config configs/default.yaml
-python scripts/test_earthformer_lite.py --config configs/default.yaml --checkpoint artifacts/checkpoints/earthformer_lite/best_model.pt --split test
-python scripts/evaluate_all_baselines.py --config configs/default.yaml --split test --include_model --checkpoint artifacts/checkpoints/earthformer_lite/best_model.pt --model_architecture earthformer_lite
+python scripts/test_earthformer_lite.py --config configs/default.yaml --checkpoint artifacts/runs/earthformer_lite/<run_name>/checkpoints/best_model.pt --split test
+python scripts/evaluate_all_baselines.py --config configs/default.yaml --split test --include_model --checkpoint artifacts/runs/earthformer_lite/<run_name>/checkpoints/best_model.pt --model_architecture earthformer_lite
 ```
 
 Running ST-Mamba-Lite:
@@ -218,8 +218,8 @@ python scripts/inspect_patch_cache.py --config configs/default.yaml
 python scripts/compute_normalization.py --config configs/default.yaml --from_cache
 python scripts/smoke_test_st_mamba_lite.py --config configs/default.yaml
 python scripts/train_st_mamba_lite.py --config configs/default.yaml
-python scripts/test_st_mamba_lite.py --config configs/default.yaml --checkpoint artifacts/checkpoints/st_mamba_lite/best_model.pt --split test
-python scripts/evaluate_all_baselines.py --config configs/default.yaml --split test --include_model --checkpoint artifacts/checkpoints/st_mamba_lite/best_model.pt --model_architecture st_mamba_lite
+python scripts/test_st_mamba_lite.py --config configs/default.yaml --checkpoint artifacts/runs/st_mamba_lite/<run_name>/checkpoints/best_model.pt --split test
+python scripts/evaluate_all_baselines.py --config configs/default.yaml --split test --include_model --checkpoint artifacts/runs/st_mamba_lite/<run_name>/checkpoints/best_model.pt --model_architecture st_mamba_lite
 ```
 
 Train the model:
@@ -241,7 +241,7 @@ Expected outputs:
 - best/latest checkpoints under `artifacts/runs/<architecture>/<run_name>/checkpoints/`
 - CSV logs under `artifacts/runs/<architecture>/<run_name>/logs/`
 - curve images under `artifacts/runs/<architecture>/<run_name>/figures/`
-- compatibility checkpoint copies under `artifacts/checkpoints/<architecture>/`
+- no duplicate compatibility checkpoint copies under `artifacts/checkpoints/<architecture>/`; use the run-local checkpoint path
 - training and validation loss printed each epoch
 
 If validation metrics are oscillating, check whether validation is using `fixed_subset_every_epoch` or `full_every_epoch`. For stable curves, use one of those modes for the whole run and do not mix capped validation with periodic full validation.
@@ -548,7 +548,6 @@ After the run, inspect these outputs:
 - `fire_dataset_index.json`
 - `artifacts/splits/manual_fire_split_resolved.json`
 - `artifacts/normalization_stats.npz`
-- `artifacts/checkpoints/`
 - `artifacts/logs/`
 - the visualization output directory configured for your run
 
@@ -564,8 +563,8 @@ python scripts/inspect_patch_cache.py --config configs/default.yaml
 python scripts/compute_normalization.py --config configs/default.yaml --from_cache
 python scripts/smoke_test_st_mamba_lite.py --config configs/default.yaml
 python scripts/train_st_mamba_lite.py --config configs/default.yaml
-python scripts/test_st_mamba_lite.py --config configs/default.yaml --checkpoint artifacts/checkpoints/st_mamba_lite/best_model.pt --split test
-python scripts/evaluate_all_baselines.py --config configs/default.yaml --split test --include_model --checkpoint artifacts/checkpoints/st_mamba_lite/best_model.pt --model_architecture st_mamba_lite
+python scripts/test_st_mamba_lite.py --config configs/default.yaml --checkpoint artifacts/runs/st_mamba_lite/<run_name>/checkpoints/best_model.pt --split test
+python scripts/evaluate_all_baselines.py --config configs/default.yaml --split test --include_model --checkpoint artifacts/runs/st_mamba_lite/<run_name>/checkpoints/best_model.pt --model_architecture st_mamba_lite
 ```
 
 Notes:
@@ -585,8 +584,8 @@ python scripts/inspect_patch_cache.py --config configs/default.yaml
 python scripts/compute_normalization.py --config configs/default.yaml --from_cache
 python scripts/smoke_test_weatherformer_lite.py --config configs/default.yaml
 python scripts/train_weatherformer_lite.py --config configs/default.yaml
-python scripts/test_weatherformer_lite.py --config configs/default.yaml --checkpoint artifacts/checkpoints/weatherformer_lite/best_model.pt --split test
-python scripts/evaluate_all_baselines.py --config configs/default.yaml --split test --include_model --checkpoint artifacts/checkpoints/weatherformer_lite/best_model.pt --model_architecture weatherformer_lite
+python scripts/test_weatherformer_lite.py --config configs/default.yaml --checkpoint artifacts/runs/weatherformer_lite/<run_name>/checkpoints/best_model.pt --split test
+python scripts/evaluate_all_baselines.py --config configs/default.yaml --split test --include_model --checkpoint artifacts/runs/weatherformer_lite/<run_name>/checkpoints/best_model.pt --model_architecture weatherformer_lite
 ```
 
 Notes:
@@ -624,92 +623,11 @@ python scripts/evaluate_trained_models.py \
   --model_architecture cawfe_latte
 ```
 
-## CAWFE-Latte v1.1 Ablation
+## Archived CAWFE-Latte variants
 
-CAWFE-Latte v1.1 is a separate ablation architecture from v1. It keeps the four encoders, multimodal alignment, fire-query attention fusion, and terrain FiLM conditioning unchanged, then replaces the post-fusion temporal CNN with six residual spatiotemporal blocks and adds a soft fire-support gate before the surface, canopy, and energy regression heads. The mask channel remains raw logits and is not gated.
+Experimental CAWFE-Latte v1.1/v1.2/v1.3 variants were archived after poor validation generalization compared with the original CAWFE-Latte v1. They are not active architectures. Future CAWFE-Latte variants should be reintroduced progressively with one isolated change at a time.
 
-The support gate is computed as `0.05 + 0.95 * sigmoid(support_logits)` and is supervised with the existing auxiliary fire-support BCE+Dice loss.
-
-Sanity-check v1.1 with:
-
-```bash
-python scripts/sanity_check_project.py \
-  --config configs/experiments/cawfe_latte_v1_1.yaml \
-  --deep
-```
-
-Train with:
-
-```bash
-python scripts/train_forecasting_model.py \
-  --config configs/experiments/cawfe_latte_v1_1.yaml
-```
-
-Run on Slurm with:
-
-```bash
-sbatch scripts/slurm_train_cawfe_latte_v1_1_a10080.sh \
-  configs/experiments/cawfe_latte_v1_1.yaml
-```
-
-Evaluate with:
-
-```bash
-python scripts/evaluate_trained_models.py \
-  --config configs/experiments/cawfe_latte_v1_1.yaml \
-  --mode quantitative \
-  --split test \
-  --model_architecture cawfe_latte_v1_1
-```
-
-## CAWFE-Latte v1.2 Ablation
-
-CAWFE-Latte v1.2 is a separate ablation architecture from v1.1. It keeps the same input data, encoders, multimodal alignment, terrain FiLM conditioning, fire-query fusion, six post-fusion residual spatiotemporal blocks, support-gated regression heads, target construction, and losses. The only architectural change is temporal attention pooling after the v1.1 post-fusion ResBlocks.
-
-The temporal pooling scores each timestep at each pixel with a small 1x1-conv MLP, applies softmax over time, and pools the fused sequence to a single `(B,D,H,W)` feature map for the existing decoder. The final attention-score conv is zero-initialized, so the model starts close to uniform averaging over timesteps.
-
-Sanity-check v1.2 with:
-
-```bash
-python scripts/sanity_check_project.py \
-  --config configs/experiments/cawfe_latte_v1_2.yaml \
-  --deep
-```
-
-Train with:
-
-```bash
-python scripts/train_forecasting_model.py \
-  --config configs/experiments/cawfe_latte_v1_2.yaml
-```
-
-Run on Slurm with:
-
-```bash
-sbatch scripts/slurm_train_cawfe_latte_v1_2_a10080.sh \
-  configs/experiments/cawfe_latte_v1_2.yaml
-```
-
-Evaluate with:
-
-```bash
-python scripts/evaluate_trained_models.py \
-  --config configs/experiments/cawfe_latte_v1_2.yaml \
-  --mode quantitative \
-  --split test \
-  --model_architecture cawfe_latte_v1_2
-```
-
-Inspect temporal-attention features with:
-
-```bash
-python scripts/debug_model_predictions.py \
-  --config configs/experiments/cawfe_latte_v1_2.yaml \
-  --model_architecture cawfe_latte_v1_2 \
-  --split test \
-  --checkpoint artifacts/runs/cawfe_latte_v1_2/<run_name>/checkpoints/best_model.pt \
-  --return_features
-```
+Archived implementation/config/script/test snapshots live under `archive/failed_cawfe_latte_variants/`.
 
 ## Rebuilding The Sliding-Window Patch Cache
 Train, validation, and test now all use sliding-window patchification with `patch_size=64` and `stride=60`.

@@ -26,7 +26,7 @@ DEFAULT_OUTPUT_CONFIG: dict[str, Any] = {
 	"root_dir": "artifacts/runs",
 	"checkpoint_root": "artifacts/checkpoints",
 	"log_root": "artifacts/logs",
-	"save_compatibility_checkpoints": True,
+	"save_compatibility_checkpoints": False,
 	"update_architecture_latest_checkpoint": True,
 	"save_epoch_checkpoints": False,
 	"save_best_checkpoint": True,
@@ -403,26 +403,9 @@ class RunManager:
 		return self.checkpoint_root / self.architecture / filename
 
 	def copy_checkpoint_to_compatibility(self, source_path: str | Path, kind: str) -> list[Path]:
-		"""Atomically copy a checkpoint into compatibility locations."""
+		"""Compatibility checkpoint copies are disabled; canonical checkpoints live under each run directory."""
 
-		if not bool(self.output_config.get("save_compatibility_checkpoints", True)):
-			return []
-		source = Path(source_path).expanduser().resolve()
-		if not source.exists():
-			raise FileNotFoundError(f"Cannot copy missing checkpoint: {source}")
-
-		destinations = [self.compatibility_checkpoint_path(kind)]
-		if bool(self.output_config.get("update_architecture_latest_checkpoint", True)):
-			destinations.append(self.architecture_latest_checkpoint_path(kind))
-
-		written: list[Path] = []
-		for destination in destinations:
-			destination.parent.mkdir(parents=True, exist_ok=True)
-			temp_path = destination.with_name(f".{destination.name}.tmp.{os.getpid()}")
-			shutil.copy2(source, temp_path)
-			os.replace(temp_path, destination)
-			written.append(destination)
-		return written
+		return []
 
 	def prune_epoch_checkpoints(self, keep_last: int | None) -> list[Path]:
 		"""Remove old epoch checkpoints from this run only."""

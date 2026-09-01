@@ -201,7 +201,7 @@ def main() -> None:
 		architecture = str(config.get("model", {}).get("architecture", "")).lower()
 		cawfe_config = config.get("cawfe_latte", {}) if isinstance(config.get("cawfe_latte", {}), Mapping) else {}
 		variant_config = config.get(architecture, {}) if isinstance(config.get(architecture, {}), Mapping) else {}
-		terrain_required = bool(variant_config.get("use_terrain_conditioning", cawfe_config.get("use_terrain_conditioning", False))) if architecture in {"cawfe_latte_v1_1", "cawfe_latte_v1_2"} else bool(cawfe_config.get("use_terrain_conditioning", False))
+		terrain_required = bool(cawfe_config.get("use_terrain_conditioning", False))
 		if terrain_required and terrain_batch is None: raise ValueError("CAWFE-Latte terrain conditioning is enabled but sanity batch has no terrain.")
 		if terrain_batch is not None:
 			if terrain_batch.ndim != 4 or int(terrain_batch.shape[1]) != 4 or tuple(terrain_batch.shape[-2:]) != tuple(y_batch.shape[-2:]): raise ValueError(f"Terrain batch must be B,4,H,W aligned with targets; got terrain={tuple(terrain_batch.shape)} y={tuple(y_batch.shape)}")
@@ -213,24 +213,6 @@ def main() -> None:
 		with torch.no_grad(): model_output = model(x_batch, terrain=terrain_batch) if terrain_batch is not None else model(x_batch)
 		prediction = extract_prediction(model_output)
 		if tuple(prediction.shape) != (int(x_batch.shape[0]), 4, int(y_batch.shape[2]), int(y_batch.shape[3])): raise ValueError(f"Processed model output shape mismatch: {tuple(prediction.shape)}")
-		if architecture in {"cawfe_latte_v1_1", "cawfe_latte_v1_2"}:
-			with torch.no_grad(): feature_output = model(x_batch, terrain=terrain_batch, return_features=True) if terrain_batch is not None else model(x_batch, return_features=True)
-			feature_prediction = extract_prediction(feature_output)
-			aux_logits = feature_output.get("aux_fire_support_logits") if isinstance(feature_output, Mapping) else None
-			support_gate = feature_output.get("support_gate") if isinstance(feature_output, Mapping) else None
-			raw_mask_logits = feature_output.get("raw_mask_logits") if isinstance(feature_output, Mapping) else None
-			if not torch.is_tensor(aux_logits) or tuple(aux_logits.shape) != (int(x_batch.shape[0]), 1, int(y_batch.shape[2]), int(y_batch.shape[3])): raise ValueError(f"CAWFE-Latte v1.1 aux_fire_support_logits shape mismatch: {None if aux_logits is None else tuple(aux_logits.shape)}")
-			if not torch.is_tensor(support_gate): raise ValueError("CAWFE-Latte v1.1 return_features=True must include support_gate.")
-			gate_min = float(support_gate.min())
-			gate_max = float(support_gate.max())
-			if gate_min < 0.05 - 1.0e-5 or gate_max > 1.0 + 1.0e-5: raise ValueError(f"CAWFE-Latte v1.1 support_gate outside [0.05, 1.0]: min={gate_min} max={gate_max}")
-			if not torch.is_tensor(raw_mask_logits) or not torch.allclose(raw_mask_logits, feature_prediction[:, 2:3], atol=1.0e-6, rtol=1.0e-5): raise ValueError(f"{architecture} mask logits appear to be gated or missing raw_mask_logits.")
-			if architecture == "cawfe_latte_v1_2":
-				alpha = feature_output.get("temporal_attention_alpha") if isinstance(feature_output, Mapping) else None
-				if not torch.is_tensor(alpha): raise ValueError("CAWFE-Latte v1.2 return_features=True must include temporal_attention_alpha.")
-				if tuple(alpha.shape) != (int(x_batch.shape[0]), int(x_batch.shape[1]), 1, int(y_batch.shape[2]), int(y_batch.shape[3])): raise ValueError(f"CAWFE-Latte v1.2 temporal_attention_alpha shape mismatch: {tuple(alpha.shape)}")
-				alpha_sum = alpha.sum(dim=1)
-				if not torch.allclose(alpha_sum, torch.ones_like(alpha_sum), atol=1.0e-5, rtol=1.0e-5): raise ValueError("CAWFE-Latte v1.2 temporal_attention_alpha must sum to 1 over time.")
 		criterion = get_loss_function(config)
 		loss_result = criterion(model_output, y_batch)
 		loss_value = loss_result["total_loss"] if isinstance(loss_result, Mapping) else loss_result

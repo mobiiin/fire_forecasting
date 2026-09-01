@@ -19,7 +19,7 @@ set -euo pipefail
 REPO_ROOT="/home/mhabibp/fire_forecasting"
 cd "${REPO_ROOT}"
 
-mkdir -p artifacts/logs artifacts/checkpoints /tmp/mhabibp_mplconfig
+mkdir -p artifacts/logs /tmp/mhabibp_mplconfig
 
 export MPLCONFIGDIR=/tmp/mhabibp_mplconfig
 export PYTHONUNBUFFERED=1

@@ -57,6 +57,7 @@ def _weighted_mean(loss_map: torch.Tensor, weights: torch.Tensor) -> torch.Tenso
 	return torch.sum(loss_map * weights) / torch.clamp(weights.sum(), min=1.0)
 
 
+
 def _build_weight_map(active_mask: torch.Tensor, active_weight: float, background_weight: float) -> torch.Tensor:
 	"""Create a floating-point weight map from a binary active mask."""
 
@@ -248,7 +249,7 @@ class MultiTaskLoss(nn.Module):
 		self.background_suppression_reduction = str(background_suppression_config.get("reduction", "mean")).lower()
 		if self.background_suppression_reduction != "mean":
 			raise ValueError("training.loss.background_suppression.reduction currently supports only 'mean'.")
-		self.cawfe_latte_loss_enabled = self.architecture in {"cawfe_latte", "cawfe_latte_v1_1", "cawfe_latte_v1_2"}
+		self.cawfe_latte_loss_enabled = self.architecture == "cawfe_latte"
 		if self.cawfe_latte_loss_enabled:
 			surface_config = _get_section(self.training_loss_config, "surface")
 			canopy_config = _get_section(self.training_loss_config, "canopy")
@@ -264,11 +265,16 @@ class MultiTaskLoss(nn.Module):
 			self.cawfe_mask_dice_weight = float(mask_config.get("dice_weight", 1.0))
 			self.aux_fire_support_enabled = bool(aux_config.get("enabled", True))
 			self.aux_fire_support_weight = float(aux_config.get("weight", 0.2))
+			self.aux_fire_support_target = str(aux_config.get("target", "original_mask")).lower()
+			self.aux_fire_support_dilation_radius = int(aux_config.get("dilation_radius", 0))
+			if self.aux_fire_support_target not in {"original_mask", "dilated_mask"}: raise ValueError("auxiliary_fire_support.target must be original_mask or dilated_mask.")
 		else:
 			self.cawfe_mask_bce_weight = 1.0
 			self.cawfe_mask_dice_weight = 1.0
 			self.aux_fire_support_enabled = False
 			self.aux_fire_support_weight = 0.0
+			self.aux_fire_support_target = "original_mask"
+			self.aux_fire_support_dilation_radius = 0
 
 	def _energy_threshold_in_target_space(self) -> float:
 		"""Convert the physical active threshold into target space."""
@@ -393,6 +399,14 @@ class MultiTaskLoss(nn.Module):
 		return torch.stack(terms).mean()
 
 
+
+	def _support_target(self, true_mask: torch.Tensor) -> torch.Tensor:
+		"""Use saved masks directly or derive a dilation only for the auxiliary loss."""
+		if self.aux_fire_support_target == "original_mask" or self.aux_fire_support_dilation_radius <= 0:
+			return true_mask
+		radius = self.aux_fire_support_dilation_radius
+		return F.max_pool2d(true_mask, kernel_size=2 * radius + 1, stride=1, padding=radius)
+
 	def _bce_dice_parts(self, pred_logits: torch.Tensor, true_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 		if pred_logits.shape != true_mask.shape:
 			raise ValueError(f"BCE+Dice expects matching shapes, got {tuple(pred_logits.shape)} and {tuple(true_mask.shape)}.")
@@ -433,12 +447,12 @@ class MultiTaskLoss(nn.Module):
 			canopy_loss = self._cawfe_huber(pred_canopy_consumed, true_canopy_consumed)
 			mask_bce, mask_dice, mask_loss = self._bce_dice_parts(pred_mask_logits, true_mask)
 			energy_loss = self._cawfe_huber(pred_energy_log, true_energy_log) if self.energy_output_names else torch.zeros((), dtype=y_pred.dtype, device=y_pred.device)
-			aux_logits = aux_outputs.get("aux_fire_support_logits")
+			aux_logits = aux_outputs.get("support_logits", aux_outputs.get("aux_fire_support_logits"))
 			aux_bce = torch.zeros((), dtype=y_pred.dtype, device=y_pred.device)
 			aux_dice = torch.zeros((), dtype=y_pred.dtype, device=y_pred.device)
 			aux_total = torch.zeros((), dtype=y_pred.dtype, device=y_pred.device)
 			if self.aux_fire_support_enabled and torch.is_tensor(aux_logits):
-				aux_bce, aux_dice, aux_total = self._bce_dice_parts(aux_logits, true_mask)
+				aux_bce, aux_dice, aux_total = self._bce_dice_parts(aux_logits, self._support_target(true_mask))
 			weighted_surface = self.surface_loss_weight * surface_loss
 			weighted_canopy = self.canopy_loss_weight * canopy_loss
 			weighted_mask = self.segmentation_loss_weight * mask_loss

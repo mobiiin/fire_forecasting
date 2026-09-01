@@ -1,0 +1,196 @@
+ablations:
+  baseline:
+    description: Original CAWFE-Latte baseline.
+    base_config: configs/experiments/cawfe_latte_baseline.yaml
+    changed_from_baseline: []
+    overrides:
+      experiment.name: cawfe_latte_baseline
+      cawfe_latte.ablation.name: baseline
+      cawfe_latte.post_fusion_backbone.type: small_cnn
+      cawfe_latte.temporal_pooling.type: last
+      cawfe_latte.regression.activation: none
+      cawfe_latte.support_gate.enabled: false
+  A_resblocks_only:
+    description: Replace the small post-fusion CNN with six residual spatiotemporal
+      blocks.
+    base_config: configs/experiments/cawfe_latte_baseline.yaml
+    changed_from_baseline:
+    - post_fusion_backbone
+    overrides:
+      experiment.name: cawfe_latte_A_resblocks_only
+      cawfe_latte.post_fusion_backbone.type: residual_spatiotemporal
+      cawfe_latte.post_fusion_backbone.num_blocks: 6
+      cawfe_latte.ablation.name: A_resblocks_only
+      cawfe_latte.temporal_pooling.type: last
+      cawfe_latte.regression.activation: none
+      cawfe_latte.support_gate.enabled: false
+  B1_softplus_only:
+    description: Use softplus for continuous regression outputs.
+    base_config: configs/experiments/cawfe_latte_baseline.yaml
+    changed_from_baseline:
+    - regression_activation
+    overrides:
+      experiment.name: cawfe_latte_B1_softplus_only
+      cawfe_latte.regression.activation: softplus
+      cawfe_latte.regression.bias_init: -5.0
+      cawfe_latte.ablation.name: B1_softplus_only
+      cawfe_latte.post_fusion_backbone.type: small_cnn
+      cawfe_latte.temporal_pooling.type: last
+      cawfe_latte.support_gate.enabled: false
+  B2_support_gate_mask_target:
+    description: Add a support gate trained against the original mask.
+    base_config: configs/experiments/cawfe_latte_baseline.yaml
+    changed_from_baseline:
+    - support_gate
+    overrides:
+      experiment.name: cawfe_latte_B2_support_gate_mask_target
+      cawfe_latte.support_gate.enabled: true
+      cawfe_latte.support_gate.source: separate_support_head
+      cawfe_latte.support_gate.gate_min: 0.05
+      cawfe_latte.support_gate.target: original_mask
+      training.loss.auxiliary_fire_support.enabled: true
+      training.loss.auxiliary_fire_support.weight: 0.2
+      training.loss.auxiliary_fire_support.target: original_mask
+      cawfe_latte.ablation.name: B2_support_gate_mask_target
+      cawfe_latte.post_fusion_backbone.type: small_cnn
+      cawfe_latte.temporal_pooling.type: last
+      cawfe_latte.regression.activation: none
+  B3_support_gate_dilated_target:
+    description: Add a support gate trained against a radius-two dilated mask.
+    base_config: configs/experiments/cawfe_latte_baseline.yaml
+    changed_from_baseline:
+    - support_gate_target
+    overrides:
+      experiment.name: cawfe_latte_B3_support_gate_dilated_target
+      cawfe_latte.support_gate.enabled: true
+      cawfe_latte.support_gate.source: separate_support_head
+      cawfe_latte.support_gate.gate_min: 0.05
+      cawfe_latte.support_gate.target: dilated_mask
+      cawfe_latte.support_gate.dilation_radius: 2
+      training.loss.auxiliary_fire_support.enabled: true
+      training.loss.auxiliary_fire_support.weight: 0.2
+      training.loss.auxiliary_fire_support.target: dilated_mask
+      training.loss.auxiliary_fire_support.dilation_radius: 2
+      cawfe_latte.ablation.name: B3_support_gate_dilated_target
+      cawfe_latte.post_fusion_backbone.type: small_cnn
+      cawfe_latte.temporal_pooling.type: last
+      cawfe_latte.regression.activation: none
+  C_temporal_attention_only:
+    description: Replace last-timestep aggregation with temporal attention pooling.
+    base_config: configs/experiments/cawfe_latte_baseline.yaml
+    changed_from_baseline:
+    - temporal_pooling
+    overrides:
+      experiment.name: cawfe_latte_C_temporal_attention_only
+      cawfe_latte.temporal_pooling.type: attention
+      cawfe_latte.temporal_pooling.hidden_dim: 16
+      cawfe_latte.temporal_pooling.initialize_uniform: true
+      cawfe_latte.ablation.name: C_temporal_attention_only
+      cawfe_latte.post_fusion_backbone.type: small_cnn
+      cawfe_latte.regression.activation: none
+      cawfe_latte.support_gate.enabled: false
+  D_resblocks_temporal_attention:
+    description: Combine residual spatiotemporal blocks and temporal attention.
+    base_config: configs/experiments/cawfe_latte_baseline.yaml
+    changed_from_baseline:
+    - post_fusion_backbone
+    - temporal_pooling
+    overrides:
+      experiment.name: cawfe_latte_D_resblocks_temporal_attention
+      cawfe_latte.post_fusion_backbone.type: residual_spatiotemporal
+      cawfe_latte.post_fusion_backbone.num_blocks: 6
+      cawfe_latte.temporal_pooling.type: attention
+      cawfe_latte.temporal_pooling.hidden_dim: 16
+      cawfe_latte.temporal_pooling.initialize_uniform: true
+      cawfe_latte.ablation.name: D_resblocks_temporal_attention
+      cawfe_latte.regression.activation: none
+      cawfe_latte.support_gate.enabled: false
+  E_resblocks_support_gate:
+    description: Combine residual blocks with support-gated softplus regression.
+    base_config: configs/experiments/cawfe_latte_baseline.yaml
+    changed_from_baseline:
+    - post_fusion_backbone
+    - support_gate
+    - regression_activation
+    overrides:
+      experiment.name: cawfe_latte_E_resblocks_support_gate
+      cawfe_latte.post_fusion_backbone.type: residual_spatiotemporal
+      cawfe_latte.post_fusion_backbone.num_blocks: 6
+      cawfe_latte.regression.activation: softplus
+      cawfe_latte.regression.bias_init: -5.0
+      cawfe_latte.support_gate.enabled: true
+      cawfe_latte.support_gate.source: separate_support_head
+      cawfe_latte.support_gate.gate_min: 0.05
+      training.loss.auxiliary_fire_support.enabled: true
+      training.loss.auxiliary_fire_support.weight: 0.2
+      training.loss.auxiliary_fire_support.target: original_mask
+      cawfe_latte.ablation.name: E_resblocks_support_gate
+      cawfe_latte.temporal_pooling.type: last
+  F_resblocks_temporal_attention_support_gate:
+    description: Combine residual blocks, temporal attention, and support-gated softplus
+      regression.
+    base_config: configs/experiments/cawfe_latte_baseline.yaml
+    changed_from_baseline:
+    - post_fusion_backbone
+    - temporal_pooling
+    - support_gate
+    - regression_activation
+    overrides:
+      experiment.name: cawfe_latte_F_resblocks_temporal_attention_support_gate
+      cawfe_latte.post_fusion_backbone.type: residual_spatiotemporal
+      cawfe_latte.post_fusion_backbone.num_blocks: 6
+      cawfe_latte.temporal_pooling.type: attention
+      cawfe_latte.temporal_pooling.hidden_dim: 16
+      cawfe_latte.temporal_pooling.initialize_uniform: true
+      cawfe_latte.regression.activation: softplus
+      cawfe_latte.regression.bias_init: -5.0
+      cawfe_latte.support_gate.enabled: true
+      cawfe_latte.support_gate.source: separate_support_head
+      cawfe_latte.support_gate.gate_min: 0.05
+      training.loss.auxiliary_fire_support.enabled: true
+      training.loss.auxiliary_fire_support.weight: 0.2
+      training.loss.auxiliary_fire_support.target: original_mask
+      cawfe_latte.ablation.name: F_resblocks_temporal_attention_support_gate
+  B4_support_gate_softplus_mask_target:
+    description: Add support gating plus softplus regression.
+    base_config: configs/experiments/cawfe_latte_baseline.yaml
+    changed_from_baseline:
+    - support_gate
+    - regression_activation
+    overrides:
+      experiment.name: cawfe_latte_B4_support_gate_softplus_mask_target
+      cawfe_latte.support_gate.enabled: true
+      cawfe_latte.support_gate.source: separate_support_head
+      cawfe_latte.support_gate.gate_min: 0.05
+      cawfe_latte.support_gate.target: original_mask
+      training.loss.auxiliary_fire_support.enabled: true
+      training.loss.auxiliary_fire_support.weight: 0.2
+      training.loss.auxiliary_fire_support.target: original_mask
+      cawfe_latte.regression.activation: softplus
+      cawfe_latte.regression.bias_init: -5.0
+      cawfe_latte.ablation.name: B4_support_gate_softplus_mask_target
+      cawfe_latte.post_fusion_backbone.type: small_cnn
+      cawfe_latte.temporal_pooling.type: last
+  B5_support_gate_softplus_dilated_target:
+    description: Add support gating plus softplus regression.
+    base_config: configs/experiments/cawfe_latte_baseline.yaml
+    changed_from_baseline:
+    - support_gate
+    - support_gate_target
+    - regression_activation
+    overrides:
+      experiment.name: cawfe_latte_B5_support_gate_softplus_dilated_target
+      cawfe_latte.support_gate.enabled: true
+      cawfe_latte.support_gate.source: separate_support_head
+      cawfe_latte.support_gate.gate_min: 0.05
+      cawfe_latte.support_gate.target: dilated_mask
+      cawfe_latte.support_gate.dilation_radius: 2
+      training.loss.auxiliary_fire_support.enabled: true
+      training.loss.auxiliary_fire_support.weight: 0.2
+      training.loss.auxiliary_fire_support.target: dilated_mask
+      training.loss.auxiliary_fire_support.dilation_radius: 2
+      cawfe_latte.regression.activation: softplus
+      cawfe_latte.regression.bias_init: -5.0
+      cawfe_latte.ablation.name: B5_support_gate_softplus_dilated_target
+      cawfe_latte.post_fusion_backbone.type: small_cnn
+      cawfe_latte.temporal_pooling.type: last

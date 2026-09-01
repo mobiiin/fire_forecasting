@@ -62,6 +62,7 @@ from src.models.model_factory import build_model_from_config
 from src.training.checkpoints import latest_and_best_checkpoint_paths, load_checkpoint, save_checkpoint, validate_checkpoint_model_compatibility
 from src.training.cuda_prefetcher import CUDAPrefetcher
 from src.training.early_stopping import build_early_stopping
+from src.training.fusion_vector_logger import FusionVectorLogger
 from src.training.hardware import (
 	autocast_context,
 	cap_num_workers_by_slurm,
@@ -2066,8 +2067,8 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 
 	def _checkpoint_extra_state() -> dict[str, Any]:
 		cawfe_latte_metadata = {}
-		if architecture in {"cawfe_latte", "cawfe_latte_v1_1", "cawfe_latte_v1_2"}:
-			cawfe_config = _get_section(config, "cawfe_latte_v1_1") if architecture == "cawfe_latte_v1_1" else (_get_section(config, "cawfe_latte_v1_2") if architecture == "cawfe_latte_v1_2" else _get_section(config, "cawfe_latte"))
+		if architecture == "cawfe_latte":
+			cawfe_config = _get_section(config, "cawfe_latte")
 			loss_config_for_meta = _get_section(_get_section(config, "training"), "loss")
 			cawfe_latte_metadata = {
 				"version": cawfe_config.get("version", "v1_end_to_end"),
@@ -2130,10 +2131,20 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 
 	partial_training_result["early_stopping"] = _early_stopping_summary()
 
+	fusion_vector_logger = FusionVectorLogger(config, run_manager.run_dir)
+	fusion_vector_batch = None
+	if fusion_vector_logger.enabled:
+		# Obtain one fixed batch once, so monitoring does not perturb the epoch sampler.
+		fusion_vector_batch = next(iter(train_loader))
+		logger.info("Saving one post-fusion vector per epoch to %s", fusion_vector_logger.output_path)
+
 	for epoch_index in range(start_epoch, epochs):
 		epoch_number = epoch_index + 1
 		epoch_start_time = time.perf_counter()
 		logger.info("Epoch %s/%s", epoch_number, epochs)
+		if fusion_vector_logger.enabled:
+			fusion_vector_logger.collect_epoch_vector(model, fusion_vector_batch, device, epoch_number)
+			fusion_vector_logger.save()
 
 		train_results = _run_epoch(
 			model=model,
@@ -2261,8 +2272,6 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 			)
 			if not best_checkpoint_path.exists():
 				raise RuntimeError(f"Best checkpoint was not created at: {best_checkpoint_path}")
-			for compatibility_path in run_manager.copy_checkpoint_to_compatibility(best_checkpoint_path, "best"):
-				logger.info("Updated compatibility best checkpoint: %s", compatibility_path)
 		elif is_best_epoch:
 			best_val_loss = val_loss
 
@@ -2279,8 +2288,6 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 			)
 			if not latest_checkpoint_path.exists():
 				raise RuntimeError(f"Latest checkpoint was not created at: {latest_checkpoint_path}")
-			for compatibility_path in run_manager.copy_checkpoint_to_compatibility(latest_checkpoint_path, "latest"):
-				logger.info("Updated compatibility latest checkpoint: %s", compatibility_path)
 
 		if save_epoch_checkpoints and (epoch_number % save_every_n_epochs == 0 or epoch_number == epochs):
 			epoch_checkpoint_path = run_manager.checkpoint_path("epoch", epoch=epoch_number)
@@ -2349,6 +2356,9 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 		)
 		if early_stopper.should_stop:
 			break
+
+	if fusion_vector_logger.enabled:
+		fusion_vector_logger.save()
 
 	test_results: dict[str, float] = {}
 	test_plot_results: dict[str, float] = {}

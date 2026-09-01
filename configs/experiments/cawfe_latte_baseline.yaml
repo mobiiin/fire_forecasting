@@ -1,28 +1,23 @@
 base_config: ../derived/default_with_fire_mask_thresholds.yaml
-
 experiment:
-  name: cawfe_latte_v1
-  description: End-to-end CAWFE-Latte on rebuilt processed temporal patches with terrain conditioning.
-
+  name: cawfe_latte_baseline
+  description: End-to-end CAWFE-Latte on rebuilt processed temporal patches with terrain
+    conditioning.
 model:
   architecture: cawfe_latte
   input_channels: 129
   output_channels: 4
-
 energy_release:
   enabled: true
   output_mode: total
   target_transform: log1p
-
 input_sequence_length: 5
 prediction_horizon: 10
 batch_size: 8
 learning_rate: 0.0003
-
 processed_dataset:
   root: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1
   version: cawfe_engineered_v1
-
 dataloader:
   source: processed_full_frames
   dataset_root: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1
@@ -33,11 +28,9 @@ dataloader:
   return_terrain: auto
   terrain_key: terrain_features
   input_key: x_engineered
-
 cache:
   enabled: false
   use_precomputed_patches: false
-
 normalization:
   enabled: true
   require_stats: true
@@ -46,7 +39,6 @@ normalization:
   path: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1/normalization/latest_normalization_sparse5_h10.json
   npz_path: /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1/normalization/latest_normalization_sparse5_h10.npz
   allow_val_test_fit: false
-
 cawfe_latte:
   enabled: true
   version: v1_end_to_end
@@ -56,7 +48,6 @@ cawfe_latte:
   output_dim: 64
   use_terrain_conditioning: true
   debug_prediction_head: false
-
   atmosphere:
     out_dim: 64
     vertical_mixing: attention
@@ -68,7 +59,6 @@ cawfe_latte:
     out_dim: 64
   flux_energy:
     out_dim: 64
-
   alignment:
     enabled: true
     spatial:
@@ -81,14 +71,13 @@ cawfe_latte:
       enabled: true
       norm_type: layernorm
       separate_norm_per_modality: true
-      eps: 1.0e-5
+      eps: 1.0e-05
     temporal:
       enabled: true
       max_time: 16
       add_positional_embedding: true
       learned_positional_embedding: true
       shared_across_modalities: true
-
   fusion:
     input_format: tokens
     dim: 64
@@ -100,24 +89,21 @@ cawfe_latte:
     attention_force_math: true
     query_source: fire_fuel
     key_value_sources:
-      - atmosphere
-      - wind
-      - flux_energy
-
+    - atmosphere
+    - wind
+    - flux_energy
   terrain_encoder:
     in_channels: 4
     hidden_dim: 32
     out_dim: 64
     activation: gelu
     norm: groupnorm
-
   terrain_film:
     dim: 64
     use_scale: true
     use_shift: true
     scale_init_zero: true
     shift_init_zero: true
-
   backbone:
     type: temporal_cnn
     dim: 64
@@ -128,10 +114,8 @@ cawfe_latte:
     residual: true
     norm: groupnorm
     activation: silu
-
   temporal_aggregation:
     mode: last
-
   decoder:
     type: shallow_cnn
     in_dim: 64
@@ -140,7 +124,6 @@ cawfe_latte:
     dropout: 0.1
     norm: groupnorm
     activation: silu
-
   heads:
     surface:
       activation: none
@@ -150,7 +133,6 @@ cawfe_latte:
       activation: logits
     energy:
       activation: none
-
   auxiliary:
     fire_support_head:
       enabled: true
@@ -158,7 +140,16 @@ cawfe_latte:
       weight: 0.2
       loss: bce_dice
       detach_source: false
-
+  ablation:
+    name: baseline
+  post_fusion_backbone:
+    type: small_cnn
+  temporal_pooling:
+    type: last
+  regression:
+    activation: none
+  support_gate:
+    enabled: false
 data_loader:
   batch_size: 8
   num_workers: 8
@@ -180,7 +171,6 @@ data_loader:
     persistent_workers: true
     prefetch_factor: 2
     drop_last: false
-
 training:
   batch_size: 8
   input_sequence_length: 5
@@ -196,7 +186,6 @@ training:
   gradient_accumulation_steps: 1
   run_external_test_after_training: false
   run_test_after_training: false
-
   early_stopping:
     enabled: true
     monitor: val_loss
@@ -209,7 +198,6 @@ training:
     save_latest_on_stop: true
     verbose: true
     stop_on_nan: true
-
   checkpointing:
     monitor: val_loss
     mode: min
@@ -217,7 +205,6 @@ training:
     save_latest: true
     save_every_n_epochs: null
     keep_last_n_epoch_checkpoints: 3
-
   output:
     root_dir: artifacts/runs
     checkpoint_root: artifacts/checkpoints
@@ -237,7 +224,6 @@ training:
     save_cache_manifest_copy: false
     save_normalization_stats_copy: true
     copy_normalization_npz: false
-
   loss:
     surface:
       type: huber
@@ -261,7 +247,6 @@ training:
       weight: 0.2
     background_suppression:
       enabled: false
-
   performance:
     precision: auto
     allow_tf32: true
@@ -279,7 +264,6 @@ training:
     compute_val_metrics: true
     max_train_batches_per_epoch: 200
     max_val_batches_per_epoch: 50
-
   validation:
     mode: fixed_subset_every_epoch
     max_val_samples_per_epoch: null
@@ -289,7 +273,12 @@ training:
     fixed_subset_seed: 42
     fixed_subset_shuffle: false
     use_same_metric_for_checkpointing: true
-
+  save_fusion_vectors:
+    enabled: false
+    output_name: fusion_vectors_by_epoch.npy
+    sample_source: first_train_batch
+    vector_reduce: mean_bt_hw
+    save_metadata: true
 evaluation:
   split: test
   batch_size: 8

@@ -20,7 +20,7 @@ CONFIG_PATH="${1:-${CONFIG_PATH:-configs/default.yaml}}"
 RUN_NAME="${RUN_NAME:-}"
 
 cd "${REPO_ROOT}"
-mkdir -p artifacts/logs artifacts/checkpoints /tmp/mhabibp_mplconfig
+mkdir -p artifacts/logs /tmp/mhabibp_mplconfig
 
 export MPLCONFIGDIR=/tmp/mhabibp_mplconfig
 export PYTHONUNBUFFERED=1

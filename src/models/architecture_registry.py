@@ -83,42 +83,14 @@ ARCHITECTURE_REGISTRY: dict[str, ArchitectureSpec] = {
 		supports_tiled_inference=False,
 		custom_architecture=True,
 	),
-	"cawfe_latte_v1_1": ArchitectureSpec(
-		name="cawfe_latte_v1_1",
-		requires_fixed_patch_size=False,
-		patch_divisibility=1,
-		input_type="sequence",
-		supports_sequence=True,
-		output_type="final_step_map",
-		expected_input_shape="(B, T, C, H, W)",
-		expected_output_shape="(B, 4, H, W)",
-		supports_patch_cache=True,
-		supports_tiled_inference=False,
-		custom_architecture=True,
-		ablation_ready=True,
-	),
-	"cawfe_latte_v1_2": ArchitectureSpec(
-		name="cawfe_latte_v1_2",
-		requires_fixed_patch_size=False,
-		patch_divisibility=1,
-		input_type="sequence",
-		supports_sequence=True,
-		output_type="final_step_map",
-		expected_input_shape="(B, T, C, H, W)",
-		expected_output_shape="(B, 4, H, W)",
-		supports_patch_cache=True,
-		supports_tiled_inference=False,
-		custom_architecture=True,
-		ablation_ready=True,
-	),
 }
 
 ARCHITECTURE_ALIASES = {
 	"cawfe_st_mamba": "st_mamba_lite",
 }
 
-REMOVED_ARCHITECTURES = {"cawfe_latte_lite"}
-REMOVED_ARCHITECTURE_MESSAGE = "The old CAWFE-Latte-Lite implementation has been removed. A new design will be added later."
+REMOVED_ARCHITECTURES = {"cawfe_latte_lite", "cawfe_latte_v1_1", "cawfe_latte_v1_2", "cawfe_latte_v1_3"}
+REMOVED_ARCHITECTURE_MESSAGE = "The old CAWFE-Latte-Lite implementation has been removed. Experimental CAWFE-Latte v1.1/v1.2/v1.3 variants were archived; use cawfe_latte or restore from archive/failed_cawfe_latte_variants."
 
 
 def resolve_model_architecture(config: Mapping[str, Any]) -> str:

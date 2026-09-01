@@ -1244,6 +1244,14 @@ training:
   epochs: 20
   max_epochs: 50
 
+  # Optional CAWFE-Latte post-fusion feature logging. Disabled by default.
+  save_fusion_vectors:
+    enabled: false
+    output_name: fusion_vectors_by_epoch.npy
+    sample_source: first_train_batch
+    vector_reduce: mean_bt_hw
+    save_metadata: true
+
   early_stopping:
     enabled: true
     monitor: val_loss
@@ -1269,7 +1277,7 @@ training:
     root_dir: ${paths.runs_root}
     checkpoint_root: ${paths.artifacts_root}/checkpoints
     log_root: ${paths.logs_root}
-    save_compatibility_checkpoints: true
+    save_compatibility_checkpoints: false
     update_architecture_latest_checkpoint: true
     save_epoch_checkpoints: false
     save_best_checkpoint: true
