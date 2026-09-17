@@ -1,0 +1,20 @@
+base_config: cawfe_latte_baseline.yaml
+
+experiment:
+  name: cawfe_latte_ablation_O_fourier_postfusion
+
+cawfe_latte:
+  ablation:
+    name: O_fourier_postfusion
+  post_fusion_backbone:
+    type: spectral_fourier
+    dim: 64
+    num_blocks: 2
+    modes_h: 16
+    modes_w: 16
+    residual: true
+    dropout: 0.1
+
+training:
+  output:
+    root_dir: artifacts/ablations/cawfe_latte/O_fourier_postfusion

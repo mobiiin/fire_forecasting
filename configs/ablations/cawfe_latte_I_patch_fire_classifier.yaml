@@ -1,0 +1,20 @@
+base_config: cawfe_latte_baseline.yaml
+
+experiment:
+  name: cawfe_latte_ablation_I_patch_fire_classifier
+
+cawfe_latte:
+  ablation:
+    name: I_patch_fire_classifier
+  patch_fire_head:
+    enabled: true
+    hidden_dim: 32
+    dropout: 0.1
+
+training:
+  loss:
+    patch_fire:
+      enabled: true
+      weight: 0.2
+  output:
+    root_dir: artifacts/ablations/cawfe_latte/I_patch_fire_classifier

@@ -1,0 +1,21 @@
+base_config: cawfe_latte_baseline.yaml
+
+experiment:
+  name: cawfe_latte_ablation_E_earthformer_lite
+
+cawfe_latte:
+  ablation:
+    name: E_earthformer_lite
+  post_fusion_backbone:
+    type: cuboid_attention_lite
+    dim: 64
+    num_blocks: 2
+    num_heads: 4
+    cuboid_size: [2, 8, 8]
+    mlp_ratio: 2.0
+    dropout: 0.1
+    use_shifted_cuboids: true
+
+training:
+  output:
+    root_dir: artifacts/ablations/cawfe_latte/E_earthformer_lite

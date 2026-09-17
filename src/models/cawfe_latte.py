@@ -13,6 +13,8 @@ from types import SimpleNamespace
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from src.models.mamba_backend import build_mamba_layer
+
 try:
 	import torch
 	import torch.nn as nn
@@ -684,6 +686,38 @@ class FireQueryCrossAttentionFusion(nn.Module):
 		return z
 
 
+class ConcatProjectionFusion(nn.Module):
+	"""Simple aligned-grid concatenation and 1x1 projection without attention."""
+
+	def __init__(self, *, dim: int = 64) -> None:
+		super().__init__()
+		self.dim = int(dim)
+		self.projection = nn.Sequential(
+			nn.Conv2d(4 * self.dim, self.dim, kernel_size=1),
+			nn.GroupNorm(_group_count(self.dim), self.dim),
+			nn.SiLU(inplace=True),
+		)
+
+	def forward(
+		self,
+		atmosphere: torch.Tensor,
+		wind: torch.Tensor,
+		fire_fuel: torch.Tensor,
+		flux_energy: torch.Tensor,
+	) -> torch.Tensor:
+		inputs = (atmosphere, wind, fire_fuel, flux_energy)
+		if any(tensor.ndim != 5 for tensor in inputs):
+			raise ValueError("ConcatProjectionFusion inputs must be B x T x D x H x W.")
+		if not all(tensor.shape == atmosphere.shape for tensor in inputs):
+			raise ValueError("ConcatProjectionFusion inputs must have identical shapes.")
+		if int(atmosphere.shape[2]) != self.dim:
+			raise ValueError(f"ConcatProjectionFusion expected D={self.dim}, got {int(atmosphere.shape[2])}.")
+		batch, time_steps, _, height, width = (int(value) for value in atmosphere.shape)
+		concatenated = torch.cat(inputs, dim=2)
+		projected = self.projection(concatenated.reshape(batch * time_steps, 4 * self.dim, height, width))
+		return projected.reshape(batch, time_steps, self.dim, height, width)
+
+
 class TemporalSpatialResidualBlock(nn.Module):
 	"""Efficient residual block mixing time then local space."""
 
@@ -713,7 +747,7 @@ class TemporalSpatialResidualBlock(nn.Module):
 
 
 class ResidualSpatiotemporalBlock(TemporalSpatialResidualBlock):
-	"""CAWFE-Latte v1.1 residual spatiotemporal block.
+	"""Same-resolution residual spatiotemporal block.
 
 	Input and output layout is B x T x D x H x W. Internally the block uses
 	Conv3d over B x D x T x H x W, first mixing time and then local space.
@@ -721,9 +755,9 @@ class ResidualSpatiotemporalBlock(TemporalSpatialResidualBlock):
 
 	def __init__(self, dim: int, *, temporal_kernel_size: int = 3, spatial_kernel_size: int = 3, dropout: float = 0.1, norm: str = "groupnorm", activation: str = "silu", residual: bool = True) -> None:
 		if str(norm).lower() != "groupnorm":
-			raise ValueError(f"CAWFE-Latte v1.1 supports only post_fusion_backbone.norm='groupnorm', got {norm!r}.")
+			raise ValueError(f"Residual spatiotemporal blocks require norm='groupnorm', got {norm!r}.")
 		if str(activation).lower() != "silu":
-			raise ValueError(f"CAWFE-Latte v1.1 supports only post_fusion_backbone.activation='silu', got {activation!r}.")
+			raise ValueError(f"Residual spatiotemporal blocks require activation='silu', got {activation!r}.")
 		super().__init__(
 			dim=int(dim),
 			temporal_kernel_size=int(temporal_kernel_size),
@@ -734,12 +768,12 @@ class ResidualSpatiotemporalBlock(TemporalSpatialResidualBlock):
 
 
 class ResidualSpatiotemporalBackbone(nn.Module):
-	"""Six-block same-resolution post-fusion backbone for CAWFE-Latte v1.1."""
+	"""Configurable-depth same-resolution residual spatiotemporal backbone."""
 
 	def __init__(self, *, dim: int = 64, num_blocks: int = 6, temporal_kernel_size: int = 3, spatial_kernel_size: int = 3, dropout: float = 0.1, residual: bool = True, type: str = "residual_spatiotemporal", norm: str = "groupnorm", activation: str = "silu") -> None:
 		super().__init__()
 		if str(type).lower() != "residual_spatiotemporal":
-			raise ValueError(f"CAWFE-Latte v1.1 supports only post_fusion_backbone.type='residual_spatiotemporal', got {type!r}.")
+			raise ValueError(f"Expected post_fusion_backbone.type='residual_spatiotemporal', got {type!r}.")
 		self.blocks = nn.Sequential(
 			*(
 				ResidualSpatiotemporalBlock(
@@ -757,6 +791,259 @@ class ResidualSpatiotemporalBackbone(nn.Module):
 
 	def forward(self, x: torch.Tensor) -> torch.Tensor:
 		return self.blocks(x)
+
+
+class MultiScaleContextBackbone(nn.Module):
+	"""Residual dilated spatial context applied independently at each timestep."""
+
+	def __init__(self, *, dim: int = 64, hidden_dim: int | None = None, type: str = "multiscale_context") -> None:
+		super().__init__()
+		if str(type).lower() != "multiscale_context":
+			raise ValueError(f"Expected post_fusion_backbone.type='multiscale_context', got {type!r}.")
+		channels = int(dim)
+		branch_channels = int(hidden_dim) if hidden_dim not in (None, 0) else max(1, channels // 2)
+		self.dilations = (1, 2, 4)
+		self.branches = nn.ModuleList(
+			[
+				nn.Sequential(
+					nn.Conv2d(channels, branch_channels, kernel_size=3, padding=dilation, dilation=dilation),
+					nn.GroupNorm(_group_count(branch_channels), branch_channels),
+					nn.SiLU(inplace=True),
+				)
+				for dilation in self.dilations
+			]
+		)
+		self.projection = nn.Sequential(
+			nn.Conv2d(branch_channels * len(self.dilations), channels, kernel_size=1),
+			nn.GroupNorm(_group_count(channels), channels),
+		)
+		self.activation = nn.SiLU(inplace=True)
+
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		if x.ndim != 5:
+			raise ValueError(f"MultiScaleContextBackbone expects B x T x D x H x W, got {tuple(x.shape)}.")
+		batch, time_steps, channels, height, width = (int(value) for value in x.shape)
+		flat = x.reshape(batch * time_steps, channels, height, width)
+		context = self.projection(torch.cat([branch(flat) for branch in self.branches], dim=1))
+		return self.activation(flat + context).reshape(batch, time_steps, channels, height, width)
+
+
+
+def window_partition(x: torch.Tensor, window_size: int) -> torch.Tensor:
+	"""Partition a padded B x H x W x D tensor into local spatial windows."""
+	if x.ndim != 4:
+		raise ValueError(f"window_partition expects B x H x W x D, got {tuple(x.shape)}.")
+	batch, height, width, dim = (int(value) for value in x.shape)
+	window = int(window_size)
+	if height % window or width % window:
+		raise ValueError(f"Padded spatial shape {(height, width)} must be divisible by window_size={window}.")
+	return x.reshape(batch, height // window, window, width // window, window, dim).permute(0, 1, 3, 2, 4, 5).contiguous().reshape(-1, window * window, dim)
+
+
+def window_reverse(windows: torch.Tensor, window_size: int, batch: int, height: int, width: int) -> torch.Tensor:
+	"""Reverse :func:`window_partition` to B x H x W x D."""
+	window = int(window_size)
+	return windows.reshape(int(batch), int(height) // window, int(width) // window, window, window, int(windows.shape[-1])).permute(0, 1, 3, 2, 4, 5).contiguous().reshape(int(batch), int(height), int(width), int(windows.shape[-1]))
+
+
+class LocalWindowAttentionBlock(nn.Module):
+	"""Per-timestep non-overlapping window attention with automatic padding."""
+
+	def __init__(self, dim: int, *, num_heads: int = 4, window_size: int = 8, mlp_ratio: float = 2.0, dropout: float = 0.1) -> None:
+		super().__init__()
+		self.dim = int(dim); self.window_size = int(window_size)
+		if self.dim % int(num_heads): raise ValueError(f"num_heads={num_heads} must divide dim={self.dim}.")
+		if self.window_size < 1: raise ValueError("window_size must be positive.")
+		hidden = max(1, int(round(self.dim * float(mlp_ratio))))
+		self.norm1 = nn.LayerNorm(self.dim)
+		self.attention = nn.MultiheadAttention(self.dim, int(num_heads), dropout=float(dropout), batch_first=True)
+		self.dropout = nn.Dropout(float(dropout)); self.norm2 = nn.LayerNorm(self.dim)
+		self.mlp = nn.Sequential(nn.Linear(self.dim, hidden), nn.GELU(), nn.Dropout(float(dropout)), nn.Linear(hidden, self.dim), nn.Dropout(float(dropout)))
+
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		if x.ndim != 5: raise ValueError(f"LocalWindowAttentionBlock expects B x T x D x H x W, got {tuple(x.shape)}.")
+		batch, time_steps, dim, height, width = (int(value) for value in x.shape)
+		if dim != self.dim: raise ValueError(f"LocalWindowAttentionBlock expected D={self.dim}, got {dim}.")
+		pad_h = (-height) % self.window_size; pad_w = (-width) % self.window_size
+		flat = F.pad(x.reshape(batch * time_steps, dim, height, width), (0, pad_w, 0, pad_h))
+		padded_h, padded_w = height + pad_h, width + pad_w
+		windows = window_partition(flat.permute(0, 2, 3, 1).contiguous(), self.window_size)
+		normalized = self.norm1(windows)
+		attended, _ = self.attention(normalized, normalized, normalized, need_weights=False)
+		windows = windows + self.dropout(attended)
+		windows = windows + self.mlp(self.norm2(windows))
+		grid = window_reverse(windows, self.window_size, batch * time_steps, padded_h, padded_w)[:, :height, :width]
+		return grid.permute(0, 3, 1, 2).contiguous().reshape(batch, time_steps, dim, height, width)
+
+
+class LocalWindowAttentionBackbone(nn.Module):
+	"""Shape-preserving stack of local spatial attention blocks."""
+
+	def __init__(self, *, dim: int = 64, num_blocks: int = 2, num_heads: int = 4, window_size: int = 8, mlp_ratio: float = 2.0, dropout: float = 0.1) -> None:
+		super().__init__(); self.local_window_attention_enabled = True; self.window_size = int(window_size)
+		self.blocks = nn.ModuleList([LocalWindowAttentionBlock(int(dim), num_heads=int(num_heads), window_size=self.window_size, mlp_ratio=float(mlp_ratio), dropout=float(dropout)) for _ in range(max(0, int(num_blocks)))])
+
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		for block in self.blocks: x = block(x)
+		return x
+
+
+def cuboid_partition(x: torch.Tensor, cuboid_size: Sequence[int]) -> torch.Tensor:
+	"""Partition padded B x T x H x W x D features into space-time cuboids."""
+	if x.ndim != 5: raise ValueError(f"cuboid_partition expects B x T x H x W x D, got {tuple(x.shape)}.")
+	ct, ch, cw = (int(value) for value in cuboid_size)
+	batch, time_steps, height, width, dim = (int(value) for value in x.shape)
+	if time_steps % ct or height % ch or width % cw: raise ValueError(f"Padded shape {(time_steps, height, width)} must be divisible by cuboid {(ct, ch, cw)}.")
+	return x.reshape(batch, time_steps // ct, ct, height // ch, ch, width // cw, cw, dim).permute(0, 1, 3, 5, 2, 4, 6, 7).contiguous().reshape(-1, ct * ch * cw, dim)
+
+
+def cuboid_reverse(windows: torch.Tensor, cuboid_size: Sequence[int], batch: int, time_steps: int, height: int, width: int) -> torch.Tensor:
+	"""Reverse :func:`cuboid_partition` to B x T x H x W x D."""
+	ct, ch, cw = (int(value) for value in cuboid_size)
+	return windows.reshape(int(batch), int(time_steps) // ct, int(height) // ch, int(width) // cw, ct, ch, cw, int(windows.shape[-1])).permute(0, 1, 4, 2, 5, 3, 6, 7).contiguous().reshape(int(batch), int(time_steps), int(height), int(width), int(windows.shape[-1]))
+
+
+class CuboidAttentionBlock(nn.Module):
+	"""Local joint space-time attention over padded cuboids."""
+
+	def __init__(self, dim: int, *, num_heads: int = 4, cuboid_size: Sequence[int] = (2, 8, 8), shifted: bool = False, mlp_ratio: float = 2.0, dropout: float = 0.1) -> None:
+		super().__init__(); self.dim = int(dim); self.cuboid_size = tuple(int(value) for value in cuboid_size); self.shifted = bool(shifted)
+		if len(self.cuboid_size) != 3 or any(value < 1 for value in self.cuboid_size): raise ValueError(f"cuboid_size must contain three positive integers, got {cuboid_size}.")
+		if self.dim % int(num_heads): raise ValueError(f"num_heads={num_heads} must divide dim={self.dim}.")
+		hidden = max(1, int(round(self.dim * float(mlp_ratio))))
+		self.norm1 = nn.LayerNorm(self.dim); self.attention = nn.MultiheadAttention(self.dim, int(num_heads), dropout=float(dropout), batch_first=True); self.dropout = nn.Dropout(float(dropout)); self.norm2 = nn.LayerNorm(self.dim)
+		self.mlp = nn.Sequential(nn.Linear(self.dim, hidden), nn.GELU(), nn.Dropout(float(dropout)), nn.Linear(hidden, self.dim), nn.Dropout(float(dropout)))
+
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		if x.ndim != 5: raise ValueError(f"CuboidAttentionBlock expects B x T x D x H x W, got {tuple(x.shape)}.")
+		batch, time_steps, dim, height, width = (int(value) for value in x.shape)
+		if dim != self.dim: raise ValueError(f"CuboidAttentionBlock expected D={self.dim}, got {dim}.")
+		ct = min(self.cuboid_size[0], time_steps); ch, cw = self.cuboid_size[1:]
+		pad_t, pad_h, pad_w = (-time_steps) % ct, (-height) % ch, (-width) % cw
+		grid = F.pad(x.permute(0, 2, 1, 3, 4).contiguous(), (0, pad_w, 0, pad_h, 0, pad_t)).permute(0, 2, 3, 4, 1).contiguous()
+		padded_shape = (time_steps + pad_t, height + pad_h, width + pad_w)
+		shift = (ct // 2, ch // 2, cw // 2) if self.shifted else (0, 0, 0)
+		if self.shifted: grid = torch.roll(grid, shifts=tuple(-value for value in shift), dims=(1, 2, 3))
+		windows = cuboid_partition(grid, (ct, ch, cw)); normalized = self.norm1(windows)
+		attended, _ = self.attention(normalized, normalized, normalized, need_weights=False)
+		windows = windows + self.dropout(attended); windows = windows + self.mlp(self.norm2(windows))
+		grid = cuboid_reverse(windows, (ct, ch, cw), batch, *padded_shape)
+		if self.shifted: grid = torch.roll(grid, shifts=shift, dims=(1, 2, 3))
+		grid = grid[:, :time_steps, :height, :width]
+		return grid.permute(0, 1, 4, 2, 3).contiguous()
+
+
+class CuboidAttentionLiteBackbone(nn.Module):
+	"""Lightweight Earthformer-style alternating regular/shifted cuboid attention."""
+
+	def __init__(self, *, dim: int = 64, num_blocks: int = 2, num_heads: int = 4, cuboid_size: Sequence[int] = (2, 8, 8), use_shifted_cuboids: bool = True, mlp_ratio: float = 2.0, dropout: float = 0.1) -> None:
+		super().__init__(); self.cuboid_size = tuple(int(value) for value in cuboid_size); self.use_shifted_cuboids = bool(use_shifted_cuboids)
+		self.blocks = nn.ModuleList([CuboidAttentionBlock(int(dim), num_heads=int(num_heads), cuboid_size=self.cuboid_size, shifted=self.use_shifted_cuboids and index % 2 == 1, mlp_ratio=float(mlp_ratio), dropout=float(dropout)) for index in range(max(0, int(num_blocks)))])
+
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		for block in self.blocks: x = block(x)
+		return x
+
+
+class SpectralConv2d(nn.Module):
+	"""Learned low-frequency 2D Fourier transform for one timestep."""
+
+	def __init__(self, dim: int, *, modes_h: int = 16, modes_w: int = 16) -> None:
+		super().__init__(); self.dim = int(dim); self.modes_h = int(modes_h); self.modes_w = int(modes_w)
+		if self.modes_h < 1 or self.modes_w < 1: raise ValueError("modes_h and modes_w must be positive.")
+		self.weight = nn.Parameter(torch.randn(self.dim, self.dim, self.modes_h, self.modes_w, 2) / max(1, self.dim))
+
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		if x.ndim != 4 or int(x.shape[1]) != self.dim: raise ValueError(f"SpectralConv2d expects B x {self.dim} x H x W, got {tuple(x.shape)}.")
+		original_dtype = x.dtype; frequency = torch.fft.rfft2(x.float(), norm="ortho")
+		mh = min(self.modes_h, int(frequency.shape[-2])); mw = min(self.modes_w, int(frequency.shape[-1])); output = torch.zeros_like(frequency)
+		weight = torch.view_as_complex(self.weight[:, :, :mh, :mw].contiguous())
+		output[:, :, :mh, :mw] = torch.einsum("bihw,iohw->bohw", frequency[:, :, :mh, :mw], weight)
+		return torch.fft.irfft2(output, s=x.shape[-2:], norm="ortho").to(dtype=original_dtype)
+
+
+class SpectralFourierBlock(nn.Module):
+	"""Fourier global mixing plus a local convolutional residual branch."""
+
+	def __init__(self, dim: int, *, modes_h: int = 16, modes_w: int = 16, residual: bool = True, dropout: float = 0.1) -> None:
+		super().__init__(); self.residual = bool(residual); self.spectral = SpectralConv2d(int(dim), modes_h=int(modes_h), modes_w=int(modes_w)); self.local = nn.Conv2d(int(dim), int(dim), kernel_size=3, padding=1); self.dropout = nn.Dropout2d(float(dropout)); self.norm = nn.GroupNorm(_group_count(int(dim)), int(dim)); self.activation = nn.SiLU(inplace=True)
+
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		if x.ndim != 5: raise ValueError(f"SpectralFourierBlock expects B x T x D x H x W, got {tuple(x.shape)}.")
+		batch, time_steps, dim, height, width = (int(value) for value in x.shape); flat = x.reshape(batch * time_steps, dim, height, width)
+		mixed = self.dropout(self.spectral(flat) + self.local(flat)); mixed = flat + mixed if self.residual else mixed
+		return self.activation(self.norm(mixed)).reshape(batch, time_steps, dim, height, width)
+
+
+class SpectralFourierBackbone(nn.Module):
+	"""Shape-preserving per-timestep spectral post-fusion backbone."""
+
+	def __init__(self, *, dim: int = 64, num_blocks: int = 2, modes_h: int = 16, modes_w: int = 16, residual: bool = True, dropout: float = 0.1) -> None:
+		super().__init__(); self.blocks = nn.ModuleList([SpectralFourierBlock(int(dim), modes_h=int(modes_h), modes_w=int(modes_w), residual=bool(residual), dropout=float(dropout)) for _ in range(max(0, int(num_blocks)))])
+
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		for block in self.blocks: x = block(x)
+		return x
+
+
+class SpatiotemporalMambaBlock(nn.Module):
+	"""Official Mamba temporal scan followed by a spatial raster scan."""
+
+	def __init__(self, dim: int, *, expansion: int = 2, dropout: float = 0.1, backend: str = "mamba_ssm", d_state: int = 16, d_conv: int = 4, scan_order: str = "temporal_then_spatial") -> None:
+		super().__init__()
+		if str(scan_order).lower() != "temporal_then_spatial": raise ValueError(f"SpatiotemporalMambaBlock supports only scan_order='temporal_then_spatial', got {scan_order!r}.")
+		if str(backend).lower() != "mamba_ssm": raise ValueError("The CAWFE-Latte Mamba ablation requires backend='mamba_ssm'; fallback surrogates are not allowed.")
+		self.dim = int(dim); self.scan_order = "temporal_then_spatial"; self.backend_name = "mamba_ssm"
+		self.temporal_norm = nn.LayerNorm(self.dim); self.spatial_norm = nn.LayerNorm(self.dim)
+		self.temporal_mamba = build_mamba_layer(self.dim, int(d_state), int(d_conv), int(expansion), "mamba_ssm")
+		self.spatial_mamba = build_mamba_layer(self.dim, int(d_state), int(d_conv), int(expansion), "mamba_ssm")
+		self.dropout = nn.Dropout(float(dropout))
+
+	@staticmethod
+	def to_temporal_sequences(x: torch.Tensor) -> tuple[torch.Tensor, tuple[int, int, int, int, int]]:
+		if x.ndim != 5: raise ValueError(f"Expected B x T x D x H x W, got {tuple(x.shape)}.")
+		shape = tuple(int(value) for value in x.shape)
+		batch, time_steps, dim, height, width = shape
+		return x.permute(0, 3, 4, 1, 2).contiguous().reshape(batch * height * width, time_steps, dim), shape
+
+	@staticmethod
+	def from_temporal_sequences(sequence: torch.Tensor, shape: tuple[int, int, int, int, int]) -> torch.Tensor:
+		batch, time_steps, dim, height, width = shape
+		return sequence.reshape(batch, height, width, time_steps, dim).permute(0, 3, 4, 1, 2).contiguous()
+
+	@staticmethod
+	def to_spatial_sequences(x: torch.Tensor) -> tuple[torch.Tensor, tuple[int, int, int, int, int]]:
+		if x.ndim != 5: raise ValueError(f"Expected B x T x D x H x W, got {tuple(x.shape)}.")
+		shape = tuple(int(value) for value in x.shape)
+		batch, time_steps, dim, height, width = shape
+		return x.permute(0, 1, 3, 4, 2).contiguous().reshape(batch * time_steps, height * width, dim), shape
+
+	@staticmethod
+	def from_spatial_sequences(sequence: torch.Tensor, shape: tuple[int, int, int, int, int]) -> torch.Tensor:
+		batch, time_steps, dim, height, width = shape
+		return sequence.reshape(batch, time_steps, height, width, dim).permute(0, 1, 4, 2, 3).contiguous()
+
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		if x.ndim != 5: raise ValueError(f"SpatiotemporalMambaBlock expects B x T x D x H x W, got {tuple(x.shape)}.")
+		if int(x.shape[2]) != self.dim: raise ValueError(f"SpatiotemporalMambaBlock expected D={self.dim}, got {int(x.shape[2])}.")
+		temporal, shape = self.to_temporal_sequences(x)
+		temporal = temporal + self.dropout(self.temporal_mamba(self.temporal_norm(temporal)))
+		x = self.from_temporal_sequences(temporal, shape)
+		spatial, shape = self.to_spatial_sequences(x)
+		spatial = spatial + self.dropout(self.spatial_mamba(self.spatial_norm(spatial)))
+		return self.from_spatial_sequences(spatial, shape)
+
+
+class SpatiotemporalMambaBackbone(nn.Module):
+	"""Factorized temporal-then-spatial stack using the official Mamba backend."""
+
+	def __init__(self, *, dim: int = 64, num_blocks: int = 2, expansion: int = 2, dropout: float = 0.1, backend: str = "mamba_ssm", d_state: int = 16, d_conv: int = 4, scan_order: str = "temporal_then_spatial") -> None:
+		super().__init__(); self.backend_name = str(backend).lower(); self.scan_order = str(scan_order).lower()
+		self.blocks = nn.ModuleList([SpatiotemporalMambaBlock(int(dim), expansion=int(expansion), dropout=float(dropout), backend=backend, d_state=int(d_state), d_conv=int(d_conv), scan_order=scan_order) for _ in range(max(0, int(num_blocks)))])
+
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		for block in self.blocks: x = block(x)
+		return x
 
 
 class TemporalCNNBackbone(nn.Module):
@@ -832,27 +1119,68 @@ class TemporalAggregator(nn.Module):
 def build_post_fusion_backbone(config: Mapping[str, Any] | None, *, dim: int) -> nn.Module:
 	"""Build the configurable post-fusion sequence backbone."""
 	options = dict(config or {})
-	kind = str(options.pop("type", "small_cnn")).lower()
+	kind = str(options.pop("type", "baseline_cnn")).lower()
 	options.setdefault("dim", int(dim))
-	if kind in {"small_cnn", "temporal_cnn"}:
+	if kind in {"baseline_cnn", "small_cnn", "temporal_cnn"}:
 		options["type"] = "temporal_cnn"
 		return TemporalCNNBackbone(**options)
 	if kind == "residual_spatiotemporal":
 		options["type"] = "residual_spatiotemporal"
 		return ResidualSpatiotemporalBackbone(**options)
+	if kind == "multiscale_context":
+		multiscale_options = {key: value for key, value in options.items() if key in {"dim", "hidden_dim"}}
+		multiscale_options["type"] = "multiscale_context"
+		return MultiScaleContextBackbone(**multiscale_options)
+	if kind == "local_window_attention":
+		return LocalWindowAttentionBackbone(**{key: value for key, value in options.items() if key in {"dim", "num_blocks", "num_heads", "window_size", "mlp_ratio", "dropout"}})
+	if kind == "cuboid_attention_lite":
+		return CuboidAttentionLiteBackbone(**{key: value for key, value in options.items() if key in {"dim", "num_blocks", "num_heads", "cuboid_size", "use_shifted_cuboids", "mlp_ratio", "dropout"}})
+	if kind == "spectral_fourier":
+		return SpectralFourierBackbone(**{key: value for key, value in options.items() if key in {"dim", "num_blocks", "modes_h", "modes_w", "residual", "dropout"}})
+	if kind == "spatiotemporal_mamba":
+		return SpatiotemporalMambaBackbone(**{key: value for key, value in options.items() if key in {"dim", "num_blocks", "expansion", "dropout", "backend", "d_state", "d_conv", "scan_order"}})
 	raise ValueError(f"Unsupported cawfe_latte.post_fusion_backbone.type: {kind!r}.")
 
 
-def build_temporal_pooling(config: Mapping[str, Any] | None, *, dim: int, input_sequence_length: int) -> TemporalAggregator:
-	"""Build last, mean, or pixelwise attention temporal pooling."""
+class TemporalAttentionPooling(nn.Module):
+	"""Learn pixelwise temporal weights and reduce B,T,D,H,W to B,D,H,W."""
+
+	def __init__(self, *, dim: int = 64, hidden_dim: int | None = None) -> None:
+		super().__init__()
+		hidden_channels = int(hidden_dim) if hidden_dim not in (None, 0) else max(1, int(dim) // 4)
+		self.score = nn.Sequential(
+			nn.Conv2d(int(dim), hidden_channels, kernel_size=1),
+			nn.SiLU(inplace=True),
+			nn.Conv2d(hidden_channels, 1, kernel_size=1),
+		)
+		final_score = self.score[-1]
+		assert isinstance(final_score, nn.Conv2d)
+		nn.init.zeros_(final_score.weight)
+		nn.init.zeros_(final_score.bias)
+		self.last_attention_weights: torch.Tensor | None = None
+
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		if x.ndim != 5:
+			raise ValueError(f"TemporalAttentionPooling expects B x T x D x H x W, got {tuple(x.shape)}.")
+		batch, time_steps, channels, height, width = (int(value) for value in x.shape)
+		scores = self.score(x.reshape(batch * time_steps, channels, height, width))
+		scores = scores.reshape(batch, time_steps, 1, height, width)
+		alpha = torch.softmax(scores, dim=1)
+		self.last_attention_weights = alpha
+		return (alpha * x).sum(dim=1)
+
+
+def build_temporal_pooling(config: Mapping[str, Any] | None, *, dim: int, input_sequence_length: int) -> nn.Module:
+	"""Build baseline last-frame or pixelwise attention temporal pooling."""
 	options = dict(config or {})
-	mode = {"attention": "attention_pool"}.get(str(options.get("type", options.get("mode", "last"))).lower(), str(options.get("type", options.get("mode", "last"))).lower())
-	pool = TemporalAggregator(mode=mode, dim=int(dim), input_sequence_length=int(input_sequence_length), hidden_dim=options.get("hidden_dim"))
-	if mode == "attention_pool" and bool(options.get("initialize_uniform", False)):
-		final = pool.attention_hidden[-1] if pool.attention_hidden is not None else pool.attention_score
-		assert isinstance(final, nn.Conv2d)
-		nn.init.zeros_(final.weight); nn.init.zeros_(final.bias)
-	return pool
+	kind = str(options.get("type", options.get("mode", "baseline"))).lower()
+	if kind in {"baseline", "last"}:
+		return TemporalAggregator(mode="last", dim=int(dim), input_sequence_length=int(input_sequence_length))
+	if kind == "mean":
+		return TemporalAggregator(mode="mean", dim=int(dim), input_sequence_length=int(input_sequence_length))
+	if kind in {"attention", "attention_pool"}:
+		return TemporalAttentionPooling(dim=int(dim), hidden_dim=options.get("hidden_dim"))
+	raise ValueError(f"Unsupported cawfe_latte.temporal_pooling.type: {kind!r}.")
 
 
 def build_regression_activation(config: Mapping[str, Any] | None) -> nn.Module:
@@ -931,6 +1259,26 @@ def _activation_from_name(name: str) -> nn.Module:
 	raise ValueError(f"Unsupported CAWFE-Latte head activation {name!r}; expected none, relu, softplus, or logits.")
 
 
+class PatchFirePresenceHead(nn.Module):
+	"""Classify whether a target patch contains any future active-fire pixel."""
+
+	def __init__(self, *, dim: int = 64, hidden_dim: int = 32, dropout: float = 0.1) -> None:
+		super().__init__()
+		self.net = nn.Sequential(
+			nn.AdaptiveAvgPool2d(1),
+			nn.Flatten(),
+			nn.Linear(int(dim), int(hidden_dim)),
+			nn.SiLU(inplace=True),
+			nn.Dropout(float(dropout)),
+			nn.Linear(int(hidden_dim), 1),
+		)
+
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		if x.ndim != 4:
+			raise ValueError(f"PatchFirePresenceHead expects B x D x H x W, got {tuple(x.shape)}.")
+		return self.net(x)
+
+
 class PredictionHead(nn.Module):
 	"""Single-channel prediction head with optional activation."""
 
@@ -945,17 +1293,18 @@ class PredictionHead(nn.Module):
 
 class CAWFELatte(nn.Module):
 	"""Single configurable CAWFE-Latte architecture with named config ablations."""
-	def __init__(self, *, input_channels: int = 129, input_sequence_length: int = 5, output_channels: int = 4, output_dim: int = 64, version: str = "v1_end_to_end", atmosphere: Mapping[str, Any] | None = None, wind: Mapping[str, Any] | None = None, fire_fuel: Mapping[str, Any] | None = None, flux_energy: Mapping[str, Any] | None = None, fusion: Mapping[str, Any] | None = None, alignment: Mapping[str, Any] | None = None, backbone: Mapping[str, Any] | None = None, temporal_aggregation: Mapping[str, Any] | None = None, post_fusion_backbone: Mapping[str, Any] | None = None, temporal_pooling: Mapping[str, Any] | None = None, regression: Mapping[str, Any] | None = None, support_gate: Mapping[str, Any] | None = None, ablation: Mapping[str, Any] | None = None, decoder: Mapping[str, Any] | None = None, heads: Mapping[str, Any] | None = None, auxiliary: Mapping[str, Any] | None = None, use_terrain_conditioning: bool = False, terrain_encoder: Mapping[str, Any] | None = None, terrain_film: Mapping[str, Any] | None = None, channel_names: Mapping[int, str] | None = None, debug_prediction_head: bool = False) -> None:
+	def __init__(self, *, input_channels: int = 129, input_sequence_length: int = 5, output_channels: int = 4, output_dim: int = 64, version: str = "v1_end_to_end", atmosphere: Mapping[str, Any] | None = None, wind: Mapping[str, Any] | None = None, fire_fuel: Mapping[str, Any] | None = None, flux_energy: Mapping[str, Any] | None = None, fusion: Mapping[str, Any] | None = None, alignment: Mapping[str, Any] | None = None, backbone: Mapping[str, Any] | None = None, temporal_aggregation: Mapping[str, Any] | None = None, post_fusion_backbone: Mapping[str, Any] | None = None, temporal_pooling: Mapping[str, Any] | None = None, regression: Mapping[str, Any] | None = None, support_gate: Mapping[str, Any] | None = None, ablation: Mapping[str, Any] | None = None, decoder: Mapping[str, Any] | None = None, heads: Mapping[str, Any] | None = None, auxiliary: Mapping[str, Any] | None = None, patch_fire_head: Mapping[str, Any] | None = None, use_terrain_conditioning: bool = False, terrain_encoder: Mapping[str, Any] | None = None, terrain_film: Mapping[str, Any] | None = None, channel_names: Mapping[int, str] | None = None, debug_prediction_head: bool = False) -> None:
 		super().__init__()
 		self.input_channels=int(input_channels); self.input_sequence_length=int(input_sequence_length); self.output_channels=int(output_channels); self.output_dim=int(output_dim); self.version=str(version); self.debug_prediction_head=bool(debug_prediction_head)
 		self.ablation_name=str(dict(ablation or {}).get("name", "baseline"))
 		if self.output_channels != 4: raise ValueError(f"CAWFE-Latte expects output_channels=4, got {self.output_channels}.")
 		if self.input_channels < 86: raise ValueError(f"CAWFE-Latte requires at least 86 input channels, got {self.input_channels}.")
-		atmosphere_config=dict(atmosphere or {}); wind_config=dict(wind or {}); fire_config=dict(fire_fuel or {}); flux_config=dict(flux_energy or {}); fusion_config=dict(fusion or {}); alignment_config=dict(alignment or {}); decoder_config=dict(decoder or {}); head_config=dict(heads or {}); auxiliary_config=dict(auxiliary or {})
+		atmosphere_config=dict(atmosphere or {}); wind_config=dict(wind or {}); fire_config=dict(fire_fuel or {}); flux_config=dict(flux_energy or {}); fusion_config=dict(fusion or {}); alignment_config=dict(alignment or {}); decoder_config=dict(decoder or {}); head_config=dict(heads or {}); auxiliary_config=dict(auxiliary or {}); patch_fire_config=dict(patch_fire_head or {}); terrain_film_config=dict(terrain_film or {})
 		self.use_terrain_conditioning=bool(use_terrain_conditioning)
-		if self.use_terrain_conditioning:
-			terrain_encoder_config=dict(terrain_encoder or {}); terrain_film_config=dict(terrain_film or {})
-			self.terrain_encoder=TerrainEncoder(**terrain_encoder_config); self.terrain_film=TerrainFiLMConditioner(dim=int(terrain_film_config.get("dim", self.output_dim)), **{k:v for k,v in terrain_film_config.items() if k != "dim"})
+		self.terrain_film_enabled=self.use_terrain_conditioning and bool(terrain_film_config.get("enabled", True))
+		if self.terrain_film_enabled:
+			terrain_encoder_config=dict(terrain_encoder or {})
+			self.terrain_encoder=TerrainEncoder(**terrain_encoder_config); self.terrain_film=TerrainFiLMConditioner(dim=int(terrain_film_config.get("dim", self.output_dim)), **{k:v for k,v in terrain_film_config.items() if k not in {"dim", "enabled"}})
 		else: self.terrain_encoder=None; self.terrain_film=None
 		self.atmosphere_encoder=AtmosphereEncoder(out_dim=int(atmosphere_config.get("out_dim", self.output_dim)), **{k:v for k,v in atmosphere_config.items() if k != "out_dim"})
 		self.wind_encoder=WindEncoder(input_channels=self.input_channels, out_dim=int(wind_config.get("out_dim", self.output_dim)), channel_names=channel_names, **{k:v for k,v in wind_config.items() if k != "out_dim"})
@@ -965,20 +1314,39 @@ class CAWFELatte(nn.Module):
 		spatial=dict(alignment_config.get("spatial", {})); distribution=dict(alignment_config.get("distribution", {})); temporal=dict(alignment_config.get("temporal", {}))
 		self.alignment=MultimodalAlignment(dim=self.output_dim, max_time=int(temporal.get("max_time", max(16,self.input_sequence_length))), use_spatial_pos=bool(spatial.get("add_positional_embedding",True)), use_temporal_pos=bool(temporal.get("add_positional_embedding",True)), separate_layernorms=bool(distribution.get("separate_norm_per_modality",True)), eps=float(distribution.get("eps",1e-5)), learned_spatial_pos=bool(spatial.get("learned_positional_embedding",True)), learned_temporal_pos=bool(temporal.get("learned_positional_embedding",True)), flatten_order=str(spatial.get("flatten_order","row_major")))
 		if int(fusion_config.get("dim",self.output_dim)) != self.output_dim: raise ValueError("fusion.dim must match output_dim for CAWFE-Latte.")
-		self.fusion=FireQueryCrossAttentionFusion(dim=self.output_dim, num_heads=int(fusion_config.get("num_heads",4)), dropout=float(fusion_config.get("dropout",0.1)), use_layer_norm=bool(fusion_config.get("use_layer_norm",True)), residual=bool(fusion_config.get("residual",True)))
-		# Legacy sections map exactly to v1 behavior when new switches are absent.
-		backbone_config=dict(post_fusion_backbone) if post_fusion_backbone is not None else dict(backbone or {})
-		if post_fusion_backbone is None: backbone_config["type"] = "small_cnn" if str(backbone_config.get("type","temporal_cnn")).lower() == "temporal_cnn" else backbone_config.get("type")
+		self.fusion_type=str(fusion_config.get("type", "fire_query_attention")).lower()
+		if self.fusion_type in {"fire_query_attention", "fire_query"}:
+			self.fusion=FireQueryCrossAttentionFusion(dim=self.output_dim, num_heads=int(fusion_config.get("num_heads",4)), dropout=float(fusion_config.get("dropout",0.1)), use_layer_norm=bool(fusion_config.get("use_layer_norm",True)), residual=bool(fusion_config.get("residual",True)))
+		elif self.fusion_type == "concat_projection":
+			self.fusion=ConcatProjectionFusion(dim=self.output_dim)
+		else:
+			raise ValueError(f"Unsupported cawfe_latte.fusion.type: {self.fusion_type!r}.")
+		# Start from the proven v1 sections, then overlay only the ablation switch.
+		# baseline_cnn/baseline therefore retain the exact legacy module arguments.
+		backbone_config=dict(backbone or {})
+		if post_fusion_backbone is not None: backbone_config.update(dict(post_fusion_backbone))
+		if str(backbone_config.get("type", "temporal_cnn")).lower() == "temporal_cnn": backbone_config["type"] = "baseline_cnn"
 		self.post_fusion_backbone=build_post_fusion_backbone(backbone_config, dim=self.output_dim); self.temporal_backbone=self.post_fusion_backbone
-		pooling_config=dict(temporal_pooling) if temporal_pooling is not None else dict(temporal_aggregation or {})
-		if temporal_pooling is None: pooling_config["type"] = pooling_config.pop("mode", "last")
+		pooling_config=dict(temporal_aggregation or {})
+		if temporal_pooling is not None: pooling_config.update(dict(temporal_pooling))
+		if str(pooling_config.get("type", pooling_config.get("mode", "last"))).lower() == "last": pooling_config["type"] = "baseline"
 		self.temporal_pooling=build_temporal_pooling(pooling_config, dim=self.output_dim, input_sequence_length=self.input_sequence_length); self.temporal_aggregator=self.temporal_pooling
-		decoder_config.setdefault("in_dim",self.output_dim); decoder_config.setdefault("hidden_dim",self.output_dim); self.decoder=ShallowDecoder(**decoder_config); decoder_out_dim=int(decoder_config["hidden_dim"])
+		decoder_type=str(decoder_config.pop("type", "shared")).lower()
+		decoder_config.setdefault("in_dim",self.output_dim); decoder_config.setdefault("hidden_dim",self.output_dim); decoder_out_dim=int(decoder_config["hidden_dim"])
+		if decoder_type in {"shared", "shallow_cnn"}:
+			self.decoder=ShallowDecoder(type="shallow_cnn", **decoder_config); self.mask_decoder=None; self.regression_decoder=None
+		elif decoder_type == "separate_regression":
+			self.decoder=None; self.mask_decoder=ShallowDecoder(type="shallow_cnn", **decoder_config); self.regression_decoder=ShallowDecoder(type="shallow_cnn", **decoder_config)
+		else:
+			raise ValueError(f"Unsupported cawfe_latte.decoder.type: {decoder_type!r}.")
+		self.decoder_type="shared" if decoder_type == "shallow_cnn" else decoder_type
 		regression_config=dict(regression or {}); self.regression_activation=build_regression_activation(regression_config)
 		new_regression = regression is not None
 		self.surface_head=PredictionHead(decoder_out_dim, activation="none" if new_regression else dict(head_config.get("surface",{})).get("activation","none")); self.canopy_head=PredictionHead(decoder_out_dim, activation="none" if new_regression else dict(head_config.get("canopy",{})).get("activation","none")); self.mask_head=PredictionHead(decoder_out_dim, activation=dict(head_config.get("mask",{})).get("activation","logits")); self.energy_head=PredictionHead(decoder_out_dim, activation="none" if new_regression else dict(head_config.get("energy",{})).get("activation","none"))
 		if new_regression and regression_config.get("bias_init") is not None:
 			for head in (self.surface_head,self.canopy_head,self.energy_head): nn.init.constant_(head.proj.bias, float(regression_config["bias_init"]))
+		self.patch_fire_head_enabled=bool(patch_fire_config.get("enabled", False))
+		self.patch_fire_head=PatchFirePresenceHead(dim=self.output_dim, hidden_dim=int(patch_fire_config.get("hidden_dim", max(1,self.output_dim//2))), dropout=float(patch_fire_config.get("dropout",0.1))) if self.patch_fire_head_enabled else None
 		if support_gate is not None:
 			self.support_gate=build_support_gate(support_gate, dim=decoder_out_dim); self.aux_fire_support_enabled=self.support_gate.enabled; self.aux_fire_support_detach_source=False; self.aux_fire_support_head=None
 		else:
@@ -991,28 +1359,46 @@ class CAWFELatte(nn.Module):
 		if int(x.shape[2])<self.input_channels: raise ValueError(f"CAWFE-Latte was configured for input_channels={self.input_channels}, got {int(x.shape[2])}.")
 	def forward(self,x:torch.Tensor,terrain:torch.Tensor|None=None,*,return_features:bool=False,return_attention:bool=False):
 		self._validate_input(x); atmosphere=self.atmosphere_encoder(x); wind=self.wind_encoder(x); fire_fuel=self.fire_fuel_encoder(x); flux_energy=self.flux_energy_encoder(x); aligned=self.alignment(atmosphere,wind,fire_fuel,flux_energy)
-		fusion_result=self.fusion(aligned["atmosphere"],aligned["wind"],aligned["fire_fuel"],aligned["flux_energy"],return_attention=return_attention); fused_tokens,attention=fusion_result if return_attention else (fusion_result,None); fused_dynamic=tokens_to_grid(fused_tokens,aligned["spatial_shape"]); fused=fused_dynamic; terrain_embedding=None
-		if self.use_terrain_conditioning:
+		attention=None
+		if self.fusion_type in {"fire_query_attention", "fire_query"}:
+			fusion_result=self.fusion(aligned["atmosphere"],aligned["wind"],aligned["fire_fuel"],aligned["flux_energy"],return_attention=return_attention); fused_tokens,attention=fusion_result if return_attention else (fusion_result,None); fused_dynamic=tokens_to_grid(fused_tokens,aligned["spatial_shape"])
+		else:
+			aligned_grids=[tokens_to_grid(aligned[name],aligned["spatial_shape"]) for name in ("atmosphere","wind","fire_fuel","flux_energy")]; fused_dynamic=self.fusion(*aligned_grids); fused_tokens=self.alignment.to_tokens(fused_dynamic)
+		fused=fused_dynamic; terrain_embedding=None
+		if self.terrain_film_enabled:
 			if terrain is None: raise ValueError("CAWFE-Latte terrain conditioning is enabled but terrain input is missing.")
 			terrain_embedding=self.terrain_encoder(terrain); fused=self.terrain_film(fused_dynamic,terrain_embedding)
-		local=self.post_fusion_backbone(fused); aggregated=self.temporal_pooling(local); decoded=self.decoder(aggregated)
-		surface=self.regression_activation(self.surface_head(decoded)); canopy=self.regression_activation(self.canopy_head(decoded)); energy=self.regression_activation(self.energy_head(decoded)); mask_logits=self.mask_head(decoded)
+		local=self.post_fusion_backbone(fused); aggregated=self.temporal_pooling(local)
+		if self.decoder_type == "shared":
+			decoded=self.decoder(aggregated); mask_features=decoded; regression_features=decoded
+		else:
+			mask_features=self.mask_decoder(aggregated); regression_features=self.regression_decoder(aggregated); decoded=regression_features
+		surface=self.regression_activation(self.surface_head(regression_features)); canopy=self.regression_activation(self.canopy_head(regression_features)); energy=self.regression_activation(self.energy_head(regression_features)); mask_logits=self.mask_head(mask_features)
+		patch_fire_logit=self.patch_fire_head(aggregated) if self.patch_fire_head is not None else None
 		support_logits=None; gate=None
-		if self.support_gate is not None: support_logits,gate=self.support_gate(decoded)
+		if self.support_gate is not None: support_logits,gate=self.support_gate(regression_features)
 		elif self.aux_fire_support_head is not None:
 			aux_source=local[:,-1].detach() if self.aux_fire_support_detach_source else local[:,-1]; support_logits=self.aux_fire_support_head(aux_source)
 		if gate is not None: surface=surface*gate; canopy=canopy*gate; energy=energy*gate
 		prediction=torch.cat([surface,canopy,mask_logits,energy],dim=1)
 		if return_features:
-			features = {"prediction": prediction, "atmosphere": atmosphere, "wind": wind, "fire_fuel": fire_fuel, "flux_energy": flux_energy, "aligned_atmosphere": aligned["atmosphere"], "aligned_wind": aligned["wind"], "aligned_fire_fuel": aligned["fire_fuel"], "aligned_flux_energy": aligned["flux_energy"], "fused_tokens": fused_tokens, "spatial_shape": aligned["spatial_shape"], "fused_grid": fused_dynamic, "fused": fused, "fused_dynamic": fused_dynamic, "terrain_features": terrain_embedding, "fused_after_terrain": fused if self.use_terrain_conditioning else None, "local": local, "aggregated": aggregated, "decoded": decoded}
+			features = {"prediction": prediction, "atmosphere": atmosphere, "wind": wind, "fire_fuel": fire_fuel, "flux_energy": flux_energy, "aligned_atmosphere": aligned["atmosphere"], "aligned_wind": aligned["wind"], "aligned_fire_fuel": aligned["fire_fuel"], "aligned_flux_energy": aligned["flux_energy"], "fused_tokens": fused_tokens, "spatial_shape": aligned["spatial_shape"], "fused_grid": fused_dynamic, "fused": fused, "fused_dynamic": fused_dynamic, "terrain_features": terrain_embedding, "fused_after_terrain": fused if self.use_terrain_conditioning else None, "local": local, "aggregated": aggregated, "decoded": decoded, "mask_features": mask_features, "regression_features": regression_features}
 			if support_logits is not None:
 				features["support_logits" if self.support_gate is not None else "aux_fire_support_logits"] = support_logits
-			if self.temporal_pooling.last_attention_weights is not None: features["temporal_attention"] = self.temporal_pooling.last_attention_weights
+			if patch_fire_logit is not None: features["patch_fire_logit"] = patch_fire_logit
+			if self.temporal_pooling.last_attention_weights is not None:
+				features["temporal_attention_alpha"] = self.temporal_pooling.last_attention_weights
+				features["temporal_attention"] = self.temporal_pooling.last_attention_weights
+			if getattr(self.post_fusion_backbone, "local_window_attention_enabled", False):
+				features["local_window_attention_enabled"] = True
+				features["window_size"] = self.post_fusion_backbone.window_size
 			if return_attention: features["fusion_attention"] = attention
 			return features
-		if self.support_gate is not None and support_logits is not None: return {"prediction": prediction, "support_logits": support_logits}
-		if support_logits is not None: return {"prediction": prediction, "aux_fire_support_logits": support_logits}
-		return prediction
+		outputs={"prediction": prediction}
+		if self.support_gate is not None and support_logits is not None: outputs["support_logits"]=support_logits
+		elif support_logits is not None: outputs["aux_fire_support_logits"]=support_logits
+		if patch_fire_logit is not None: outputs["patch_fire_logit"]=patch_fire_logit
+		return outputs if len(outputs) > 1 else prediction
 
 
 __all__ = [
@@ -1022,11 +1408,14 @@ __all__ = [
 	"TerrainFiLMConditioner",
 	"FireFuelEncoder",
 	"FireQueryCrossAttentionFusion",
+	"ConcatProjectionFusion",
 	"FluxEnergyEncoder",
 	"MultimodalAlignment",
 	"PredictionHead",
+	"PatchFirePresenceHead",
 	"ShallowDecoder",
 	"TemporalAggregator",
+	"TemporalAttentionPooling",
 	"SupportGate",
 	"build_post_fusion_backbone",
 	"build_temporal_pooling",
@@ -1035,6 +1424,20 @@ __all__ = [
 	"TemporalCNNBackbone",
 	"ResidualSpatiotemporalBackbone",
 	"ResidualSpatiotemporalBlock",
+	"MultiScaleContextBackbone",
+	"LocalWindowAttentionBlock",
+	"LocalWindowAttentionBackbone",
+	"CuboidAttentionBlock",
+	"CuboidAttentionLiteBackbone",
+	"SpectralConv2d",
+	"SpectralFourierBlock",
+	"SpectralFourierBackbone",
+	"SpatiotemporalMambaBlock",
+	"SpatiotemporalMambaBackbone",
+	"window_partition",
+	"window_reverse",
+	"cuboid_partition",
+	"cuboid_reverse",
 	"TemporalSpatialResidualBlock",
 	"TemporalConvBlock",
 	"WindEncoder",

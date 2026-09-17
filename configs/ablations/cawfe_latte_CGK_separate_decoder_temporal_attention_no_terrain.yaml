@@ -1,0 +1,18 @@
+base_config: cawfe_latte_baseline.yaml
+
+experiment:
+  name: cawfe_latte_ablation_CGK_separate_decoder_temporal_attention_no_terrain
+
+cawfe_latte:
+  ablation:
+    name: CGK_separate_decoder_temporal_attention_no_terrain
+  temporal_pooling:
+    type: attention
+  decoder:
+    type: separate_regression
+  terrain_film:
+    enabled: false
+
+training:
+  output:
+    root_dir: artifacts/ablations/cawfe_latte/CGK_separate_decoder_temporal_attention_no_terrain

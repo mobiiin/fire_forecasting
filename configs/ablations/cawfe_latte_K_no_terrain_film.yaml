@@ -1,0 +1,14 @@
+base_config: cawfe_latte_baseline.yaml
+
+experiment:
+  name: cawfe_latte_ablation_K_no_terrain_film
+
+cawfe_latte:
+  ablation:
+    name: K_no_terrain_film
+  terrain_film:
+    enabled: false
+
+training:
+  output:
+    root_dir: artifacts/ablations/cawfe_latte/K_no_terrain_film

@@ -16,15 +16,12 @@ def test_support_gate_range():
 
 def test_forward_variants_keep_prediction_contract():
     from src.config import load_config
-    from scripts.run_cawfe_latte_ablations import set_dotted
     from src.models.model_factory import build_model_from_config
     import yaml
     definitions=yaml.safe_load(open('configs/ablations/cawfe_latte_ablations.yaml'))['ablations']
-    for name in ('baseline','A_resblocks_only','B1_softplus_only','C_temporal_attention_only'):
-        config=load_config('configs/experiments/cawfe_latte_baseline.yaml')
-        for key,value in definitions[name]['overrides'].items(): set_dotted(config,key,value)
+    for name in ('baseline','A_resblocks','B_multiscale_context','C_temporal_attention'):
+        config=load_config(definitions[name]['config_path'])
         model=build_model_from_config(config,129).eval()
         with torch.no_grad(): output=model(torch.randn(1,5,129,16,16),terrain=torch.randn(1,4,16,16))
         prediction=output['prediction'] if isinstance(output,dict) else output
         assert prediction.shape == (1,4,16,16)
-        if name.startswith('B') and isinstance(output,dict): assert output['support_logits'].shape[1] == 1

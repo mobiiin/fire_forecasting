@@ -1,0 +1,30 @@
+base_config: ../experiments/cawfe_latte_v1.yaml
+
+experiment:
+  name: cawfe_latte_ablation_baseline
+  description: Ten-epoch validation-only screening run of the preserved CAWFE-Latte baseline.
+
+model:
+  architecture: cawfe_latte
+
+cawfe_latte:
+  ablation:
+    name: baseline
+  post_fusion_backbone:
+    type: baseline_cnn
+  temporal_pooling:
+    type: baseline
+
+training:
+  max_epochs: 10
+  epochs: 10
+  run_external_test_after_training: false
+  run_test_after_training: false
+  early_stopping:
+    enabled: false
+  output:
+    root_dir: artifacts/ablations/cawfe_latte/baseline
+    flat_run_layout: true
+    update_architecture_latest_checkpoint: false
+    save_best_checkpoint: true
+    save_latest_checkpoint: true

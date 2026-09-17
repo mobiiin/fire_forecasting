@@ -1,0 +1,16 @@
+base_config: cawfe_latte_baseline.yaml
+
+experiment:
+  name: cawfe_latte_ablation_CG_separate_decoder_temporal_attention
+
+cawfe_latte:
+  ablation:
+    name: CG_separate_decoder_temporal_attention
+  temporal_pooling:
+    type: attention
+  decoder:
+    type: separate_regression
+
+training:
+  output:
+    root_dir: artifacts/ablations/cawfe_latte/CG_separate_decoder_temporal_attention

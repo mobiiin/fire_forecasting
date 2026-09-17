@@ -1107,12 +1107,23 @@ python scripts/visualize_processed_samples.py \
 
 ## CAWFE-Latte Ablations
 
-CAWFE-Latte now has one active architecture, `model.architecture: cawfe_latte`. Named A/B/C ablations in `configs/ablations/cawfe_latte_ablations.yaml` change only configurable modules: post-fusion backbone, temporal pooling, regression activation, and optional support gating. Fast mode is only for ranking candidates; use full mode for scientific results.
+CAWFE-Latte has one active architecture, `model.architecture: cawfe_latte`. The first 10-epoch screening batch changes only the post-fusion backbone (A/B) or temporal pooling (C); early stopping and automatic test evaluation are disabled.
 
 ```bash
-python scripts/run_cawfe_latte_ablations.py --ablations all --mode fast --dry-run
-python scripts/run_cawfe_latte_ablations.py --ablations baseline A_resblocks_only B1_softplus_only C_temporal_attention_only --mode fast
-sbatch scripts/slurm_run_cawfe_latte_ablations_a10080.sh "baseline A_resblocks_only B1_softplus_only C_temporal_attention_only" fast
+python scripts/check_cawfe_latte_ablation_configs.py
+bash scripts/submit_cawfe_latte_ablation_batch.sh \
+  baseline A_resblocks B_multiscale_context C_temporal_attention
+python scripts/summarize_cawfe_latte_ablations.py
+```
+
+Submit the second screening batch with the same generic Slurm workflow:
+
+```bash
+bash scripts/submit_cawfe_latte_ablation_batch.sh \
+  G_separate_regression_decoder \
+  I_patch_fire_classifier \
+  K_no_terrain_film \
+  L_simple_concat_fusion
 ```
 
 ## Per-epoch CAWFE-Latte fusion vectors

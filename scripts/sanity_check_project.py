@@ -146,6 +146,16 @@ def _apply_sanity_overrides(config: dict[str, Any], batch_size: int, num_workers
 	config["data_loader"] = data_loader_config
 
 
+def _resolve_sanity_device(config: Mapping[str, Any], override: str | None = None) -> torch.device:
+	"""Resolve one smoke-test device consistently for every data pipeline."""
+	device_name = str(override if override not in (None, "", "null") else config.get("device", "auto")).lower()
+	if device_name == "auto":
+		device_name = "cuda" if torch.cuda.is_available() else "cpu"
+	if device_name.startswith("cuda") and not torch.cuda.is_available():
+		device_name = "cpu"
+	return torch.device(device_name)
+
+
 def main() -> None:
 	"""Run project sanity checks end-to-end."""
 
@@ -198,6 +208,12 @@ def main() -> None:
 		if getattr(train_loader.dataset, "input_normalization_on_device", False): raise ValueError("Processed dataset unexpectedly enables device-side normalization.")
 		if not getattr(train_loader.dataset, "inputs_are_normalized", False) and bool(config.get("dataloader", {}).get("normalize_inputs", True)): raise ValueError("Processed inputs were not normalized in the Dataset.")
 		model = build_model_from_config(config, input_channels=int(x_batch.shape[2]))
+		device = _resolve_sanity_device(config, args.device)
+		model = model.to(device)
+		x_batch = x_batch.to(device)
+		y_batch = y_batch.to(device)
+		if terrain_batch is not None:
+			terrain_batch = terrain_batch.to(device)
 		architecture = str(config.get("model", {}).get("architecture", "")).lower()
 		cawfe_config = config.get("cawfe_latte", {}) if isinstance(config.get("cawfe_latte", {}), Mapping) else {}
 		variant_config = config.get(architecture, {}) if isinstance(config.get(architecture, {}), Mapping) else {}
@@ -349,12 +365,7 @@ def main() -> None:
 
 	task_type = str(config.get("task_type", "regression")).lower()
 	model = build_model_from_config(config, input_channels=int(x_batch.shape[2]))
-	device_name = str(config.get("device", "auto")).lower()
-	if device_name == "auto":
-		device_name = "cuda" if torch.cuda.is_available() else "cpu"
-	if device_name == "cuda" and not torch.cuda.is_available():
-		device_name = "cpu"
-	device = torch.device(device_name)
+	device = _resolve_sanity_device(config, args.device)
 	model = model.to(device)
 	x_batch = x_batch.to(device)
 	y_batch = y_batch.to(device)

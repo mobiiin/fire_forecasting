@@ -1,196 +1,137 @@
 ablations:
   baseline:
-    description: Original CAWFE-Latte baseline.
-    base_config: configs/experiments/cawfe_latte_baseline.yaml
-    changed_from_baseline: []
-    overrides:
-      experiment.name: cawfe_latte_baseline
-      cawfe_latte.ablation.name: baseline
-      cawfe_latte.post_fusion_backbone.type: small_cnn
-      cawfe_latte.temporal_pooling.type: last
-      cawfe_latte.regression.activation: none
-      cawfe_latte.support_gate.enabled: false
-  A_resblocks_only:
-    description: Replace the small post-fusion CNN with six residual spatiotemporal
-      blocks.
-    base_config: configs/experiments/cawfe_latte_baseline.yaml
-    changed_from_baseline:
-    - post_fusion_backbone
-    overrides:
-      experiment.name: cawfe_latte_A_resblocks_only
-      cawfe_latte.post_fusion_backbone.type: residual_spatiotemporal
-      cawfe_latte.post_fusion_backbone.num_blocks: 6
-      cawfe_latte.ablation.name: A_resblocks_only
-      cawfe_latte.temporal_pooling.type: last
-      cawfe_latte.regression.activation: none
-      cawfe_latte.support_gate.enabled: false
-  B1_softplus_only:
-    description: Use softplus for continuous regression outputs.
-    base_config: configs/experiments/cawfe_latte_baseline.yaml
-    changed_from_baseline:
-    - regression_activation
-    overrides:
-      experiment.name: cawfe_latte_B1_softplus_only
-      cawfe_latte.regression.activation: softplus
-      cawfe_latte.regression.bias_init: -5.0
-      cawfe_latte.ablation.name: B1_softplus_only
-      cawfe_latte.post_fusion_backbone.type: small_cnn
-      cawfe_latte.temporal_pooling.type: last
-      cawfe_latte.support_gate.enabled: false
-  B2_support_gate_mask_target:
-    description: Add a support gate trained against the original mask.
-    base_config: configs/experiments/cawfe_latte_baseline.yaml
-    changed_from_baseline:
-    - support_gate
-    overrides:
-      experiment.name: cawfe_latte_B2_support_gate_mask_target
-      cawfe_latte.support_gate.enabled: true
-      cawfe_latte.support_gate.source: separate_support_head
-      cawfe_latte.support_gate.gate_min: 0.05
-      cawfe_latte.support_gate.target: original_mask
-      training.loss.auxiliary_fire_support.enabled: true
-      training.loss.auxiliary_fire_support.weight: 0.2
-      training.loss.auxiliary_fire_support.target: original_mask
-      cawfe_latte.ablation.name: B2_support_gate_mask_target
-      cawfe_latte.post_fusion_backbone.type: small_cnn
-      cawfe_latte.temporal_pooling.type: last
-      cawfe_latte.regression.activation: none
-  B3_support_gate_dilated_target:
-    description: Add a support gate trained against a radius-two dilated mask.
-    base_config: configs/experiments/cawfe_latte_baseline.yaml
-    changed_from_baseline:
-    - support_gate_target
-    overrides:
-      experiment.name: cawfe_latte_B3_support_gate_dilated_target
-      cawfe_latte.support_gate.enabled: true
-      cawfe_latte.support_gate.source: separate_support_head
-      cawfe_latte.support_gate.gate_min: 0.05
-      cawfe_latte.support_gate.target: dilated_mask
-      cawfe_latte.support_gate.dilation_radius: 2
-      training.loss.auxiliary_fire_support.enabled: true
-      training.loss.auxiliary_fire_support.weight: 0.2
-      training.loss.auxiliary_fire_support.target: dilated_mask
-      training.loss.auxiliary_fire_support.dilation_radius: 2
-      cawfe_latte.ablation.name: B3_support_gate_dilated_target
-      cawfe_latte.post_fusion_backbone.type: small_cnn
-      cawfe_latte.temporal_pooling.type: last
-      cawfe_latte.regression.activation: none
-  C_temporal_attention_only:
-    description: Replace last-timestep aggregation with temporal attention pooling.
-    base_config: configs/experiments/cawfe_latte_baseline.yaml
-    changed_from_baseline:
-    - temporal_pooling
-    overrides:
-      experiment.name: cawfe_latte_C_temporal_attention_only
-      cawfe_latte.temporal_pooling.type: attention
-      cawfe_latte.temporal_pooling.hidden_dim: 16
-      cawfe_latte.temporal_pooling.initialize_uniform: true
-      cawfe_latte.ablation.name: C_temporal_attention_only
-      cawfe_latte.post_fusion_backbone.type: small_cnn
-      cawfe_latte.regression.activation: none
-      cawfe_latte.support_gate.enabled: false
-  D_resblocks_temporal_attention:
-    description: Combine residual spatiotemporal blocks and temporal attention.
-    base_config: configs/experiments/cawfe_latte_baseline.yaml
-    changed_from_baseline:
-    - post_fusion_backbone
-    - temporal_pooling
-    overrides:
-      experiment.name: cawfe_latte_D_resblocks_temporal_attention
-      cawfe_latte.post_fusion_backbone.type: residual_spatiotemporal
-      cawfe_latte.post_fusion_backbone.num_blocks: 6
-      cawfe_latte.temporal_pooling.type: attention
-      cawfe_latte.temporal_pooling.hidden_dim: 16
-      cawfe_latte.temporal_pooling.initialize_uniform: true
-      cawfe_latte.ablation.name: D_resblocks_temporal_attention
-      cawfe_latte.regression.activation: none
-      cawfe_latte.support_gate.enabled: false
-  E_resblocks_support_gate:
-    description: Combine residual blocks with support-gated softplus regression.
-    base_config: configs/experiments/cawfe_latte_baseline.yaml
-    changed_from_baseline:
-    - post_fusion_backbone
-    - support_gate
-    - regression_activation
-    overrides:
-      experiment.name: cawfe_latte_E_resblocks_support_gate
-      cawfe_latte.post_fusion_backbone.type: residual_spatiotemporal
-      cawfe_latte.post_fusion_backbone.num_blocks: 6
-      cawfe_latte.regression.activation: softplus
-      cawfe_latte.regression.bias_init: -5.0
-      cawfe_latte.support_gate.enabled: true
-      cawfe_latte.support_gate.source: separate_support_head
-      cawfe_latte.support_gate.gate_min: 0.05
-      training.loss.auxiliary_fire_support.enabled: true
-      training.loss.auxiliary_fire_support.weight: 0.2
-      training.loss.auxiliary_fire_support.target: original_mask
-      cawfe_latte.ablation.name: E_resblocks_support_gate
-      cawfe_latte.temporal_pooling.type: last
-  F_resblocks_temporal_attention_support_gate:
-    description: Combine residual blocks, temporal attention, and support-gated softplus
-      regression.
-    base_config: configs/experiments/cawfe_latte_baseline.yaml
-    changed_from_baseline:
-    - post_fusion_backbone
-    - temporal_pooling
-    - support_gate
-    - regression_activation
-    overrides:
-      experiment.name: cawfe_latte_F_resblocks_temporal_attention_support_gate
-      cawfe_latte.post_fusion_backbone.type: residual_spatiotemporal
-      cawfe_latte.post_fusion_backbone.num_blocks: 6
-      cawfe_latte.temporal_pooling.type: attention
-      cawfe_latte.temporal_pooling.hidden_dim: 16
-      cawfe_latte.temporal_pooling.initialize_uniform: true
-      cawfe_latte.regression.activation: softplus
-      cawfe_latte.regression.bias_init: -5.0
-      cawfe_latte.support_gate.enabled: true
-      cawfe_latte.support_gate.source: separate_support_head
-      cawfe_latte.support_gate.gate_min: 0.05
-      training.loss.auxiliary_fire_support.enabled: true
-      training.loss.auxiliary_fire_support.weight: 0.2
-      training.loss.auxiliary_fire_support.target: original_mask
-      cawfe_latte.ablation.name: F_resblocks_temporal_attention_support_gate
-  B4_support_gate_softplus_mask_target:
-    description: Add support gating plus softplus regression.
-    base_config: configs/experiments/cawfe_latte_baseline.yaml
-    changed_from_baseline:
-    - support_gate
-    - regression_activation
-    overrides:
-      experiment.name: cawfe_latte_B4_support_gate_softplus_mask_target
-      cawfe_latte.support_gate.enabled: true
-      cawfe_latte.support_gate.source: separate_support_head
-      cawfe_latte.support_gate.gate_min: 0.05
-      cawfe_latte.support_gate.target: original_mask
-      training.loss.auxiliary_fire_support.enabled: true
-      training.loss.auxiliary_fire_support.weight: 0.2
-      training.loss.auxiliary_fire_support.target: original_mask
-      cawfe_latte.regression.activation: softplus
-      cawfe_latte.regression.bias_init: -5.0
-      cawfe_latte.ablation.name: B4_support_gate_softplus_mask_target
-      cawfe_latte.post_fusion_backbone.type: small_cnn
-      cawfe_latte.temporal_pooling.type: last
-  B5_support_gate_softplus_dilated_target:
-    description: Add support gating plus softplus regression.
-    base_config: configs/experiments/cawfe_latte_baseline.yaml
-    changed_from_baseline:
-    - support_gate
-    - support_gate_target
-    - regression_activation
-    overrides:
-      experiment.name: cawfe_latte_B5_support_gate_softplus_dilated_target
-      cawfe_latte.support_gate.enabled: true
-      cawfe_latte.support_gate.source: separate_support_head
-      cawfe_latte.support_gate.gate_min: 0.05
-      cawfe_latte.support_gate.target: dilated_mask
-      cawfe_latte.support_gate.dilation_radius: 2
-      training.loss.auxiliary_fire_support.enabled: true
-      training.loss.auxiliary_fire_support.weight: 0.2
-      training.loss.auxiliary_fire_support.target: dilated_mask
-      training.loss.auxiliary_fire_support.dilation_radius: 2
-      cawfe_latte.regression.activation: softplus
-      cawfe_latte.regression.bias_init: -5.0
-      cawfe_latte.ablation.name: B5_support_gate_softplus_dilated_target
-      cawfe_latte.post_fusion_backbone.type: small_cnn
-      cawfe_latte.temporal_pooling.type: last
+    name: baseline
+    description: Preserve the successful CAWFE-Latte architecture unchanged.
+    config_path: configs/ablations/cawfe_latte_baseline.yaml
+    changed_component: none
+  A_resblocks:
+    name: A_resblocks
+    description: Replace the baseline post-fusion CNN with six residual spatiotemporal blocks.
+    config_path: configs/ablations/cawfe_latte_A_resblocks.yaml
+    changed_component: post_fusion_backbone
+  B_multiscale_context:
+    name: B_multiscale_context
+    description: Replace the baseline post-fusion CNN with residual multi-scale spatial context.
+    config_path: configs/ablations/cawfe_latte_B_multiscale_context.yaml
+    changed_component: post_fusion_backbone
+  C_temporal_attention:
+    name: C_temporal_attention
+    description: Replace baseline last-timestep pooling with learned pixelwise temporal attention.
+    config_path: configs/ablations/cawfe_latte_C_temporal_attention.yaml
+    changed_component: temporal_pooling
+  G_separate_regression_decoder:
+    name: G_separate_regression_decoder
+    description: Replace the shared decoder with separate mask and continuous-regression decoders.
+    config_path: configs/ablations/cawfe_latte_G_separate_regression_decoder.yaml
+    changed_component: decoder
+  I_patch_fire_classifier:
+    name: I_patch_fire_classifier
+    description: Add a supervision-only patch-level future-fire presence classifier.
+    config_path: configs/ablations/cawfe_latte_I_patch_fire_classifier.yaml
+    changed_component: patch_fire_head
+  K_no_terrain_film:
+    name: K_no_terrain_film
+    description: Disable terrain encoding and FiLM modulation while retaining terrain data delivery.
+    config_path: configs/ablations/cawfe_latte_K_no_terrain_film.yaml
+    changed_component: terrain_film
+  L_simple_concat_fusion:
+    name: L_simple_concat_fusion
+    description: Replace fire-query attention with aligned modality concatenation and 1x1 projection.
+    config_path: configs/ablations/cawfe_latte_L_simple_concat_fusion.yaml
+    changed_component: fusion
+  D_local_window_attention:
+    name: D_local_window_attention
+    description: Replace the baseline post-fusion CNN with per-timestep local-window spatial self-attention.
+    config_path: configs/ablations/cawfe_latte_D_local_window_attention.yaml
+    changed_component: post_fusion_backbone
+    expected_compute_class: medium
+  E_earthformer_lite:
+    name: E_earthformer_lite
+    description: Replace the baseline post-fusion CNN with alternating local space-time cuboid attention.
+    config_path: configs/ablations/cawfe_latte_E_earthformer_lite.yaml
+    changed_component: post_fusion_backbone
+    expected_compute_class: high
+  O_fourier_postfusion:
+    name: O_fourier_postfusion
+    description: Replace the baseline post-fusion CNN with residual Fourier and local spatial mixing.
+    config_path: configs/ablations/cawfe_latte_O_fourier_postfusion.yaml
+    changed_component: post_fusion_backbone
+    expected_compute_class: medium
+  P_mamba_postfusion:
+    name: P_mamba_postfusion
+    description: Replace the baseline post-fusion CNN with official-Mamba temporal and spatial scans.
+    config_path: configs/ablations/cawfe_latte_P_mamba_postfusion.yaml
+    changed_component: post_fusion_backbone
+    expected_compute_class: high
+  CG_separate_decoder_temporal_attention:
+    name: CG_separate_decoder_temporal_attention
+    short_name: CG
+    description: Separate regression decoder plus temporal attention pooling.
+    components: [C, G]
+    changed_components: [temporal_pooling, decoder]
+    config_path: configs/ablations/cawfe_latte_CG_separate_decoder_temporal_attention.yaml
+    expected_compute_class: medium
+  GA_separate_decoder_resblocks:
+    name: GA_separate_decoder_resblocks
+    short_name: GA
+    description: Separate regression decoder plus six residual spatiotemporal blocks.
+    components: [G, A]
+    changed_components: [post_fusion_backbone, decoder]
+    config_path: configs/ablations/cawfe_latte_GA_separate_decoder_resblocks.yaml
+    expected_compute_class: medium
+  GE_separate_decoder_earthformer:
+    name: GE_separate_decoder_earthformer
+    short_name: GE
+    description: Separate regression decoder plus Earthformer-lite cuboid attention.
+    components: [G, E]
+    changed_components: [post_fusion_backbone, decoder]
+    config_path: configs/ablations/cawfe_latte_GE_separate_decoder_earthformer.yaml
+    expected_compute_class: high
+  GP_separate_decoder_mamba:
+    name: GP_separate_decoder_mamba
+    short_name: GP
+    description: Separate regression decoder plus official-Mamba spatiotemporal processing.
+    components: [G, P]
+    changed_components: [post_fusion_backbone, decoder]
+    config_path: configs/ablations/cawfe_latte_GP_separate_decoder_mamba.yaml
+    expected_compute_class: high
+  GK_separate_decoder_no_terrain:
+    name: GK_separate_decoder_no_terrain
+    short_name: GK
+    description: Separate regression decoder with terrain FiLM disabled.
+    components: [G, K]
+    changed_components: [decoder, terrain_film]
+    config_path: configs/ablations/cawfe_latte_GK_separate_decoder_no_terrain.yaml
+    expected_compute_class: medium
+  CGA_separate_decoder_temporal_attention_resblocks:
+    name: CGA_separate_decoder_temporal_attention_resblocks
+    short_name: CGA
+    description: Separate regression decoder, temporal attention pooling, and six residual spatiotemporal blocks.
+    components: [C, G, A]
+    changed_components: [post_fusion_backbone, temporal_pooling, decoder]
+    config_path: configs/ablations/cawfe_latte_CGA_separate_decoder_temporal_attention_resblocks.yaml
+    expected_compute_class: high
+  CGE_separate_decoder_temporal_attention_earthformer:
+    name: CGE_separate_decoder_temporal_attention_earthformer
+    short_name: CGE
+    description: Separate regression decoder, temporal attention pooling, and Earthformer-lite cuboid attention.
+    components: [C, G, E]
+    changed_components: [post_fusion_backbone, temporal_pooling, decoder]
+    config_path: configs/ablations/cawfe_latte_CGE_separate_decoder_temporal_attention_earthformer.yaml
+    expected_compute_class: high
+  CGP_separate_decoder_temporal_attention_mamba:
+    name: CGP_separate_decoder_temporal_attention_mamba
+    short_name: CGP
+    description: Separate regression decoder, temporal attention pooling, and official-Mamba spatiotemporal processing.
+    components: [C, G, P]
+    changed_components: [post_fusion_backbone, temporal_pooling, decoder]
+    config_path: configs/ablations/cawfe_latte_CGP_separate_decoder_temporal_attention_mamba.yaml
+    expected_compute_class: high
+  CGK_separate_decoder_temporal_attention_no_terrain:
+    name: CGK_separate_decoder_temporal_attention_no_terrain
+    short_name: CGK
+    description: Separate regression decoder and temporal attention pooling with terrain FiLM disabled.
+    components: [C, G, K]
+    changed_components: [temporal_pooling, decoder, terrain_film]
+    config_path: configs/ablations/cawfe_latte_CGK_separate_decoder_temporal_attention_no_terrain.yaml
+    expected_compute_class: medium

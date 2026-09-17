@@ -265,14 +265,47 @@ manual_fire_split:
     - Tubbs
     - REDWOODVALLEY
 
+    # added
+    - ARCHIECREEK
+    - CAMP
+    - CREEK
+    - ESPERANZA
+    - KING__period1__keepz_08
+    - KING__period2__keepz_08
+    - KING__period3__keepz_08
+    - MOSQUITO
+    - NORTHCOMPLX
+    - SLATER
+    - GLASS
+    - LITTLEBEAR__lbvaa__keepz_08
+    - LITTLEBEAR__lbvab__keepz_08
+    - LITTLEBEAR__lbvac__keepz_08
+
+    # hypothetical datasets: always training
+    - PARKCTY_HYPOTHETICAL
+    - TRUCKEE_HYPOTHETICAL
+    - YUBA_HYPOTHETICAL
+
   val_fires:
     - THOMAS__1209__keepz_08
-    - WITCHCREEK 
+    - WITCHCREEK
     - MARSHALL
+
+    # added
+    - CARR_FIRENADO
+    - EASTTROUBLESOME
+    - RIM__0820__keepz_08
 
   test_fires:
     - THOMAS__1210__keepz_08
     - CHIMNEYTOPS2
+
+    # added
+    - MCKINNEY
+    - TUOLUMNE_65
+    - WOOLSEY
+    - SPRINGS
+    - RIM__0822__keepz_08
 
 
 
@@ -1246,7 +1279,7 @@ training:
 
   # Optional CAWFE-Latte post-fusion feature logging. Disabled by default.
   save_fusion_vectors:
-    enabled: false
+    enabled: true
     output_name: fusion_vectors_by_epoch.npy
     sample_source: first_train_batch
     vector_reduce: mean_bt_hw

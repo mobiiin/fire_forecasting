@@ -1,0 +1,15 @@
+base_config: cawfe_latte_baseline.yaml
+
+experiment:
+  name: cawfe_latte_ablation_A_resblocks
+
+cawfe_latte:
+  ablation:
+    name: A_resblocks
+  post_fusion_backbone:
+    type: residual_spatiotemporal
+    num_blocks: 6
+
+training:
+  output:
+    root_dir: artifacts/ablations/cawfe_latte/A_resblocks

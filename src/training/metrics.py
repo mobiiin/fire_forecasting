@@ -10,7 +10,7 @@ except ImportError:  # pragma: no cover - environment-specific fallback
 	torch = None
 
 from src.data.energy_release import resolve_energy_output_channel_names, resolve_energy_release_config
-from src.training.model_outputs import extract_prediction
+from src.training.model_outputs import extract_aux_outputs, extract_prediction, patch_fire_presence_target
 
 
 def _get_section(config, *names):
@@ -48,6 +48,33 @@ def _segmentation_stats(predicted_mask: torch.Tensor, target_mask: torch.Tensor,
 		"precision": float(precision.item()),
 		"recall": float(recall.item()),
 	}
+
+
+def compute_patch_fire_metrics(model_output, y_true: torch.Tensor, eps: float = 1.0e-6) -> dict[str, float]:
+	"""Compute patch fire/no-fire classification metrics when its auxiliary logit exists."""
+	if torch is None:
+		raise ImportError("PyTorch is required to compute patch-fire metrics.")
+	patch_fire_logit = extract_aux_outputs(model_output).get("patch_fire_logit")
+	if not torch.is_tensor(patch_fire_logit):
+		return {}
+	with torch.no_grad():
+		target = patch_fire_presence_target(y_true).to(device=patch_fire_logit.device)
+		if patch_fire_logit.shape != target.shape:
+			raise ValueError(f"Patch-fire logits and targets must match, got {tuple(patch_fire_logit.shape)} and {tuple(target.shape)}.")
+		predicted = (torch.sigmoid(patch_fire_logit) >= 0.5).to(dtype=torch.float32)
+		target = target.to(dtype=torch.float32)
+		true_positive = torch.sum(predicted * target)
+		false_positive = torch.sum(predicted * (1.0 - target))
+		false_negative = torch.sum((1.0 - predicted) * target)
+		precision = true_positive / (true_positive + false_positive + eps)
+		recall = true_positive / (true_positive + false_negative + eps)
+		f1 = 2.0 * precision * recall / (precision + recall + eps)
+		return {
+			"patch_fire_accuracy": float((predicted == target).to(dtype=torch.float32).mean().item()),
+			"patch_fire_precision": float(precision.item()),
+			"patch_fire_recall": float(recall.item()),
+			"patch_fire_f1": float(f1.item()),
+		}
 
 
 def compute_metrics(y_pred: torch.Tensor, y_true: torch.Tensor, config) -> dict[str, float]:

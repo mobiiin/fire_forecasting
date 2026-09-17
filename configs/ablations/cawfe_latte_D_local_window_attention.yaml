@@ -1,0 +1,20 @@
+base_config: cawfe_latte_baseline.yaml
+
+experiment:
+  name: cawfe_latte_ablation_D_local_window_attention
+
+cawfe_latte:
+  ablation:
+    name: D_local_window_attention
+  post_fusion_backbone:
+    type: local_window_attention
+    num_blocks: 2
+    dim: 64
+    num_heads: 4
+    window_size: 8
+    mlp_ratio: 2.0
+    dropout: 0.1
+
+training:
+  output:
+    root_dir: artifacts/ablations/cawfe_latte/D_local_window_attention

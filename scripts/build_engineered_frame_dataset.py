@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -198,8 +199,9 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
 		area = load_fire_geometry(data_dir, geometry_config, geom_path=Path(str(record["geom_path"])) if record.get("geom_path") else None, terrain_path=Path(str(record["terrain_path"])) if record.get("terrain_path") else None, expected_shape=(h, w))["area_2d_m2"]
 		if bool(pc.get("save_area_2d", True)): np.save(geom_dir / "area_2d.npy", area.astype(np.float32))
 		_write_json(geom_dir / "geom_metadata.json", {"shape": list(area.shape), "dtype": "float32", "source_geom": record.get("geom_path"), "area_units": "m^2"})
-		frame_rows = []
-		for local, frame_path in enumerate(tqdm(selected_files, desc=f"{split}/{fire_name} frames", unit="frame", leave=False)):
+		def process_frame(item: tuple[int, Path]) -> tuple[int, Path, Path, np.ndarray, bool]:
+			"""Build one independent frame; safe to run concurrently within a fire."""
+			local, frame_path = item
 			out_path = frames_dir / f"frame_{local:06d}.npz"
 			rebuild_frame = True
 			if args.skip_existing and out_path.exists():
@@ -219,11 +221,26 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
 				if x.shape[0] != channel_manifest["num_total_channels"]: raise ValueError(f"Channel count mismatch for {fire_name}: {x.shape[0]} vs {channel_manifest['num_total_channels']}")
 				if not np.isfinite(x).all(): logging.warning("NaN/Inf detected in %s", frame_path)
 				frame_npz_roundtrip(out_path, x, raw.transpose(2, 0, 1) if bool(pc.get("save_raw_channels", True)) else None, frame_index_local=local, frame_index_original=start + local, fire_name=fire_name, split=split)
+			return local, frame_path, out_path, x, rebuild_frame
+
+		frame_rows = []
+		frame_items = list(enumerate(selected_files))
+		worker_count = max(1, min(int(args.workers), len(frame_items)))
+		if worker_count == 1:
+			processed_frames = (process_frame(item) for item in frame_items)
+		else:
+			# Each task writes a distinct archive. Threading overlaps raw-frame reads,
+			# NumPy feature work, and zlib compression while preserving frame order here.
+			executor = ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="engineered-frame")
+			processed_frames = executor.map(process_frame, frame_items)
+		for local, frame_path, out_path, x, _ in tqdm(processed_frames, total=len(frame_items), desc=f"{split}/{fire_name} frames", unit="frame", leave=False):
 			quick_path = None
 			quick_cfg = pc.get("quicklook", {}) if isinstance(pc.get("quicklook"), Mapping) else {}
 			if (args.quicklooks and bool(quick_cfg.get("enabled", True)) and (local == 0 or local == len(selected_files) - 1 or local % int(quick_cfg.get("every_n_frames", 100)) == 0)) and sum(1 for row in frame_rows if row.get("quicklook_path")) < int(quick_cfg.get("max_per_fire", 20)):
 				quick_dir.mkdir(parents=True, exist_ok=True); quick_path = quick_dir / f"frame_{local:06d}_core.png"; _quicklook(quick_path, x, fire_name, split, local, start + local)
 			frame_rows.append({"local_index": local, "original_index": start + local, "path": str(out_path.relative_to(output)), "source_raw_file": str(frame_path), "quicklook_path": str(quick_path.relative_to(output)) if quick_path else None})
+		if worker_count > 1:
+			executor.shutdown(wait=True)
 		_write_json(fire_root / "fire_manifest.json", {"fire_name": fire_name, "split": split, "source_fire_path": str(data_dir), "num_raw_frames": len(files), "num_processed_frames": len(selected_files), "temporal_trim": dict(trim), "frame_shape": [channel_manifest["num_total_channels"], h, w], "raw_shape": [86, h, w], "frame_format": "npz", "array_layout": "C,H,W", "frames_dir": "frames", "geometry": {"area_2d_path": str((geom_dir / "area_2d.npy").relative_to(fire_root)), "height": h, "width": w}, "terrain": terrain_manifest})
 		(fire_root / "frame_manifest.jsonl").write_text("\n".join(json.dumps(row, sort_keys=True) for row in frame_rows) + "\n", encoding="utf-8")
 		fires_manifest[fire_name] = {"split": split, "manifest": str((fire_root / "fire_manifest.json").relative_to(output)), "num_processed_frames": len(selected_files), "shape": [channel_manifest["num_total_channels"], h, w], "terrain": terrain_manifest}
@@ -238,7 +255,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
 
 def main() -> None:
 	p = argparse.ArgumentParser()
-	p.add_argument("--config", default="configs/default.yaml"); p.add_argument("--output_root"); p.add_argument("--fires", default="all"); p.add_argument("--splits", nargs="+", choices=SPLITS, default=list(SPLITS)); p.add_argument("--overwrite", action="store_true"); p.add_argument("--skip_existing", action="store_true"); p.add_argument("--max_frames_per_fire", type=int); p.add_argument("--no_quicklooks", dest="quicklooks", action="store_false", default=True); p.add_argument("--dtype", default="float32"); p.add_argument("--compression", default="compressed"); p.add_argument("--include_unsplit_fires", action="store_true")
+	p.add_argument("--config", default="configs/default.yaml"); p.add_argument("--output_root"); p.add_argument("--fires", default="all"); p.add_argument("--splits", nargs="+", choices=SPLITS, default=list(SPLITS)); p.add_argument("--overwrite", action="store_true"); p.add_argument("--skip_existing", action="store_true"); p.add_argument("--max_frames_per_fire", type=int); p.add_argument("--workers", type=int, default=1, help="Concurrent frame builders per fire; use 1 for serial processing."); p.add_argument("--no_quicklooks", dest="quicklooks", action="store_false", default=True); p.add_argument("--dtype", default="float32"); p.add_argument("--compression", default="compressed"); p.add_argument("--include_unsplit_fires", action="store_true")
 	args = p.parse_args(); print(json.dumps(build(args), indent=2))
 
 

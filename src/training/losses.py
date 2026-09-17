@@ -18,7 +18,7 @@ from src.data.energy_release import resolve_energy_output_channel_names, resolve
 
 
 
-from src.training.model_outputs import extract_aux_outputs, extract_prediction
+from src.training.model_outputs import extract_aux_outputs, extract_prediction, patch_fire_presence_target
 
 def _get_section(config, *names):
 	"""Return the first mapping-like section present in ``config``."""
@@ -256,6 +256,9 @@ class MultiTaskLoss(nn.Module):
 			mask_config = _get_section(self.training_loss_config, "mask")
 			energy_config = _get_section(self.training_loss_config, "energy")
 			aux_config = _get_section(self.training_loss_config, "auxiliary_fire_support")
+			patch_fire_config = _get_section(self.training_loss_config, "patch_fire")
+			self.patch_fire_enabled = bool(patch_fire_config.get("enabled", False))
+			self.patch_fire_weight = float(patch_fire_config.get("weight", 0.2))
 			self.surface_loss_weight = float(surface_config.get("weight", 1.0))
 			self.canopy_loss_weight = float(canopy_config.get("weight", 1.0))
 			self.segmentation_loss_weight = float(mask_config.get("weight", 5.0))
@@ -275,6 +278,8 @@ class MultiTaskLoss(nn.Module):
 			self.aux_fire_support_weight = 0.0
 			self.aux_fire_support_target = "original_mask"
 			self.aux_fire_support_dilation_radius = 0
+			self.patch_fire_enabled = False
+			self.patch_fire_weight = 0.0
 
 	def _energy_threshold_in_target_space(self) -> float:
 		"""Convert the physical active threshold into target space."""
@@ -458,8 +463,19 @@ class MultiTaskLoss(nn.Module):
 			weighted_mask = self.segmentation_loss_weight * mask_loss
 			weighted_energy = self.energy_loss_weight * energy_loss
 			weighted_aux = self.aux_fire_support_weight * aux_total
-			total_loss = weighted_surface + weighted_canopy + weighted_mask + weighted_energy + weighted_aux
-			return {
+			patch_fire_loss = torch.zeros((), dtype=y_pred.dtype, device=y_pred.device)
+			weighted_patch_fire = torch.zeros((), dtype=y_pred.dtype, device=y_pred.device)
+			if self.patch_fire_enabled:
+				patch_fire_logit = aux_outputs.get("patch_fire_logit")
+				if not torch.is_tensor(patch_fire_logit):
+					raise ValueError("training.loss.patch_fire.enabled=true requires model output 'patch_fire_logit'.")
+				patch_target = patch_fire_presence_target(y_true).to(device=patch_fire_logit.device, dtype=patch_fire_logit.dtype)
+				if patch_fire_logit.shape != patch_target.shape:
+					raise ValueError(f"Patch-fire logits and targets must match, got {tuple(patch_fire_logit.shape)} and {tuple(patch_target.shape)}.")
+				patch_fire_loss = F.binary_cross_entropy_with_logits(patch_fire_logit, patch_target)
+				weighted_patch_fire = self.patch_fire_weight * patch_fire_loss
+			total_loss = weighted_surface + weighted_canopy + weighted_mask + weighted_energy + weighted_aux + weighted_patch_fire
+			result = {
 				"total_loss": total_loss,
 				"loss_total": total_loss,
 				"loss_surface": surface_loss,
@@ -478,6 +494,11 @@ class MultiTaskLoss(nn.Module):
 				"weighted_energy": weighted_energy,
 				"weighted_aux_fire_support": weighted_aux,
 			}
+			if self.patch_fire_enabled:
+				result["loss_patch_fire_bce"] = patch_fire_loss
+				result["loss_patch_fire_total"] = patch_fire_loss
+				result["weighted_patch_fire"] = weighted_patch_fire
+			return result
 
 		surface_loss = self._regression_loss(pred_surface_consumed, true_surface_consumed, true_mask)
 		canopy_loss = self._regression_loss(pred_canopy_consumed, true_canopy_consumed, true_mask)

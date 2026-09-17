@@ -1,0 +1,14 @@
+base_config: cawfe_latte_baseline.yaml
+
+experiment:
+  name: cawfe_latte_ablation_L_simple_concat_fusion
+
+cawfe_latte:
+  ablation:
+    name: L_simple_concat_fusion
+  fusion:
+    type: concat_projection
+
+training:
+  output:
+    root_dir: artifacts/ablations/cawfe_latte/L_simple_concat_fusion

@@ -90,6 +90,7 @@ cawfe_latte:
       shared_across_modalities: true
 
   fusion:
+    type: fire_query_attention
     input_format: tokens
     dim: 64
     num_heads: 4
@@ -112,6 +113,7 @@ cawfe_latte:
     norm: groupnorm
 
   terrain_film:
+    enabled: true
     dim: 64
     use_scale: true
     use_shift: true
@@ -132,8 +134,17 @@ cawfe_latte:
   temporal_aggregation:
     mode: last
 
+  post_fusion_backbone:
+    type: baseline_cnn
+
+  temporal_pooling:
+    type: baseline
+
+  patch_fire_head:
+    enabled: false
+
   decoder:
-    type: shallow_cnn
+    type: shared
     in_dim: 64
     hidden_dim: 64
     num_blocks: 2

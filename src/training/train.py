@@ -83,7 +83,7 @@ from src.training.input_normalization import (
 	resolve_input_normalization_stats_path,
 )
 from src.training.losses import get_loss_function
-from src.training.metrics import compute_metrics
+from src.training.metrics import compute_metrics, compute_patch_fire_metrics
 from src.training.run_manager import RunManager, get_training_checkpointing_config, get_training_output_config
 from src.training.run_plots import save_training_run_figures
 from src.utils.logging import setup_logging
@@ -918,6 +918,7 @@ def _run_epoch(
 	total_loss = 0.0
 	metric_samples = 0
 	metric_totals: dict[str, float] = defaultdict(float)
+	metric_weights: dict[str, float] = defaultdict(float)
 	loss_component_totals: dict[str, float] = defaultdict(float)
 	timing_totals: dict[str, float] = defaultdict(float)
 	timing_rows: list[dict[str, Any]] = []
@@ -1099,11 +1100,24 @@ def _run_epoch(
 				y_batch.detach(),
 			)
 			batch_metrics = compute_metrics(metric_prediction, metric_target, config)
+			batch_metrics.update(compute_patch_fire_metrics(model_output, metric_target))
 			_sync_if_timing()
 			metrics_time = time.perf_counter() - metrics_start_time
 			metric_samples += batch_size
+			no_fire_patch_count = max(0.0, float(batch_metrics.get("no_fire_patch_count", 0.0)))
 			for metric_name, metric_value in batch_metrics.items():
-				metric_totals[metric_name] += float(metric_value) * batch_size
+				value = float(metric_value)
+				if not math.isfinite(value):
+					continue
+				if metric_name in {"no_fire_patch_count", "active_patch_count"}:
+					metric_totals[metric_name] += value
+					metric_weights[metric_name] = 1.0
+					continue
+				weight = no_fire_patch_count if metric_name.startswith("no_fire_") else float(batch_size)
+				if weight <= 0.0:
+					continue
+				metric_totals[metric_name] += value * weight
+				metric_weights[metric_name] += weight
 
 		batch_total_time = time.perf_counter() - fetch_start_time
 		samples_per_second = batch_size / max(batch_total_time, 1.0e-9)
@@ -1184,7 +1198,7 @@ def _run_epoch(
 	for component_name, total_value in loss_component_totals.items():
 		results[f"{desc}_{component_name}"] = total_value / total_samples
 	for metric_name, total_value in metric_totals.items():
-		results[f"{desc}_{metric_name}"] = total_value / max(metric_samples, 1)
+		results[f"{desc}_{metric_name}"] = total_value / max(metric_weights[metric_name], 1.0)
 	results[f"{desc}_samples"] = float(total_samples)
 	results[f"{desc}_batches"] = float(batch_number)
 	completed_batches = max(1, int(batch_number))
@@ -2141,6 +2155,8 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 	for epoch_index in range(start_epoch, epochs):
 		epoch_number = epoch_index + 1
 		epoch_start_time = time.perf_counter()
+		if device.type == "cuda":
+			torch.cuda.reset_peak_memory_stats(device)
 		logger.info("Epoch %s/%s", epoch_number, epochs)
 		if fusion_vector_logger.enabled:
 			fusion_vector_logger.collect_epoch_vector(model, fusion_vector_batch, device, epoch_number)
@@ -2213,8 +2229,8 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 		gpu_memory_allocated_gb = 0.0
 		gpu_memory_reserved_gb = 0.0
 		if device.type == "cuda":
-			gpu_memory_allocated_gb = float(torch.cuda.memory_allocated(device)) / float(1024**3)
-			gpu_memory_reserved_gb = float(torch.cuda.memory_reserved(device)) / float(1024**3)
+			gpu_memory_allocated_gb = float(torch.cuda.max_memory_allocated(device)) / float(1024**3)
+			gpu_memory_reserved_gb = float(torch.cuda.max_memory_reserved(device)) / float(1024**3)
 		train_samples = float(train_results.get("train_samples", 0.0))
 		row = {
 			"epoch": epoch_number,

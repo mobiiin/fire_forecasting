@@ -1,0 +1,14 @@
+base_config: cawfe_latte_baseline.yaml
+
+experiment:
+  name: cawfe_latte_ablation_C_temporal_attention
+
+cawfe_latte:
+  ablation:
+    name: C_temporal_attention
+  temporal_pooling:
+    type: attention
+
+training:
+  output:
+    root_dir: artifacts/ablations/cawfe_latte/C_temporal_attention

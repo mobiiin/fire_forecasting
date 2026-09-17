@@ -1,0 +1,14 @@
+base_config: cawfe_latte_baseline.yaml
+
+experiment:
+  name: cawfe_latte_ablation_B_multiscale_context
+
+cawfe_latte:
+  ablation:
+    name: B_multiscale_context
+  post_fusion_backbone:
+    type: multiscale_context
+
+training:
+  output:
+    root_dir: artifacts/ablations/cawfe_latte/B_multiscale_context

@@ -229,6 +229,7 @@ def build_model_from_config(config: Mapping[str, Any], input_channels: int):
 			decoder=section.get("decoder", {}),
 			heads=section.get("heads", {}),
 			auxiliary=section.get("auxiliary", {}),
+			patch_fire_head=section.get("patch_fire_head", {}),
 			use_terrain_conditioning=bool(section.get("use_terrain_conditioning", False)),
 			terrain_encoder=section.get("terrain_encoder", {}),
 			terrain_film=section.get("terrain_film", {}),

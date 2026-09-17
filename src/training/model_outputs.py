@@ -26,3 +26,13 @@ def extract_aux_outputs(model_output: Any) -> dict[str, Any]:
     if isinstance(model_output, dict):
         return {key: value for key, value in model_output.items() if key != "prediction"}
     return {}
+
+
+def patch_fire_presence_target(y_true: Any):
+    """Build one B x 1 future-fire-presence target from channel-2 fire masks."""
+    if torch is None or not torch.is_tensor(y_true):
+        raise TypeError("Patch-fire targets require a torch.Tensor.")
+    if y_true.ndim != 4 or int(y_true.shape[1]) < 3:
+        raise ValueError(f"Patch-fire targets expect B x C x H x W with C >= 3, got {tuple(y_true.shape)}.")
+    target_mask = y_true[:, 2]
+    return (target_mask > 0.5).flatten(1).any(dim=1).to(dtype=torch.float32).unsqueeze(1)

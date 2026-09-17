@@ -1,0 +1,14 @@
+base_config: cawfe_latte_baseline.yaml
+
+experiment:
+  name: cawfe_latte_ablation_G_separate_regression_decoder
+
+cawfe_latte:
+  ablation:
+    name: G_separate_regression_decoder
+  decoder:
+    type: separate_regression
+
+training:
+  output:
+    root_dir: artifacts/ablations/cawfe_latte/G_separate_regression_decoder

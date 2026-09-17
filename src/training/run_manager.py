@@ -24,6 +24,7 @@ except ImportError:  # pragma: no cover - dependency is already required by conf
 
 DEFAULT_OUTPUT_CONFIG: dict[str, Any] = {
 	"root_dir": "artifacts/runs",
+	"flat_run_layout": False,
 	"checkpoint_root": "artifacts/checkpoints",
 	"log_root": "artifacts/logs",
 	"save_compatibility_checkpoints": False,
@@ -199,7 +200,8 @@ class RunManager:
 			self.requested_run_name = sanitize_run_component(explicit_run_name, fallback=self.architecture)
 		self.overwrite_run = bool(training_config.get("overwrite_run", False))
 		self.run_name = self.requested_run_name
-		self.run_dir = self.root_dir / self.architecture / self.run_name
+		self.run_parent_dir = self.root_dir if bool(self.output_config.get("flat_run_layout", False)) else self.root_dir / self.architecture
+		self.run_dir = self.run_parent_dir / self.run_name
 		self.checkpoint_dir = self.run_dir / "checkpoints"
 		self.log_dir = self.run_dir / "logs"
 		self.figure_dir = self.run_dir / "figures"
@@ -216,12 +218,12 @@ class RunManager:
 		base_run_name = self.requested_run_name
 		if self.overwrite_run:
 			self.run_name = base_run_name
-			self.run_dir = self.root_dir / self.architecture / self.run_name
+			self.run_dir = self.run_parent_dir / self.run_name
 			self.run_dir.mkdir(parents=True, exist_ok=True)
 		else:
 			for suffix_index in range(1, 1000):
 				candidate_name = base_run_name if suffix_index == 1 else f"{base_run_name}_v{suffix_index}"
-				candidate_dir = self.root_dir / self.architecture / candidate_name
+				candidate_dir = self.run_parent_dir / candidate_name
 				try:
 					candidate_dir.mkdir(parents=True, exist_ok=False)
 				except FileExistsError:
@@ -230,7 +232,7 @@ class RunManager:
 				self.run_dir = candidate_dir
 				break
 			else:  # pragma: no cover - defensive guard for pathological collisions
-				raise FileExistsError(f"Could not create a unique run directory under {self.root_dir / self.architecture}.")
+				raise FileExistsError(f"Could not create a unique run directory under {self.run_parent_dir}.")
 
 		self.checkpoint_dir = self.run_dir / "checkpoints"
 		self.log_dir = self.run_dir / "logs"

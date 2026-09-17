@@ -20,6 +20,8 @@ Options:
   --make-quicklooks           Save debug visualizations
   --overwrite                 Pass overwrite where supported; disables engineered --skip_existing
   --max-frames-per-fire N     Debug-only frame limit
+  --engineered-workers N      Concurrent full-frame builders per fire (default: 1)
+  --normalization-frame-cache-gb N  RAM cache for decompressed normalization frames (default: 0)
   --dry-run                   Print commands without running them
   --help                      Show this help
 EOF
@@ -56,6 +58,8 @@ SKIP_SAMPLES=0
 SKIP_NORMALIZATION=0
 SKIP_INSPECTION=0
 MAX_FRAMES_PER_FIRE=""
+ENGINEERED_WORKERS="1"
+NORMALIZATION_FRAME_CACHE_GB="0"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -73,6 +77,8 @@ while [[ $# -gt 0 ]]; do
         --make-quicklooks) MAKE_QUICKLOOKS=1; shift ;;
         --overwrite) OVERWRITE=1; shift ;;
         --max-frames-per-fire) MAX_FRAMES_PER_FIRE="$2"; shift 2 ;;
+        --engineered-workers) ENGINEERED_WORKERS="$2"; shift 2 ;;
+        --normalization-frame-cache-gb) NORMALIZATION_FRAME_CACHE_GB="$2"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         --help|-h) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
@@ -270,6 +276,8 @@ if [[ "$SKIP_ENGINEERED" == "0" ]]; then
     else
         cmd+=(--skip_existing)
     fi
+    cmd+=(--workers "$ENGINEERED_WORKERS")
+    if [[ "$MAKE_QUICKLOOKS" == "0" ]]; then cmd+=(--no_quicklooks); fi
     [[ -n "$MAX_FRAMES_PER_FIRE" ]] && cmd+=(--max_frames_per_fire "$MAX_FRAMES_PER_FIRE")
     run_cmd "${cmd[@]}"
 fi
@@ -336,7 +344,7 @@ if [[ "$SKIP_SAMPLES" == "0" ]]; then
     fi
 fi
 if [[ "$SKIP_NORMALIZATION" == "0" ]]; then
-    run_cmd python scripts/compute_processed_dataset_normalization.py --config "$TARGET_CONFIG" --pattern "$PATTERN"
+    run_cmd python scripts/compute_processed_dataset_normalization.py --config "$TARGET_CONFIG" --pattern "$PATTERN" --frame_cache_gb "$NORMALIZATION_FRAME_CACHE_GB"
     if [[ "$DRY_RUN" == "0" ]]; then
         verify_normalization_outputs "$TARGET_CONFIG" "$PATTERN"
     fi

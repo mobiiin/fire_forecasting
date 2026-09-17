@@ -4,6 +4,9 @@ Controls:
   Left/Right  previous/next target timestamp
   n/p         next/previous fire
   w           save current figure
+
+Examples:
+  python scripts/visualize_targets.py --config configs/default.yaml --split train --fire CALWOOD
   q           quit
   h           print controls
 """
@@ -12,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import Mapping
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -19,6 +23,42 @@ import numpy as np
 from src.config import load_config
 from src.data.fire_mask_thresholds import resolve_frozen_thresholds
 from src.data.processed_dataset import SPLITS, load_dataset_manifest, load_fire_manifest, manifest_split_fires
+
+
+def _all_manifest_fires(manifest: Mapping) -> dict[str, str | None]:
+	"""Return every processed fire and its manifest split when available."""
+	fires = manifest.get("fires", {}) if isinstance(manifest, Mapping) else {}
+	result: dict[str, str | None] = {}
+	if isinstance(fires, Mapping):
+		for name, payload in fires.items():
+			split = payload.get("split") if isinstance(payload, Mapping) else None
+			result[str(name)] = str(split) if split is not None else None
+	if isinstance(manifest.get("splits", {}), Mapping):
+		for split in SPLITS:
+			for name in manifest_split_fires(manifest, split):
+				result.setdefault(str(name), split)
+	return result
+
+
+def _resolve_start_fire_index(manifest: Mapping, split: str, fires: list[str], requested_fire: str | None) -> int:
+	if not requested_fire:
+		return 0
+	if requested_fire in fires:
+		return fires.index(requested_fire)
+	all_fires = _all_manifest_fires(manifest)
+	if requested_fire in all_fires:
+		actual_split = all_fires[requested_fire] or "unknown"
+		raise ValueError(
+			"Fire {!r} is present in the processed dataset, but not in split {!r}; "
+			"it belongs to split {!r}. Re-run with --split {}.".format(requested_fire, split, actual_split, actual_split)
+		)
+	available = ", ".join(fires[:20])
+	if len(fires) > 20:
+		available += ", ... ({} total)".format(len(fires))
+	raise ValueError(
+		"Fire {!r} was not found in the processed dataset trajectory for split {!r}. "
+		"Available fires in this split: {}".format(requested_fire, split, available or "<none>")
+	)
 
 
 def _load_view(root: Path, fire: str, current_index: int, horizon: int):
@@ -54,7 +94,7 @@ def main():
 	p.add_argument("--config", default="configs/default.yaml")
 	p.add_argument("--dataset_root")
 	p.add_argument("--split", choices=SPLITS, default="train")
-	p.add_argument("--fire")
+	p.add_argument("--fire", help="Optional fire name to start from. Must be present in the selected split.")
 	p.add_argument("--current_index", type=int, default=0)
 	p.add_argument("--horizon", type=int)
 	p.add_argument("--mode", choices=("interactive", "save"), default="interactive")
@@ -70,7 +110,9 @@ def main():
 	fires = manifest_split_fires(manifest, a.split)
 	if not fires:
 		raise ValueError(f"No fires found for split {a.split!r}")
-	fire_index = fires.index(a.fire) if a.fire in fires else 0
+	fire_index = _resolve_start_fire_index(manifest, a.split, fires, a.fire)
+	if a.fire:
+		print(f"Starting target visualizer at requested fire: {a.fire}")
 	state = {"fire_index": fire_index, "current_index": max(0, int(a.current_index))}
 	labels = ["current surface fuel", "future surface fuel", "surface consumed", "current canopy fuel", "future canopy fuel", "canopy consumed", "energy MW", "energy log", "fire mask"]
 	fig = plt.figure(figsize=(12, 11))
@@ -125,7 +167,10 @@ def main():
 
 	if a.mode == "save":
 		redraw()
-		fig.savefig(Path(a.output_dir) / f"{fire_name()}_current_{state['current_index']:06d}.png", dpi=130)
+		output = Path(a.output_dir) / f"{fire_name()}_current_{state['current_index']:06d}.png"
+		output.parent.mkdir(parents=True, exist_ok=True)
+		fig.savefig(output, dpi=130)
+		print(f"Saved: {output}")
 		plt.close(fig)
 	else:
 		fig.canvas.mpl_connect("key_press_event", on_key)

@@ -1,0 +1,24 @@
+base_config: cawfe_latte_baseline.yaml
+
+experiment:
+  name: cawfe_latte_ablation_CGP_separate_decoder_temporal_attention_mamba
+
+cawfe_latte:
+  ablation:
+    name: CGP_separate_decoder_temporal_attention_mamba
+  post_fusion_backbone:
+    type: spatiotemporal_mamba
+    dim: 64
+    num_blocks: 2
+    expansion: 2
+    dropout: 0.1
+    scan_order: temporal_then_spatial
+    backend: mamba_ssm
+  temporal_pooling:
+    type: attention
+  decoder:
+    type: separate_regression
+
+training:
+  output:
+    root_dir: artifacts/ablations/cawfe_latte/CGP_separate_decoder_temporal_attention_mamba
