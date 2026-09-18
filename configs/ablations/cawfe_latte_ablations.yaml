@@ -135,3 +135,111 @@ ablations:
     changed_components: [temporal_pooling, decoder, terrain_film]
     config_path: configs/ablations/cawfe_latte_CGK_separate_decoder_temporal_attention_no_terrain.yaml
     expected_compute_class: medium
+  GA_Q1_fire_domain_adversarial:
+    name: GA_Q1_fire_domain_adversarial
+    short_name: GA-Q1
+    description: Add training-only fire-domain adversarial invariance to GA.
+    components: [G, A, Q1]
+    parent_architecture: GA_separate_decoder_resblocks
+    changed_components: [post_fusion_backbone, decoder, domain_adversarial]
+    config_path: configs/ablations/cawfe_latte_GA_Q1_fire_domain_adversarial.yaml
+    expected_compute_class: medium
+  GA_Q2_fire_domain_mmd:
+    name: GA_Q2_fire_domain_mmd
+    short_name: GA-Q2
+    description: Add cross-fire latent MMD alignment to GA.
+    components: [G, A, Q2]
+    parent_architecture: GA_separate_decoder_resblocks
+    changed_components: [post_fusion_backbone, decoder, fire_mmd]
+    config_path: configs/ablations/cawfe_latte_GA_Q2_fire_domain_mmd.yaml
+    expected_compute_class: medium
+  GA_R_mask_guided_regression_attention:
+    name: GA_R_mask_guided_regression_attention
+    short_name: GA-R
+    description: Add zero-initialized mask-guided regression feature attention to GA.
+    components: [G, A, R]
+    parent_architecture: GA_separate_decoder_resblocks
+    changed_components: [post_fusion_backbone, decoder, mask_guided_regression]
+    config_path: configs/ablations/cawfe_latte_GA_R_mask_guided_regression_attention.yaml
+    expected_compute_class: medium
+  GA_S_regression_moe:
+    name: GA_S_regression_moe
+    short_name: GA-S
+    description: Replace GA's regression decoder with three softly routed shallow experts.
+    components: [G, A, S]
+    parent_architecture: GA_separate_decoder_resblocks
+    changed_components: [post_fusion_backbone, decoder, regression_moe]
+    config_path: configs/ablations/cawfe_latte_GA_S_regression_moe.yaml
+    expected_compute_class: medium
+  GA_T_supervised_contrastive:
+    name: GA_T_supervised_contrastive
+    short_name: GA-T
+    description: Add target-activity supervised contrastive regularization to GA.
+    components: [G, A, T]
+    parent_architecture: GA_separate_decoder_resblocks
+    changed_components: [post_fusion_backbone, decoder, supervised_contrastive]
+    config_path: configs/ablations/cawfe_latte_GA_T_supervised_contrastive.yaml
+    expected_compute_class: medium
+  GA_U_physical_state_aux:
+    name: GA_U_physical_state_aux
+    short_name: GA-U
+    description: Add auxiliary global physical-state supervision to GA.
+    components: [G, A, U]
+    parent_architecture: GA_separate_decoder_resblocks
+    changed_components: [post_fusion_backbone, decoder, physical_state_aux]
+    config_path: configs/ablations/cawfe_latte_GA_U_physical_state_aux.yaml
+    expected_compute_class: medium
+  GPK_mamba_no_terrain:
+    name: GPK_mamba_no_terrain
+    short_name: GPK
+    description: Combine separate regression decoding, official Mamba, and disabled terrain FiLM.
+    components: [G, P, K]
+    parent_architecture: [GP_separate_decoder_mamba, GK_separate_decoder_no_terrain]
+    changed_components: [post_fusion_backbone, decoder, terrain_film]
+    config_path: configs/ablations/cawfe_latte_GPK_mamba_no_terrain.yaml
+    expected_compute_class: high
+  CGPK_temporal_mamba_no_terrain:
+    name: CGPK_temporal_mamba_no_terrain
+    short_name: CGPK
+    description: Combine temporal attention, separate decoding, official Mamba, and disabled terrain FiLM.
+    components: [C, G, P, K]
+    parent_architecture: [CGP_separate_decoder_temporal_attention_mamba, GK_separate_decoder_no_terrain]
+    changed_components: [post_fusion_backbone, temporal_pooling, decoder, terrain_film]
+    config_path: configs/ablations/cawfe_latte_CGPK_temporal_mamba_no_terrain.yaml
+    expected_compute_class: high
+  GAK_resblocks_no_terrain:
+    name: GAK_resblocks_no_terrain
+    short_name: GAK
+    description: Combine six residual post-fusion blocks, separate decoding, and disabled terrain FiLM.
+    components: [G, A, K]
+    parent_architecture: [GA_separate_decoder_resblocks, GK_separate_decoder_no_terrain]
+    changed_components: [post_fusion_backbone, decoder, terrain_film]
+    config_path: configs/ablations/cawfe_latte_GAK_resblocks_no_terrain.yaml
+    expected_compute_class: medium
+  CGP_R_mask_guided_regression_attention:
+    name: CGP_R_mask_guided_regression_attention
+    short_name: CGP-R
+    description: Add zero-initialized mask-guided regression feature attention to CGP.
+    components: [C, G, P, R]
+    parent_architecture: CGP_separate_decoder_temporal_attention_mamba
+    changed_components: [post_fusion_backbone, temporal_pooling, decoder, mask_guided_regression]
+    config_path: configs/ablations/cawfe_latte_CGP_R_mask_guided_regression_attention.yaml
+    expected_compute_class: high
+  GP_R_mask_guided_regression_attention:
+    name: GP_R_mask_guided_regression_attention
+    short_name: GP-R
+    description: Add zero-initialized mask-guided regression feature attention to GP.
+    components: [G, P, R]
+    parent_architecture: GP_separate_decoder_mamba
+    changed_components: [post_fusion_backbone, decoder, mask_guided_regression]
+    config_path: configs/ablations/cawfe_latte_GP_R_mask_guided_regression_attention.yaml
+    expected_compute_class: high
+  GK_R_mask_guided_regression_attention:
+    name: GK_R_mask_guided_regression_attention
+    short_name: GK-R
+    description: Add zero-initialized mask-guided regression feature attention to GK.
+    components: [G, K, R]
+    parent_architecture: GK_separate_decoder_no_terrain
+    changed_components: [decoder, terrain_film, mask_guided_regression]
+    config_path: configs/ablations/cawfe_latte_GK_R_mask_guided_regression_attention.yaml
+    expected_compute_class: medium

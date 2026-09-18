@@ -1291,15 +1291,122 @@ class PredictionHead(nn.Module):
 		return self.activation(self.proj(x))
 
 
+class GradientReversalFunction(torch.autograd.Function):
+	"""Identity in the forward pass and sign-scaled reversal in backward."""
+
+	@staticmethod
+	def forward(ctx, x: torch.Tensor, lambda_grl: float) -> torch.Tensor:
+		ctx.lambda_grl = float(lambda_grl)
+		return x.view_as(x)
+
+	@staticmethod
+	def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+		return -ctx.lambda_grl * grad_output, None
+
+
+def gradient_reverse(x: torch.Tensor, lambda_grl: float = 1.0) -> torch.Tensor:
+	return GradientReversalFunction.apply(x, float(lambda_grl))
+
+
+class DomainAdversarialHead(nn.Module):
+	"""Training-only fire-domain classifier attached through a GRL."""
+
+	def __init__(self, dim: int, num_domains: int, hidden_dim: int = 64, lambda_grl: float = 1.0, dropout: float = 0.1) -> None:
+		super().__init__()
+		if int(num_domains) < 1:
+			raise ValueError("domain_adversarial.num_domains must be positive.")
+		self.lambda_grl = float(lambda_grl)
+		self.classifier = nn.Sequential(
+			nn.Linear(int(dim), int(hidden_dim)),
+			nn.SiLU(inplace=True),
+			nn.Dropout(float(dropout)),
+			nn.Linear(int(hidden_dim), int(num_domains)),
+		)
+
+	def forward(self, pooled: torch.Tensor) -> torch.Tensor:
+		return self.classifier(gradient_reverse(pooled, self.lambda_grl))
+
+
+class MaskGuidedRegressionAttention(nn.Module):
+	"""Soft mask-feature attention that is exactly parent-equivalent at alpha=0."""
+
+	def __init__(self, mask_dim: int, alpha_init: float = 0.0, attention_activation: str = "sigmoid") -> None:
+		super().__init__()
+		if str(attention_activation).lower() != "sigmoid":
+			raise ValueError("mask_guided_regression.attention_activation must be 'sigmoid'.")
+		self.projection = nn.Conv2d(int(mask_dim), 1, kernel_size=1)
+		self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
+
+	def forward(self, regression_features: torch.Tensor, mask_features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+		attention = torch.sigmoid(self.projection(mask_features.detach()))
+		return regression_features * (1.0 + self.alpha * attention), attention
+
+
+class RegressionMixtureOfExperts(nn.Module):
+	"""Three-way (configurable) soft mixture of shallow regression decoders."""
+
+	def __init__(self, dim: int, decoder_config: Mapping[str, Any], num_experts: int = 3, routing: str = "soft") -> None:
+		super().__init__()
+		if str(routing).lower() != "soft":
+			raise ValueError("regression_moe.routing currently supports only 'soft'.")
+		if int(num_experts) < 2:
+			raise ValueError("regression_moe.num_experts must be at least 2.")
+		self.num_experts = int(num_experts)
+		options = dict(decoder_config)
+		self.experts = nn.ModuleList(
+			ShallowDecoder(type="shallow_cnn", **options) for _ in range(self.num_experts)
+		)
+		router_hidden_dim = max(1, int(dim) // 2)
+		self.router = nn.Sequential(
+			nn.Linear(int(dim), router_hidden_dim),
+			nn.SiLU(inplace=True),
+			nn.Linear(router_hidden_dim, self.num_experts),
+		)
+
+	def forward(self, latent: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+		context = F.adaptive_avg_pool2d(latent, 1).flatten(1)
+		weights = torch.softmax(self.router(context), dim=1)
+		expert_features = torch.stack([expert(latent) for expert in self.experts], dim=1)
+		mixture = torch.sum(expert_features * weights[:, :, None, None, None], dim=1)
+		return mixture, weights
+
+
+class ContrastiveProjectionHead(nn.Module):
+	def __init__(self, dim: int, projection_dim: int = 64, hidden_dim: int = 128) -> None:
+		super().__init__()
+		self.net = nn.Sequential(
+			nn.Linear(int(dim), int(hidden_dim)),
+			nn.SiLU(inplace=True),
+			nn.Linear(int(hidden_dim), int(projection_dim)),
+		)
+
+	def forward(self, pooled: torch.Tensor) -> torch.Tensor:
+		return F.normalize(self.net(pooled), p=2, dim=1)
+
+
+class PhysicalStateAuxHead(nn.Module):
+	def __init__(self, dim: int, hidden_dim: int = 64) -> None:
+		super().__init__()
+		self.net = nn.Sequential(
+			nn.Linear(int(dim), int(hidden_dim)),
+			nn.SiLU(inplace=True),
+			nn.Linear(int(hidden_dim), 3),
+		)
+
+	def forward(self, pooled: torch.Tensor) -> torch.Tensor:
+		prediction = self.net(pooled)
+		return torch.cat([torch.sigmoid(prediction[:, :1]), prediction[:, 1:]], dim=1)
+
+
 class CAWFELatte(nn.Module):
 	"""Single configurable CAWFE-Latte architecture with named config ablations."""
-	def __init__(self, *, input_channels: int = 129, input_sequence_length: int = 5, output_channels: int = 4, output_dim: int = 64, version: str = "v1_end_to_end", atmosphere: Mapping[str, Any] | None = None, wind: Mapping[str, Any] | None = None, fire_fuel: Mapping[str, Any] | None = None, flux_energy: Mapping[str, Any] | None = None, fusion: Mapping[str, Any] | None = None, alignment: Mapping[str, Any] | None = None, backbone: Mapping[str, Any] | None = None, temporal_aggregation: Mapping[str, Any] | None = None, post_fusion_backbone: Mapping[str, Any] | None = None, temporal_pooling: Mapping[str, Any] | None = None, regression: Mapping[str, Any] | None = None, support_gate: Mapping[str, Any] | None = None, ablation: Mapping[str, Any] | None = None, decoder: Mapping[str, Any] | None = None, heads: Mapping[str, Any] | None = None, auxiliary: Mapping[str, Any] | None = None, patch_fire_head: Mapping[str, Any] | None = None, use_terrain_conditioning: bool = False, terrain_encoder: Mapping[str, Any] | None = None, terrain_film: Mapping[str, Any] | None = None, channel_names: Mapping[int, str] | None = None, debug_prediction_head: bool = False) -> None:
+	def __init__(self, *, input_channels: int = 129, input_sequence_length: int = 5, output_channels: int = 4, output_dim: int = 64, version: str = "v1_end_to_end", atmosphere: Mapping[str, Any] | None = None, wind: Mapping[str, Any] | None = None, fire_fuel: Mapping[str, Any] | None = None, flux_energy: Mapping[str, Any] | None = None, fusion: Mapping[str, Any] | None = None, alignment: Mapping[str, Any] | None = None, backbone: Mapping[str, Any] | None = None, temporal_aggregation: Mapping[str, Any] | None = None, post_fusion_backbone: Mapping[str, Any] | None = None, temporal_pooling: Mapping[str, Any] | None = None, regression: Mapping[str, Any] | None = None, support_gate: Mapping[str, Any] | None = None, ablation: Mapping[str, Any] | None = None, decoder: Mapping[str, Any] | None = None, heads: Mapping[str, Any] | None = None, auxiliary: Mapping[str, Any] | None = None, patch_fire_head: Mapping[str, Any] | None = None, domain_adversarial: Mapping[str, Any] | None = None, fire_mmd: Mapping[str, Any] | None = None, mask_guided_regression: Mapping[str, Any] | None = None, regression_moe: Mapping[str, Any] | None = None, supervised_contrastive: Mapping[str, Any] | None = None, physical_state_aux: Mapping[str, Any] | None = None, use_terrain_conditioning: bool = False, terrain_encoder: Mapping[str, Any] | None = None, terrain_film: Mapping[str, Any] | None = None, channel_names: Mapping[int, str] | None = None, debug_prediction_head: bool = False) -> None:
 		super().__init__()
 		self.input_channels=int(input_channels); self.input_sequence_length=int(input_sequence_length); self.output_channels=int(output_channels); self.output_dim=int(output_dim); self.version=str(version); self.debug_prediction_head=bool(debug_prediction_head)
 		self.ablation_name=str(dict(ablation or {}).get("name", "baseline"))
 		if self.output_channels != 4: raise ValueError(f"CAWFE-Latte expects output_channels=4, got {self.output_channels}.")
 		if self.input_channels < 86: raise ValueError(f"CAWFE-Latte requires at least 86 input channels, got {self.input_channels}.")
-		atmosphere_config=dict(atmosphere or {}); wind_config=dict(wind or {}); fire_config=dict(fire_fuel or {}); flux_config=dict(flux_energy or {}); fusion_config=dict(fusion or {}); alignment_config=dict(alignment or {}); decoder_config=dict(decoder or {}); head_config=dict(heads or {}); auxiliary_config=dict(auxiliary or {}); patch_fire_config=dict(patch_fire_head or {}); terrain_film_config=dict(terrain_film or {})
+		atmosphere_config=dict(atmosphere or {}); wind_config=dict(wind or {}); fire_config=dict(fire_fuel or {}); flux_config=dict(flux_energy or {}); fusion_config=dict(fusion or {}); alignment_config=dict(alignment or {}); decoder_config=dict(decoder or {}); head_config=dict(heads or {}); auxiliary_config=dict(auxiliary or {}); patch_fire_config=dict(patch_fire_head or {}); domain_config=dict(domain_adversarial or {}); mmd_config=dict(fire_mmd or {}); mask_guidance_config=dict(mask_guided_regression or {}); moe_config=dict(regression_moe or {}); contrastive_config=dict(supervised_contrastive or {}); physical_config=dict(physical_state_aux or {}); terrain_film_config=dict(terrain_film or {})
 		self.use_terrain_conditioning=bool(use_terrain_conditioning)
 		self.terrain_film_enabled=self.use_terrain_conditioning and bool(terrain_film_config.get("enabled", True))
 		if self.terrain_film_enabled:
@@ -1333,10 +1440,20 @@ class CAWFELatte(nn.Module):
 		self.temporal_pooling=build_temporal_pooling(pooling_config, dim=self.output_dim, input_sequence_length=self.input_sequence_length); self.temporal_aggregator=self.temporal_pooling
 		decoder_type=str(decoder_config.pop("type", "shared")).lower()
 		decoder_config.setdefault("in_dim",self.output_dim); decoder_config.setdefault("hidden_dim",self.output_dim); decoder_out_dim=int(decoder_config["hidden_dim"])
+		self.regression_moe_enabled=bool(moe_config.get("enabled", False))
+		self.mask_guided_regression_enabled=bool(mask_guidance_config.get("enabled", False))
+		if (self.regression_moe_enabled or self.mask_guided_regression_enabled) and decoder_type != "separate_regression":
+			raise ValueError("regression_moe and mask_guided_regression require decoder.type='separate_regression'.")
+		self.regression_moe=None
 		if decoder_type in {"shared", "shallow_cnn"}:
 			self.decoder=ShallowDecoder(type="shallow_cnn", **decoder_config); self.mask_decoder=None; self.regression_decoder=None
 		elif decoder_type == "separate_regression":
-			self.decoder=None; self.mask_decoder=ShallowDecoder(type="shallow_cnn", **decoder_config); self.regression_decoder=ShallowDecoder(type="shallow_cnn", **decoder_config)
+			self.decoder=None; self.mask_decoder=ShallowDecoder(type="shallow_cnn", **decoder_config)
+			if self.regression_moe_enabled:
+				self.regression_decoder=None
+				self.regression_moe=RegressionMixtureOfExperts(self.output_dim, decoder_config, num_experts=int(moe_config.get("num_experts", 3)), routing=str(moe_config.get("routing", "soft")))
+			else:
+				self.regression_decoder=ShallowDecoder(type="shallow_cnn", **decoder_config)
 		else:
 			raise ValueError(f"Unsupported cawfe_latte.decoder.type: {decoder_type!r}.")
 		self.decoder_type="shared" if decoder_type == "shallow_cnn" else decoder_type
@@ -1351,38 +1468,55 @@ class CAWFELatte(nn.Module):
 			self.support_gate=build_support_gate(support_gate, dim=decoder_out_dim); self.aux_fire_support_enabled=self.support_gate.enabled; self.aux_fire_support_detach_source=False; self.aux_fire_support_head=None
 		else:
 			legacy=dict(auxiliary_config.get("fire_support_head",{})); self.aux_fire_support_enabled=bool(legacy.get("enabled",True)); self.aux_fire_support_detach_source=bool(legacy.get("detach_source",False)); self.aux_fire_support_head=nn.Conv2d(self.output_dim,1,1) if self.aux_fire_support_enabled else None; self.support_gate=None
+		# Initialize additions after every parent module so zero-alpha R is also
+		# seed-for-seed parent-equivalent, not merely algebraically equivalent.
+		self.mask_guided_regression=MaskGuidedRegressionAttention(decoder_out_dim, alpha_init=float(mask_guidance_config.get("alpha_init", 0.0)), attention_activation=str(mask_guidance_config.get("attention_activation", "sigmoid"))) if self.mask_guided_regression_enabled else None
+		self.domain_adversarial_enabled=bool(domain_config.get("enabled", False))
+		self.domain_adversarial_head=DomainAdversarialHead(self.output_dim, num_domains=int(domain_config.get("num_domains", 0)), hidden_dim=int(domain_config.get("hidden_dim", 64)), lambda_grl=float(domain_config.get("lambda_grl", 1.0)), dropout=float(domain_config.get("dropout", 0.1))) if self.domain_adversarial_enabled else None
+		self.fire_mmd_enabled=bool(mmd_config.get("enabled", False))
+		self.supervised_contrastive_enabled=bool(contrastive_config.get("enabled", False))
+		self.contrastive_projection=ContrastiveProjectionHead(self.output_dim, projection_dim=int(contrastive_config.get("projection_dim", 64))) if self.supervised_contrastive_enabled else None
+		self.physical_state_aux_enabled=bool(physical_config.get("enabled", False))
+		self.physical_state_aux_head=PhysicalStateAuxHead(self.output_dim, hidden_dim=int(physical_config.get("hidden_dim", 64))) if self.physical_state_aux_enabled else None
 
 	def _validate_input(self,x:torch.Tensor)->None:
 		if x.ndim!=5: raise ValueError(f"CAWFE-Latte expects B x T x C x H x W input, got {tuple(x.shape)}.")
 		if int(x.shape[1])!=self.input_sequence_length: raise ValueError(f"CAWFE-Latte expected T={self.input_sequence_length}, got T={int(x.shape[1])}.")
 		if int(x.shape[2]) < 86: raise ValueError(f"CAWFE-Latte requires at least 86 input channels, got {int(x.shape[2])}.")
 		if int(x.shape[2])<self.input_channels: raise ValueError(f"CAWFE-Latte was configured for input_channels={self.input_channels}, got {int(x.shape[2])}.")
-	def forward(self,x:torch.Tensor,terrain:torch.Tensor|None=None,*,return_features:bool=False,return_attention:bool=False):
+	def forward(self,x:torch.Tensor,terrain:torch.Tensor|None=None,*,return_features:bool=False,return_attention:bool=False,return_aux:bool=False):
 		self._validate_input(x); atmosphere=self.atmosphere_encoder(x); wind=self.wind_encoder(x); fire_fuel=self.fire_fuel_encoder(x); flux_energy=self.flux_energy_encoder(x); aligned=self.alignment(atmosphere,wind,fire_fuel,flux_energy)
 		attention=None
 		if self.fusion_type in {"fire_query_attention", "fire_query"}:
-			fusion_result=self.fusion(aligned["atmosphere"],aligned["wind"],aligned["fire_fuel"],aligned["flux_energy"],return_attention=return_attention); fused_tokens,attention=fusion_result if return_attention else (fusion_result,None); fused_dynamic=tokens_to_grid(fused_tokens,aligned["spatial_shape"])
+			fusion_result=self.fusion(aligned["atmosphere"],aligned["wind"],aligned["fire_fuel"],aligned["flux_energy"],return_attention=return_attention); fused_tokens,attention=fusion_result if return_attention else (fusion_result,None); z_dynamic=tokens_to_grid(fused_tokens,aligned["spatial_shape"])
 		else:
-			aligned_grids=[tokens_to_grid(aligned[name],aligned["spatial_shape"]) for name in ("atmosphere","wind","fire_fuel","flux_energy")]; fused_dynamic=self.fusion(*aligned_grids); fused_tokens=self.alignment.to_tokens(fused_dynamic)
-		fused=fused_dynamic; terrain_embedding=None
+			aligned_grids=[tokens_to_grid(aligned[name],aligned["spatial_shape"]) for name in ("atmosphere","wind","fire_fuel","flux_energy")]; z_dynamic=self.fusion(*aligned_grids); fused_tokens=self.alignment.to_tokens(z_dynamic)
+		z_terrain=z_dynamic; terrain_embedding=None
 		if self.terrain_film_enabled:
 			if terrain is None: raise ValueError("CAWFE-Latte terrain conditioning is enabled but terrain input is missing.")
-			terrain_embedding=self.terrain_encoder(terrain); fused=self.terrain_film(fused_dynamic,terrain_embedding)
-		local=self.post_fusion_backbone(fused); aggregated=self.temporal_pooling(local)
+			terrain_embedding=self.terrain_encoder(terrain); z_terrain=self.terrain_film(z_dynamic,terrain_embedding)
+		z_backbone=self.post_fusion_backbone(z_terrain); z_shared=self.temporal_pooling(z_backbone)
+		router_weights=None; mask_guidance_attention=None
 		if self.decoder_type == "shared":
-			decoded=self.decoder(aggregated); mask_features=decoded; regression_features=decoded
+			decoded=self.decoder(z_shared); mask_features=decoded; regression_features_before_guidance=decoded
 		else:
-			mask_features=self.mask_decoder(aggregated); regression_features=self.regression_decoder(aggregated); decoded=regression_features
+			mask_features=self.mask_decoder(z_shared)
+			if self.regression_moe is not None: regression_features_before_guidance,router_weights=self.regression_moe(z_shared)
+			else: regression_features_before_guidance=self.regression_decoder(z_shared)
+			decoded=regression_features_before_guidance
+		regression_features=regression_features_before_guidance
+		if self.mask_guided_regression is not None:
+			regression_features,mask_guidance_attention=self.mask_guided_regression(regression_features_before_guidance,mask_features)
 		surface=self.regression_activation(self.surface_head(regression_features)); canopy=self.regression_activation(self.canopy_head(regression_features)); energy=self.regression_activation(self.energy_head(regression_features)); mask_logits=self.mask_head(mask_features)
-		patch_fire_logit=self.patch_fire_head(aggregated) if self.patch_fire_head is not None else None
+		patch_fire_logit=self.patch_fire_head(z_shared) if self.patch_fire_head is not None else None
 		support_logits=None; gate=None
 		if self.support_gate is not None: support_logits,gate=self.support_gate(regression_features)
 		elif self.aux_fire_support_head is not None:
-			aux_source=local[:,-1].detach() if self.aux_fire_support_detach_source else local[:,-1]; support_logits=self.aux_fire_support_head(aux_source)
+			aux_source=z_backbone[:,-1].detach() if self.aux_fire_support_detach_source else z_backbone[:,-1]; support_logits=self.aux_fire_support_head(aux_source)
 		if gate is not None: surface=surface*gate; canopy=canopy*gate; energy=energy*gate
 		prediction=torch.cat([surface,canopy,mask_logits,energy],dim=1)
 		if return_features:
-			features = {"prediction": prediction, "atmosphere": atmosphere, "wind": wind, "fire_fuel": fire_fuel, "flux_energy": flux_energy, "aligned_atmosphere": aligned["atmosphere"], "aligned_wind": aligned["wind"], "aligned_fire_fuel": aligned["fire_fuel"], "aligned_flux_energy": aligned["flux_energy"], "fused_tokens": fused_tokens, "spatial_shape": aligned["spatial_shape"], "fused_grid": fused_dynamic, "fused": fused, "fused_dynamic": fused_dynamic, "terrain_features": terrain_embedding, "fused_after_terrain": fused if self.use_terrain_conditioning else None, "local": local, "aggregated": aggregated, "decoded": decoded, "mask_features": mask_features, "regression_features": regression_features}
+			features = {"prediction": prediction, "atmosphere": atmosphere, "wind": wind, "fire_fuel": fire_fuel, "flux_energy": flux_energy, "aligned_atmosphere": aligned["atmosphere"], "aligned_wind": aligned["wind"], "aligned_fire_fuel": aligned["fire_fuel"], "aligned_flux_energy": aligned["flux_energy"], "fused_tokens": fused_tokens, "spatial_shape": aligned["spatial_shape"], "fused_grid": z_dynamic, "fused": z_terrain, "fused_dynamic": z_dynamic, "terrain_features": terrain_embedding, "fused_after_terrain": z_terrain if self.use_terrain_conditioning else None, "local": z_backbone, "aggregated": z_shared, "decoded": decoded, "mask_features": mask_features, "regression_features_before_guidance": regression_features_before_guidance, "regression_features": regression_features, "z_dynamic": z_dynamic, "z_terrain": z_terrain, "z_backbone": z_backbone, "z_shared": z_shared}
 			if support_logits is not None:
 				features["support_logits" if self.support_gate is not None else "aux_fire_support_logits"] = support_logits
 			if patch_fire_logit is not None: features["patch_fire_logit"] = patch_fire_logit
@@ -1392,13 +1526,27 @@ class CAWFELatte(nn.Module):
 			if getattr(self.post_fusion_backbone, "local_window_attention_enabled", False):
 				features["local_window_attention_enabled"] = True
 				features["window_size"] = self.post_fusion_backbone.window_size
+			if mask_guidance_attention is not None: features["mask_guidance_attention"] = mask_guidance_attention
+			if router_weights is not None: features["router_weights"] = router_weights
 			if return_attention: features["fusion_attention"] = attention
 			return features
 		outputs={"prediction": prediction}
 		if self.support_gate is not None and support_logits is not None: outputs["support_logits"]=support_logits
 		elif support_logits is not None: outputs["aux_fire_support_logits"]=support_logits
 		if patch_fire_logit is not None: outputs["patch_fire_logit"]=patch_fire_logit
-		return outputs if len(outputs) > 1 else prediction
+		if self.mask_guided_regression is not None and (self.training or return_aux):
+			outputs["mask_guidance_alpha"]=self.mask_guided_regression.alpha
+			outputs["mask_guidance_attention"]=mask_guidance_attention
+		if router_weights is not None and (self.training or return_aux): outputs["router_weights"]=router_weights
+		if self.training:
+			pooled=F.adaptive_avg_pool2d(z_shared,1).flatten(1)
+			if self.domain_adversarial_head is not None: outputs["domain_logits"]=self.domain_adversarial_head(pooled)
+			if self.fire_mmd_enabled: outputs["fire_mmd_features"]=pooled
+			if self.contrastive_projection is not None: outputs["contrastive_embedding"]=self.contrastive_projection(pooled)
+		if self.physical_state_aux_head is not None and (self.training or return_aux):
+			pooled=F.adaptive_avg_pool2d(z_shared,1).flatten(1)
+			outputs["physical_state_prediction"]=self.physical_state_aux_head(pooled)
+		return outputs if len(outputs) > 1 or return_aux else prediction
 
 
 __all__ = [
@@ -1413,6 +1561,13 @@ __all__ = [
 	"MultimodalAlignment",
 	"PredictionHead",
 	"PatchFirePresenceHead",
+	"GradientReversalFunction",
+	"gradient_reverse",
+	"DomainAdversarialHead",
+	"MaskGuidedRegressionAttention",
+	"RegressionMixtureOfExperts",
+	"ContrastiveProjectionHead",
+	"PhysicalStateAuxHead",
 	"ShallowDecoder",
 	"TemporalAggregator",
 	"TemporalAttentionPooling",

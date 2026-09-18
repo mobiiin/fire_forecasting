@@ -18,7 +18,7 @@ from contextlib import nullcontext
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 if "MPLCONFIGDIR" not in os.environ:
 	_mpl_config_dir = Path(os.environ.get("TMPDIR", "/tmp")) / "fire_forecasting_mplconfig"
@@ -55,11 +55,16 @@ except ImportError:  # pragma: no cover - environment-specific fallback
 
 from src.config import compute_file_sha256, load_config
 from src.data.cache import target_definition_version, temporal_target_offsets
-from src.data.dataset import create_dataloaders
+from src.data.dataset import create_dataloaders, metadata_batch_to_list
 from src.data.spatial_transforms import infer_with_external_test_spatial_handling
+from src.evaluation.validation_subset import (
+	DEFAULT_SCREENING_INDEX_PATH,
+	ensure_screening_validation_indices,
+)
+from src.evaluation.full_validation import evaluate_full_validation
 from src.models.architecture_registry import resolve_model_architecture
 from src.models.model_factory import build_model_from_config
-from src.training.checkpoints import latest_and_best_checkpoint_paths, load_checkpoint, save_checkpoint, validate_checkpoint_model_compatibility
+from src.training.checkpoints import latest_and_best_checkpoint_paths, load_checkpoint, load_model_state_dict_compatible, save_checkpoint, validate_checkpoint_model_compatibility
 from src.training.cuda_prefetcher import CUDAPrefetcher
 from src.training.early_stopping import build_early_stopping
 from src.training.fusion_vector_logger import FusionVectorLogger
@@ -630,7 +635,7 @@ def _loader_summary(loader) -> dict[str, Any]:
 	}
 
 
-SUPPORTED_VALIDATION_MODES = {"full_every_epoch", "fixed_subset_every_epoch", "random_subset_every_epoch"}
+SUPPORTED_VALIDATION_MODES = {"full_every_epoch", "fixed_subset_every_epoch", "random_subset_every_epoch", "stratified_fixed_every_epoch"}
 
 
 def _coerce_optional_positive_int(value: Any, *, name: str) -> int | None:
@@ -659,10 +664,12 @@ def resolve_validation_policy(config: Mapping[str, Any], val_loader=None, logger
 	- full_every_epoch: use the complete validation loader every epoch.
 	- fixed_subset_every_epoch: choose one deterministic batch-index subset once.
 	- random_subset_every_epoch: sample a fresh deterministic-random validation subset each epoch.
+	- stratified_fixed_every_epoch: reuse one shared target-stratified sample subset.
 	"""
 
 	training_config = _get_section(config, "training")
 	validation_config = dict(training_config.get("validation", {})) if isinstance(training_config.get("validation"), Mapping) else {}
+	screening_config = dict(validation_config.get("screening", {})) if isinstance(validation_config.get("screening"), Mapping) else {}
 	performance_config = get_performance_config(config)
 
 	deprecated_values = []
@@ -678,10 +685,16 @@ def resolve_validation_policy(config: Mapping[str, Any], val_loader=None, logger
 		)
 
 	mode = str(validation_config.get("mode", "fixed_subset_every_epoch")).strip().lower()
+	if bool(screening_config.get("enabled", False)):
+		sampling = str(screening_config.get("sampling", "stratified_fixed")).strip().lower()
+		if sampling == "stratified_fixed":
+			mode = "stratified_fixed_every_epoch"
+		else:
+			raise ValueError(f"Unsupported training.validation.screening.sampling: {sampling!r}.")
 	if mode not in SUPPORTED_VALIDATION_MODES:
 		raise ValueError(
-			"Unsupported training.validation.mode. "
-			"Expected one of: full_every_epoch, fixed_subset_every_epoch, random_subset_every_epoch. "
+			"Unsupported training.validation.mode. Expected one of: full_every_epoch, "
+			"fixed_subset_every_epoch, random_subset_every_epoch, stratified_fixed_every_epoch. "
 			f"Got {mode!r}."
 		)
 
@@ -705,7 +718,8 @@ def resolve_validation_policy(config: Mapping[str, Any], val_loader=None, logger
 			"use_same_metric_for_checkpointing": bool(validation_config.get("use_same_metric_for_checkpointing", True)),
 		}
 
-	max_samples = _coerce_optional_positive_int(validation_config.get("max_val_samples_per_epoch"), name="training.validation.max_val_samples_per_epoch")
+	max_samples_value = screening_config.get("max_samples", validation_config.get("max_val_samples_per_epoch"))
+	max_samples = _coerce_optional_positive_int(max_samples_value, name="training.validation.screening.max_samples")
 	batch_size = getattr(val_loader, "batch_size", None) if val_loader is not None else None
 	if batch_size is None and val_loader is not None and hasattr(getattr(val_loader, "batch_sampler", None), "batch_size"):
 		batch_size = getattr(val_loader.batch_sampler, "batch_size")
@@ -714,7 +728,10 @@ def resolve_validation_policy(config: Mapping[str, Any], val_loader=None, logger
 		if batch_size is None:
 			raise ValueError("training.validation.max_val_samples_per_epoch requires a validation DataLoader with a known batch_size.")
 		max_batches_from_samples = max(1, int(math.ceil(float(max_samples) / float(batch_size))))
-	max_batches_value = validation_config.get("max_val_batches_per_epoch", performance_config.get("max_val_batches_per_epoch", 50))
+	max_batches_value = screening_config.get(
+		"max_batches",
+		validation_config.get("max_val_batches_per_epoch", performance_config.get("max_val_batches_per_epoch", 50)),
+	)
 	max_batches = _coerce_optional_positive_int(max_batches_value, name="training.validation.max_val_batches_per_epoch")
 	if max_batches_from_samples is not None:
 		max_batches = max_batches_from_samples
@@ -725,7 +742,7 @@ def resolve_validation_policy(config: Mapping[str, Any], val_loader=None, logger
 
 	fixed_subset_shuffle = bool(validation_config.get("fixed_subset_shuffle", False))
 	fixed_subset_seed = _resolve_validation_seed(
-		validation_config.get("fixed_subset_seed", 42),
+		screening_config.get("seed", validation_config.get("fixed_subset_seed", 42)),
 		default=42,
 		random_when_missing=(mode == "fixed_subset_every_epoch" and fixed_subset_shuffle),
 	)
@@ -736,6 +753,45 @@ def resolve_validation_policy(config: Mapping[str, Any], val_loader=None, logger
 	)
 
 	total_batches = len(val_loader) if val_loader is not None else None
+	if mode == "stratified_fixed_every_epoch":
+		if val_loader is None or getattr(val_loader, "dataset", None) is None:
+			raise ValueError("Stratified fixed validation requires val_loader.dataset.")
+		if batch_size is None:
+			raise ValueError("Stratified fixed validation requires a known validation batch size.")
+		dataset_length = len(val_loader.dataset)
+		requested_samples = min(dataset_length, int(max_samples or (int(max_batches) * int(batch_size))))
+		index_path = screening_config.get("index_path", str(DEFAULT_SCREENING_INDEX_PATH))
+		artifact = ensure_screening_validation_indices(
+			val_loader.dataset,
+			config,
+			requested_samples=requested_samples,
+			seed=fixed_subset_seed,
+			output_path=index_path,
+			logger=logger,
+		)
+		selected_sample_indices = [int(index) for index in artifact["selected_sample_indices"]]
+		screening_loader = _subset_loader_like(val_loader, selected_sample_indices)
+		return {
+			"validation_mode": mode,
+			"validation_scope": "stratified_fixed_subset",
+			"max_val_batches_per_epoch": int(max_batches),
+			"max_val_samples_per_epoch": requested_samples,
+			"fixed_subset_seed": fixed_subset_seed,
+			"fixed_subset_shuffle": False,
+			"random_subset_seed": None,
+			"selected_batch_indices": None,
+			"selected_sample_indices": selected_sample_indices,
+			"validation_batches_total": total_batches,
+			"validation_batches_used": len(screening_loader),
+			"validation_samples_used": requested_samples,
+			"is_full_validation": False,
+			"screening_index_path": str(Path(index_path).expanduser().resolve()),
+			"screening_counts": dict(artifact["screening_counts"]),
+			"full_validation_counts": dict(artifact["full_validation_counts"]),
+			"dataset_identity": dict(artifact["identity"]),
+			"_screening_loader": screening_loader,
+			"use_same_metric_for_checkpointing": bool(validation_config.get("use_same_metric_for_checkpointing", True)),
+		}
 	if total_batches is None:
 		used_batches = int(max_batches)
 		selected_batch_indices = list(range(used_batches)) if mode == "fixed_subset_every_epoch" else None
@@ -779,7 +835,11 @@ def _validation_subset_metadata(policy: Mapping[str, Any], val_loader) -> dict[s
 		"max_val_samples_per_epoch": policy.get("max_val_samples_per_epoch"),
 		"random_subset_seed": policy.get("random_subset_seed"),
 		"selected_batch_indices": policy.get("selected_batch_indices"),
-		"selected_sample_indices": None,
+		"selected_sample_indices": policy.get("selected_sample_indices"),
+		"screening_index_path": policy.get("screening_index_path"),
+		"screening_counts": policy.get("screening_counts"),
+		"full_validation_counts": policy.get("full_validation_counts"),
+		"dataset_identity": policy.get("dataset_identity"),
 		"validation_dataset_length": len(getattr(val_loader, "dataset", [])),
 		"validation_batches_total": policy.get("validation_batches_total", len(val_loader)),
 		"validation_batches_used": policy.get("validation_batches_used"),
@@ -792,7 +852,7 @@ def _validation_subset_metadata(policy: Mapping[str, Any], val_loader) -> dict[s
 def save_validation_subset_metadata(run_manager: RunManager, policy: Mapping[str, Any], val_loader) -> Path | None:
 	"""Persist validation subset metadata when using fixed-subset validation."""
 
-	if str(policy.get("validation_mode")) != "fixed_subset_every_epoch":
+	if str(policy.get("validation_mode")) not in {"fixed_subset_every_epoch", "stratified_fixed_every_epoch"}:
 		return None
 	path = run_manager.metadata_dir / "validation_subset.json"
 	path.parent.mkdir(parents=True, exist_ok=True)
@@ -822,9 +882,35 @@ def validation_batch_indices_for_epoch(policy: Mapping[str, Any], epoch_number: 
 	return sorted(torch.randperm(total_batches, generator=generator)[:used_batches].tolist())
 
 
-def validation_loader_for_epoch(val_loader, policy: Mapping[str, Any], epoch_number: int | None):
-	"""Return an exact random validation sample-subset DataLoader for one epoch when configured."""
+def _subset_loader_like(val_loader, selected_sample_indices: Sequence[int]):
+	"""Clone a validation loader around a fixed sample subset without shuffling."""
 
+	dataset = getattr(val_loader, "dataset", None)
+	if dataset is None:
+		raise ValueError("Validation sample subset requires val_loader.dataset.")
+	subset = Subset(dataset, [int(index) for index in selected_sample_indices])
+	num_workers = int(getattr(val_loader, "num_workers", 0) or 0)
+	loader_kwargs = {
+		"batch_size": getattr(val_loader, "batch_size", None),
+		"shuffle": False,
+		"num_workers": num_workers,
+		"collate_fn": getattr(val_loader, "collate_fn", None),
+		"pin_memory": bool(getattr(val_loader, "pin_memory", False)),
+		"drop_last": False,
+	}
+	if num_workers > 0:
+		prefetch_factor = getattr(val_loader, "prefetch_factor", None)
+		if prefetch_factor is not None:
+			loader_kwargs["prefetch_factor"] = prefetch_factor
+		loader_kwargs["persistent_workers"] = bool(getattr(val_loader, "persistent_workers", False))
+	return DataLoader(subset, **loader_kwargs)
+
+
+def validation_loader_for_epoch(val_loader, policy: Mapping[str, Any], epoch_number: int | None):
+	"""Return the configured sample-subset DataLoader for one validation epoch."""
+
+	if str(policy.get("validation_mode")) == "stratified_fixed_every_epoch":
+		return policy["_screening_loader"], list(policy["selected_sample_indices"])
 	if str(policy.get("validation_mode")) != "random_subset_every_epoch" or policy.get("max_val_samples_per_epoch") is None:
 		return val_loader, None
 	dataset = getattr(val_loader, "dataset", None)
@@ -920,6 +1006,7 @@ def _run_epoch(
 	metric_totals: dict[str, float] = defaultdict(float)
 	metric_weights: dict[str, float] = defaultdict(float)
 	loss_component_totals: dict[str, float] = defaultdict(float)
+	loss_component_weights: dict[str, float] = defaultdict(float)
 	timing_totals: dict[str, float] = defaultdict(float)
 	timing_rows: list[dict[str, Any]] = []
 	epoch_start_time = time.perf_counter()
@@ -998,7 +1085,29 @@ def _run_epoch(
 		with torch.set_grad_enabled(train):
 			with _maybe_autocast(device, amp_dtype):
 				forward_start_time = time.perf_counter()
-				model_output = model(x_batch, terrain=terrain_batch) if terrain_batch is not None else model(x_batch)
+				model_kwargs: dict[str, Any] = {}
+				if terrain_batch is not None:
+					model_kwargs["terrain"] = terrain_batch
+				if not train and _cawfe_validation_aux_enabled(config):
+					model_kwargs["return_aux"] = True
+				model_output = model(x_batch, **model_kwargs)
+				if train and _cawfe_training_aux_enabled(config):
+					if torch.is_tensor(model_output):
+						model_output = {"prediction": model_output}
+					else:
+						model_output = dict(model_output)
+					model_output["auxiliary_training"] = True
+					domain_mapping = config.get("_fire_domain_to_index")
+					if isinstance(domain_mapping, Mapping):
+						metadata = batch_extra.get("metadata")
+						if not isinstance(metadata, Mapping):
+							raise ValueError("Fire-domain training requires collated sample metadata.")
+						metadata_items = metadata_batch_to_list(metadata, batch_size=int(x_batch.shape[0]))
+						try:
+							labels = [int(domain_mapping[str(item["fire_name"])]) for item in metadata_items]
+						except KeyError as exc:
+							raise ValueError(f"Training batch contains an unknown or missing fire_name: {exc}") from exc
+						model_output["fire_domain_labels"] = torch.as_tensor(labels, dtype=torch.long, device=y_batch.device)
 				y_pred = extract_prediction(model_output)
 				_sync_if_timing()
 				forward_time = time.perf_counter() - forward_start_time
@@ -1085,7 +1194,9 @@ def _run_epoch(
 		total_samples += batch_size
 		total_loss += batch_loss_value * batch_size
 		for component_name, component_value in batch_loss_components.items():
-			loss_component_totals[component_name] += float(component_value) * batch_size
+			component_weight = 1.0 if component_name.endswith("_fraction") else float(batch_size)
+			loss_component_totals[component_name] += float(component_value) * component_weight
+			loss_component_weights[component_name] += component_weight
 
 		should_compute_metrics = (
 			(compute_train_metrics_every_batch or batch_number % train_metrics_every_n_batches == 0 or batch_number == total_batches)
@@ -1109,7 +1220,7 @@ def _run_epoch(
 				value = float(metric_value)
 				if not math.isfinite(value):
 					continue
-				if metric_name in {"no_fire_patch_count", "active_patch_count"}:
+				if metric_name in {"total_patch_count", "no_fire_patch_count", "fire_patch_count", "active_patch_count"}:
 					metric_totals[metric_name] += value
 					metric_weights[metric_name] = 1.0
 					continue
@@ -1196,7 +1307,7 @@ def _run_epoch(
 
 	results = {f"{desc}_loss": total_loss / total_samples}
 	for component_name, total_value in loss_component_totals.items():
-		results[f"{desc}_{component_name}"] = total_value / total_samples
+		results[f"{desc}_{component_name}"] = total_value / max(loss_component_weights[component_name], 1.0)
 	for metric_name, total_value in metric_totals.items():
 		results[f"{desc}_{metric_name}"] = total_value / max(metric_weights[metric_name], 1.0)
 	results[f"{desc}_samples"] = float(total_samples)
@@ -1721,6 +1832,117 @@ def _maybe_probe_auto_batch_size(
 	return False
 
 
+def _cawfe_training_aux_enabled(config: Mapping[str, Any]) -> bool:
+	if resolve_model_architecture(config) != "cawfe_latte":
+		return False
+	section = _get_section(config, "cawfe_latte")
+	return any(
+		bool(_get_section(section, name).get("enabled", False))
+		for name in (
+			"domain_adversarial",
+			"fire_mmd",
+			"regression_moe",
+			"supervised_contrastive",
+			"physical_state_aux",
+		)
+	)
+
+
+def _cawfe_validation_aux_enabled(config: Mapping[str, Any]) -> bool:
+	"""Request only inference-safe auxiliary outputs needed for validation diagnostics."""
+	if resolve_model_architecture(config) != "cawfe_latte":
+		return False
+	section = _get_section(config, "cawfe_latte")
+	return any(
+		bool(_get_section(section, name).get("enabled", False))
+		for name in ("mask_guided_regression", "physical_state_aux")
+	)
+
+
+def _requires_fire_domain_metadata(config: Mapping[str, Any]) -> bool:
+	section = _get_section(config, "cawfe_latte")
+	return any(
+		bool(_get_section(section, name).get("enabled", False))
+		for name in ("domain_adversarial", "fire_mmd")
+	)
+
+
+def _dataset_records(dataset) -> list[Mapping[str, Any]]:
+	if isinstance(dataset, Subset):
+		base_records = _dataset_records(dataset.dataset)
+		return [base_records[int(index)] for index in dataset.indices]
+	records = getattr(dataset, "records", None)
+	if isinstance(records, list):
+		return records
+	return []
+
+
+def build_fire_domain_mapping(records: Iterable[Mapping[str, Any]]) -> dict[str, int]:
+	"""Build deterministic sorted class IDs from training records only."""
+	try:
+		unique_names = sorted({str(record["fire_name"]) for record in records})
+	except KeyError as exc:
+		raise ValueError("Fire-domain supervision requires fire_name on every training record.") from exc
+	if not unique_names:
+		raise ValueError("Fire-domain supervision requires at least one training fire.")
+	return {name: index for index, name in enumerate(unique_names)}
+
+
+def _configure_fire_domain_training(config: dict[str, Any], train_loader, logger) -> None:
+	"""Build stable training-fire IDs and audit typical shuffled MMD batches."""
+	if not _requires_fire_domain_metadata(config):
+		return
+	records = _dataset_records(train_loader.dataset)
+	if not records:
+		raise ValueError("Fire-domain supervision requires dataset records containing fire_name metadata.")
+	fire_names = [str(record["fire_name"]) for record in records]
+	mapping = build_fire_domain_mapping(records)
+	unique_names = list(mapping)
+	config["_fire_domain_to_index"] = mapping
+	cawfe_config = _get_section(config, "cawfe_latte")
+	domain_config = _get_section(cawfe_config, "domain_adversarial")
+	if bool(domain_config.get("enabled", False)):
+		configured = int(domain_config.get("num_domains", len(unique_names)))
+		if configured != len(unique_names):
+			raise ValueError(
+			f"domain_adversarial.num_domains={configured} but the training split contains {len(unique_names)} fires."
+		)
+		domain_config["num_domains"] = len(unique_names)
+		run_dir_value = _get_section(config, "training").get("run_dir")
+		if not run_dir_value:
+			raise ValueError("A run directory is required before configuring fire-domain training.")
+		mapping_path = Path(str(run_dir_value)) / "train_fire_domain_mapping.json"
+		mapping_path.write_text(json.dumps(mapping, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+		config["_fire_domain_mapping_path"] = str(mapping_path)
+	logger.info("Training fire-domain mapping: %s domain(s) | %s", len(unique_names), mapping)
+
+	mmd_config = _get_section(cawfe_config, "fire_mmd")
+	if not bool(mmd_config.get("enabled", False)):
+		return
+	batch_size = int(getattr(train_loader, "batch_size", None) or _get_section(config, "training").get("batch_size", 1))
+	max_batches = int(_resolve_max_batches(config, "train") or math.ceil(len(fire_names) / max(1, batch_size)))
+	generator = torch.Generator().manual_seed(int(_get_section(config, "training").get("seed", config.get("seed", 42))))
+	order = torch.randperm(len(fire_names), generator=generator).tolist()
+	batch_domain_counts = []
+	for offset in range(0, len(order), max(1, batch_size)):
+		indices = order[offset : offset + batch_size]
+		batch_domain_counts.append(len({fire_names[index] for index in indices}))
+		if len(batch_domain_counts) >= max_batches:
+			break
+	valid_fraction = sum(count >= 2 for count in batch_domain_counts) / max(1, len(batch_domain_counts))
+	logger.info(
+		"MMD DOMAIN-MIX AUDIT | simulated shuffled batches=%s | multi-fire batches=%.2f%% | batch_size=%s",
+		len(batch_domain_counts),
+		100.0 * valid_fraction,
+		batch_size,
+	)
+	if valid_fraction < 0.10:
+		logger.warning(
+			"*** MMD WARNING: only %.2f%% of typical batches contain at least two fire IDs; most batches will contribute zero MMD loss. Sampler unchanged. ***",
+			100.0 * valid_fraction,
+		)
+
+
 def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 	"""Train a model from an already-loaded configuration mapping."""
 
@@ -1729,7 +1951,10 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 
 	config = dict(config)
 	original_config = deepcopy(config)
-	config["return_metadata"] = False
+	training_validation = _get_section(_get_section(config, "training"), "validation")
+	full_validation_config = _get_section(training_validation, "full")
+	automatic_full_validation = bool(full_validation_config.get("enabled", False))
+	config["return_metadata"] = bool(_requires_fire_domain_metadata(config) or automatic_full_validation)
 	training_config = _get_section(config, "training")
 	performance_config = get_performance_config(config)
 	logging_config = _get_section(config, "logging")
@@ -1819,6 +2044,7 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 	logger.info("Loading dataloaders")
 
 	train_loader, val_loader, test_loader = create_dataloaders(config)
+	_configure_fire_domain_training(config, train_loader, logger)
 	input_sequence_length = int(config.get("input_sequence_length", training_config.get("input_sequence_length", 1)))
 	output_channels = int(_get_section(config, "model").get("output_channels", 1))
 
@@ -1837,6 +2063,7 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 	if _maybe_probe_auto_batch_size(config, train_loader, input_channels, device, logger):
 		logger.info("Rebuilding dataloaders with probed batch_size=%s", _get_section(config, "training").get("batch_size", config.get("batch_size")))
 		train_loader, val_loader, test_loader = create_dataloaders(config)
+		_configure_fire_domain_training(config, train_loader, logger)
 		input_channels = _infer_input_channels_from_loader(train_loader)
 		training_config = _get_section(config, "training")
 		performance_config = get_performance_config(config)
@@ -1941,6 +2168,19 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 		logger.info("Validation mode: random_subset_every_epoch")
 		logger.info("Random validation subset: %s batch(es) per epoch", validation_policy["validation_batches_used"])
 		logger.info("Random validation base seed: %s", validation_policy["random_subset_seed"])
+	elif validation_policy["validation_mode"] == "stratified_fixed_every_epoch":
+		logger.info("Validation mode: stratified_fixed_every_epoch")
+		logger.info(
+			"Fixed representative validation subset: samples=%s fire=%s no_fire=%s batches=%s seed=%s",
+			validation_policy["screening_counts"]["total"],
+			validation_policy["screening_counts"]["fire"],
+			validation_policy["screening_counts"]["no_fire"],
+			validation_policy["validation_batches_used"],
+			validation_policy["fixed_subset_seed"],
+		)
+		logger.info("Shared screening index: %s", validation_policy["screening_index_path"])
+		if validation_subset_path is not None:
+			logger.info("Saved validation subset metadata: %s", validation_subset_path)
 	else:
 		logger.info("Validation mode: fixed_subset_every_epoch")
 		logger.info("Fixed validation subset: %s batch(es)", validation_policy["validation_batches_used"])
@@ -2182,9 +2422,20 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 			epoch_number=epoch_number,
 			timing_csv_path=timing_log_path,
 		)
+		if bool(_get_section(_get_section(config, "cawfe_latte"), "fire_mmd").get("enabled", False)):
+			mmd_valid_fraction = float(train_results.get("train_mmd_valid_batch_fraction", 0.0))
+			logger.info("MMD contributing batches this epoch: %.2f%%", 100.0 * mmd_valid_fraction)
+			if mmd_valid_fraction < 0.10:
+				logger.warning("*** MMD WARNING: only %.2f%% of training batches contributed MMD loss; sampler remains unchanged. ***", 100.0 * mmd_valid_fraction)
 		validation_epoch_loader, validation_sample_indices = validation_loader_for_epoch(val_loader, validation_policy, epoch_number)
 		validation_batch_indices = validation_batch_indices_for_epoch(validation_policy, epoch_number)
-		if validation_policy["validation_mode"] == "fixed_subset_every_epoch":
+		if validation_policy["validation_mode"] == "stratified_fixed_every_epoch":
+			logger.info(
+				"Validation using shared stratified subset: %s samples, %s batch(es)",
+				validation_policy["validation_samples_used"],
+				validation_policy["validation_batches_used"],
+			)
+		elif validation_policy["validation_mode"] == "fixed_subset_every_epoch":
 			logger.info("Validation using fixed subset: %s batch(es)", validation_policy["validation_batches_used"])
 		elif validation_policy["validation_mode"] == "random_subset_every_epoch":
 			if validation_sample_indices is not None:
@@ -2376,6 +2627,37 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 	if fusion_vector_logger.enabled:
 		fusion_vector_logger.save()
 
+	full_validation_results: dict[str, Any] = {}
+	if automatic_full_validation:
+		if not best_checkpoint_path.is_file():
+			raise RuntimeError(f"Automatic full validation requires the best checkpoint: {best_checkpoint_path}")
+		logger.info("Reloading best screening checkpoint for automatic full validation: %s", best_checkpoint_path)
+		best_checkpoint = load_checkpoint(best_checkpoint_path, map_location=device)
+		validate_checkpoint_model_compatibility(model, best_checkpoint, best_checkpoint_path)
+		load_model_state_dict_compatible(model, best_checkpoint, best_checkpoint_path)
+		model.eval()
+		full_validation_results = evaluate_full_validation(
+			model=model,
+			val_loader=val_loader,
+			config=config,
+			device=device,
+			amp_dtype=amp_dtype,
+			run_dir=run_manager.run_dir,
+			checkpoint_path=best_checkpoint_path,
+			checkpoint_epoch=best_checkpoint.get("epoch"),
+			expected_counts=validation_policy.get("full_validation_counts"),
+			logger=logger,
+		)
+		full_metrics = full_validation_results["metrics"]
+		logger.info(
+			"Automatic full validation complete | total=%s fire=%s no_fire=%s dice=%s iou=%s",
+			full_metrics["full_val_total_patch_count"],
+			full_metrics["full_val_fire_patch_count"],
+			full_metrics["full_val_no_fire_patch_count"],
+			full_metrics["full_val_dice"],
+			full_metrics["full_val_iou"],
+		)
+
 	test_results: dict[str, float] = {}
 	test_plot_results: dict[str, float] = {}
 	run_test_after_training = bool(training_config.get("run_test_after_training", config.get("run_test_after_training", False)))
@@ -2477,6 +2759,7 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 		"history_rows": history_rows,
 		"normalization": normalization_metadata,
 		"validation": validation_protocol_metadata,
+		"full_validation": full_validation_results,
 		"test_results": test_results,
 		"early_stopping": _early_stopping_summary(),
 		"stopped_early": bool(stopped_early),

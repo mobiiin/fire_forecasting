@@ -292,13 +292,16 @@ training:
     max_val_batches_per_epoch: 50
 
   validation:
-    mode: fixed_subset_every_epoch
-    max_val_samples_per_epoch: null
-    max_val_batches_per_epoch: 50
-    random_subset_seed: 42
-    # Use the first fixed batches; random scattered indices force DataLoader traversal.
-    fixed_subset_seed: 42
-    fixed_subset_shuffle: false
+    screening:
+      enabled: true
+      max_batches: 50
+      sampling: stratified_fixed
+      seed: 12345
+      index_path: artifacts/ablations/cawfe_latte/shared_validation/screening_validation_indices.json
+    full:
+      enabled: true
+      checkpoint: best
+      run_once_after_training: true
     use_same_metric_for_checkpointing: true
 
 evaluation:

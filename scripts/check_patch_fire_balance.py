@@ -16,10 +16,18 @@ from typing import Any, Iterable, Mapping
 
 import numpy as np
 
+from src.evaluation.fire_activity import (
+    ACTIVE_FRACTION_BIN_NAMES,
+    FIRE_MASK_THRESHOLD,
+    ACTIVE_FRACTION_THRESHOLD,
+    active_fraction_bin_name,
+    classify_patch_fire_state,
+)
+
 
 SAMPLE_PATTERNS = ("consecutive5_h10", "single1_h10", "sparse5_h10")
 SPLITS = ("train", "val", "test", "all")
-BIN_ORDER = ("no_fire", "tiny_fire", "small_fire", "medium_fire", "large_fire")
+BIN_ORDER = ACTIVE_FRACTION_BIN_NAMES
 
 
 def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
@@ -155,40 +163,21 @@ def load_fire_mask(target_path: str | Path) -> np.ndarray:
 def classify_patch(
     fire_mask: np.ndarray,
     patch: Mapping[str, int],
-    threshold: float = 0.5,
-    active_fraction_threshold: float = 0.0,
+    threshold: float = FIRE_MASK_THRESHOLD,
+    active_fraction_threshold: float = ACTIVE_FRACTION_THRESHOLD,
 ) -> dict[str, Any]:
-    mask = np.asarray(fire_mask)
-    if mask.ndim != 2:
-        raise ValueError(f"Fire mask must be 2-D, got shape={mask.shape}")
-    y0, x0, height, width = (int(patch[key]) for key in ("y0", "x0", "height", "width"))
-    if y0 + height > mask.shape[0] or x0 + width > mask.shape[1]:
-        raise ValueError(f"Patch {dict(patch)} is outside fire mask shape={mask.shape}")
-    fire_patch = mask[y0 : y0 + height, x0 : x0 + width]
-    active_pixels = int((fire_patch > float(threshold)).sum())
-    total_pixels = int(height * width)
-    active_fraction = float(active_pixels / total_pixels) if total_pixels else 0.0
-    min_fraction = float(active_fraction_threshold)
-    has_fire = active_fraction > 0.0 if min_fraction <= 0.0 else active_fraction >= min_fraction
-    return {
-        "active_pixels": active_pixels,
-        "total_pixels": total_pixels,
-        "active_fraction": active_fraction,
-        "has_fire": bool(has_fire),
-        "bin": active_fraction_bin(active_fraction),
-    }
+    """Compatibility wrapper around the shared canonical classifier."""
+
+    return classify_patch_fire_state(
+        fire_mask,
+        patch,
+        fire_threshold=threshold,
+        active_fraction_threshold=active_fraction_threshold,
+    )
 
 
 def active_fraction_bin(active_fraction: float) -> str:
-    if active_fraction == 0.0:
-        return "no_fire"
-    if active_fraction < 0.001:
-        return "tiny_fire"
-    if active_fraction < 0.01:
-        return "small_fire"
-    if active_fraction < 0.05:
-        return "medium_fire"
-    return "large_fire"
+    return active_fraction_bin_name(active_fraction)
 
 
 def _empty_counts() -> dict[str, Any]:
@@ -342,8 +331,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dataset-root", default="/scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1")
     parser.add_argument("--sample-pattern", choices=SAMPLE_PATTERNS, default="consecutive5_h10")
     parser.add_argument("--split", choices=SPLITS, default="train")
-    parser.add_argument("--fire-threshold", type=float, default=0.5)
-    parser.add_argument("--active-fraction-threshold", type=float, default=0.0)
+    parser.add_argument("--fire-threshold", type=float, default=FIRE_MASK_THRESHOLD)
+    parser.add_argument("--active-fraction-threshold", type=float, default=ACTIVE_FRACTION_THRESHOLD)
     parser.add_argument("--max-samples", type=int)
     parser.add_argument("--per-fire", action="store_true")
     parser.add_argument("--save-json")

@@ -12,6 +12,13 @@ for ABLATION in "$@"; do
     echo "Unknown ablation: ${ABLATION}" >&2
     exit 2
   fi
+done
+
+# Build/reuse one dataset-identified, fire/no-fire-stratified validation subset
+# before allocating GPUs. Every submitted job also validates this artifact.
+"${PYTHON_BIN}" scripts/prepare_cawfe_latte_screening_validation.py
+
+for ABLATION in "$@"; do
   JOB_ID="$(sbatch --parsable scripts/slurm_train_cawfe_latte_ablation_a10080.sh "${ABLATION}")"
-  echo "${ABLATION}: submitted job ${JOB_ID}"
+  echo "${ABLATION}: submitted one-job train + full-validation job ${JOB_ID}"
 done

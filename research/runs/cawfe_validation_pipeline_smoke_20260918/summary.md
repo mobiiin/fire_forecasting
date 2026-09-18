@@ -1,0 +1,27 @@
+# CAWFE-Latte Validation Pipeline Smoke Check
+
+- Purpose: verify the permanent one-job screening/full-validation implementation without training or submitting Slurm jobs.
+- Date: 2026-09-18 UTC.
+- Code base commit: `5bb70c92c286a11c06e51bd45e701b66d81893b3` with uncommitted implementation changes in the working tree.
+- Configuration: `configs/ablations/cawfe_latte_baseline.yaml` / processed `sparse5_h10` validation split.
+- Commands:
+  - `python scripts/prepare_cawfe_latte_screening_validation.py`
+  - `python scripts/check_patch_fire_balance.py --dataset-root /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1 --sample-pattern sparse5_h10 --split val`
+  - Integrated full evaluator on one canonical fire and one no-fire sample using `artifacts/ablations/cawfe_latte/baseline/slurm15930220/checkpoints/best_model.pt` (CPU; temporary output only).
+  - Focused pytest suite and `python -m pytest -q tests`.
+- Output locations:
+  - Shared screening indices: `artifacts/ablations/cawfe_latte/shared_validation/screening_validation_indices.json`
+  - Temporary checkpoint smoke artifacts: `/tmp/cawfe_full_validation_checkpoint_smoke`
+- Completion status: complete.
+- Observations:
+  - Screening subset: 400 total, 260 fire, 140 no-fire; both strata cover all six validation fires.
+  - Canonical full validation: 67,515 total, 43,862 fire, 23,653 no-fire (35.033696%).
+  - Independent balance checker returned the same counts.
+  - Existing baseline checkpoint evaluator smoke returned 2 total, 1 fire, 1 no-fire.
+  - Focused validation/ablation suite: 58 passed, 4 skipped.
+  - Repository `tests/` suite: 296 passed, 5 skipped, 3 failed.
+- Failures/warnings:
+  - The three `tests/` failures are pre-existing and unrelated: debug metric fixture expects four channels without enabling energy; an exact float32/float64 energy-log equality assertion; and a missing-Mamba test while `mamba_ssm` is installed.
+  - Unrestricted `pytest` also has a pre-existing module-name collision between `scripts/test_*.py` and `tests/test_*.py`; `pytest tests` is the valid suite invocation.
+  - No training job or Slurm job was launched.
+- Interpretation: implementation smoke validation complete; architecture comparison awaits fresh ablation reruns.

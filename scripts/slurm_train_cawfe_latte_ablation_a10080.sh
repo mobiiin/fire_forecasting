@@ -66,4 +66,6 @@ nvidia-smi
 
 srun --ntasks=1 --chdir="${REPO_ROOT}" --export=ALL   /usr/bin/env PYTHONPATH="${PYTHONPATH}" "${PYTHON_BIN}"   scripts/sanity_check_project.py   --config "${CONFIG_PATH}"   --batch_size 2   --num_workers 0   --deep
 
+echo "Starting 10-epoch screening training; the runner will reload best_model.pt and evaluate the full validation split before exit."
 srun --ntasks=1 --chdir="${REPO_ROOT}" --export=ALL   /usr/bin/env PYTHONPATH="${PYTHONPATH}" "${PYTHON_BIN}"   scripts/run_cawfe_latte_ablation.py "${ABLATION}" --run-id "${RUN_ID}"
+echo "Completed training and automatic full validation for ${ABLATION}."

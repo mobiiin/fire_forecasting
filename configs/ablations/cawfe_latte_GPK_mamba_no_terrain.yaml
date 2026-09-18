@@ -1,0 +1,29 @@
+base_config: cawfe_latte_baseline.yaml
+
+experiment:
+  name: cawfe_latte_ablation_GPK_mamba_no_terrain
+
+model:
+  architecture: cawfe_latte
+
+cawfe_latte:
+  ablation:
+    name: GPK_mamba_no_terrain
+  post_fusion_backbone:
+    type: spatiotemporal_mamba
+    dim: 64
+    num_blocks: 2
+    expansion: 2
+    dropout: 0.1
+    scan_order: temporal_then_spatial
+    backend: mamba_ssm
+  temporal_pooling:
+    type: baseline
+  decoder:
+    type: separate_regression
+  terrain_film:
+    enabled: false
+
+training:
+  output:
+    root_dir: artifacts/ablations/cawfe_latte/GPK_mamba_no_terrain

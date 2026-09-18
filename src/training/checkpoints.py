@@ -136,8 +136,35 @@ def validate_checkpoint_model_compatibility(model, checkpoint: Mapping[str, Any]
 
 
 
+def _materialize_cawfe_latte_spatial_pos(model, state_dict: Mapping[str, Any], checkpoint_path: str | Path | None = None) -> None:
+	"""Materialize the lazy CAWFE-Latte spatial parameter before state loading."""
+	value = state_dict.get("alignment.spatial_pos")
+	alignment = getattr(model, "alignment", None)
+	if not torch.is_tensor(value) or alignment is None or getattr(alignment, "spatial_pos", None) is not None:
+		return
+	if value.ndim != 4 or tuple(value.shape[:2]) != (1, 1):
+		path_text = f" ({Path(checkpoint_path).expanduser().resolve()})" if checkpoint_path is not None else ""
+		raise ValueError(f"Invalid CAWFE-Latte alignment.spatial_pos shape{path_text}: {tuple(value.shape)}")
+	num_tokens = int(value.shape[2])
+	dim = int(value.shape[3])
+	model_dim = int(getattr(alignment, "dim", dim))
+	if dim != model_dim:
+		raise ValueError(f"Checkpoint spatial positional dim={dim} does not match model dim={model_dim}.")
+	spatial_size = int(num_tokens ** 0.5)
+	if spatial_size * spatial_size != num_tokens:
+		path_text = f" ({Path(checkpoint_path).expanduser().resolve()})" if checkpoint_path is not None else ""
+		raise ValueError(
+			f"Cannot infer square CAWFE-Latte spatial shape from {num_tokens} positional tokens{path_text}."
+		)
+	reference = getattr(alignment, "temporal_pos", None)
+	device = reference.device if torch.is_tensor(reference) else next(model.parameters()).device
+	dtype = reference.dtype if torch.is_tensor(reference) else value.dtype
+	alignment.spatial_pos = torch.nn.Parameter(torch.empty(tuple(value.shape), device=device, dtype=dtype))
+	alignment._spatial_shape = (spatial_size, spatial_size)
+
+
 def load_model_state_dict_compatible(model, checkpoint: Mapping[str, Any], checkpoint_path: str | Path | None = None):
-	"""Load model weights while tolerating narrowly-known legacy CAWFE-Latte keys."""
+	"""Load model weights while materializing lazy CAWFE-Latte parameters."""
 	state_dict = checkpoint.get("model_state_dict")
 	if not isinstance(state_dict, Mapping):
 		raise KeyError("Checkpoint does not contain a mapping model_state_dict.")
@@ -151,31 +178,10 @@ def load_model_state_dict_compatible(model, checkpoint: Mapping[str, Any], check
 	model_architecture = str(getattr(model, "architecture", getattr(model, "name", ""))).lower()
 	if not model_architecture:
 		model_architecture = model.__class__.__name__.lower()
-	legacy_unexpected: set[str] = set()
 	if architecture == "cawfe_latte" or "cawfelatte" in model_architecture or "cawfe_latte" in model_architecture:
-		legacy_unexpected.add("alignment.spatial_pos")
-	if legacy_unexpected:
-		result = model.load_state_dict(state_dict, strict=False)
-		missing = list(getattr(result, "missing_keys", []))
-		unexpected = list(getattr(result, "unexpected_keys", []))
-		unhandled_unexpected = [key for key in unexpected if key not in legacy_unexpected]
-		if missing or unhandled_unexpected:
-			path_text = f" ({Path(checkpoint_path).expanduser().resolve()})" if checkpoint_path is not None else ""
-			raise RuntimeError(
-				"Checkpoint state_dict is incompatible with the current model"
-				f"{path_text}. missing_keys={missing} unexpected_keys={unhandled_unexpected}"
-			)
-		ignored = [key for key in unexpected if key in legacy_unexpected]
-		if ignored:
-			path_text = f" ({Path(checkpoint_path).expanduser().resolve()})" if checkpoint_path is not None else ""
-			warnings.warn(
-				"Ignoring legacy CAWFE-Latte checkpoint key(s)"
-				f"{path_text}: {ignored}. This is expected for older alignment checkpoints.",
-				RuntimeWarning,
-				stacklevel=2,
-			)
-		return result
+		_materialize_cawfe_latte_spatial_pos(model, state_dict, checkpoint_path)
 	return model.load_state_dict(state_dict)
+
 
 def latest_and_best_checkpoint_paths(path: str | Path) -> tuple[Path, Path]:
 	"""Return the latest and best checkpoint paths derived from a base path."""

@@ -10,6 +10,7 @@ except ImportError:  # pragma: no cover - environment-specific fallback
 	torch = None
 
 from src.data.energy_release import resolve_energy_output_channel_names, resolve_energy_release_config
+from src.evaluation.fire_activity import ACTIVE_FRACTION_THRESHOLD, FIRE_MASK_THRESHOLD, classify_fire_masks
 from src.training.model_outputs import extract_aux_outputs, extract_prediction, patch_fire_presence_target
 
 
@@ -156,19 +157,25 @@ def compute_metrics(y_pred: torch.Tensor, y_true: torch.Tensor, config) -> dict[
 
 			if active_mask.any():
 				active_surface_mae = surface_abs_error[active_mask].mean()
+				active_surface_rmse = torch.sqrt(torch.mean((pred_surface[active_mask] - true_surface[active_mask]) ** 2) + eps)
 				active_canopy_mae = canopy_abs_error[active_mask].mean()
+				active_canopy_rmse = torch.sqrt(torch.mean((pred_canopy[active_mask] - true_canopy[active_mask]) ** 2) + eps)
 			else:
 				active_surface_mae = torch.full((), float("nan"), device=y_pred.device, dtype=y_pred.dtype)
+				active_surface_rmse = torch.full((), float("nan"), device=y_pred.device, dtype=y_pred.dtype)
 				active_canopy_mae = torch.full((), float("nan"), device=y_pred.device, dtype=y_pred.dtype)
+				active_canopy_rmse = torch.full((), float("nan"), device=y_pred.device, dtype=y_pred.dtype)
 
 			segmentation_metrics = _segmentation_stats(mask_pred, true_mask, eps)
 			results = {
 				"surface_consumed_mae": float(surface_abs_error.mean().item()),
 				"surface_consumed_rmse": float(torch.sqrt(torch.mean((pred_surface - true_surface) ** 2) + eps).item()),
 				"active_surface_consumed_mae": float(active_surface_mae.item()),
+				"active_surface_consumed_rmse": float(active_surface_rmse.item()),
 				"canopy_consumed_mae": float(canopy_abs_error.mean().item()),
 				"canopy_consumed_rmse": float(torch.sqrt(torch.mean((pred_canopy - true_canopy) ** 2) + eps).item()),
 				"active_canopy_consumed_mae": float(active_canopy_mae.item()),
+				"active_canopy_consumed_rmse": float(active_canopy_rmse.item()),
 				"mask_iou": float(segmentation_metrics["iou"]),
 				"mask_dice": float(segmentation_metrics["dice"]),
 				"mask_precision": float(segmentation_metrics["precision"]),
@@ -180,19 +187,27 @@ def compute_metrics(y_pred: torch.Tensor, y_true: torch.Tensor, config) -> dict[
 				"canopy_mae": float(canopy_abs_error.mean().item()),
 				"canopy_rmse": float(torch.sqrt(torch.mean((pred_canopy - true_canopy) ** 2) + eps).item()),
 			}
-			# Patch-level no-fire metrics expose false positives that aggregate Dice can hide.
-			active_fraction = true_mask.flatten(1).mean(dim=1)
-			no_fire_patches = active_fraction < float(metric_config.get("no_fire_active_fraction_threshold", 0.001))
-			active_patches = ~no_fire_patches
+			# Training, the balance checker, and full validation all call the same
+			# canonical target-mask classifier.
+			classification = classify_fire_masks(
+				true_mask[:, 0],
+				fire_threshold=FIRE_MASK_THRESHOLD,
+				active_fraction_threshold=ACTIVE_FRACTION_THRESHOLD,
+			)
+			fire_patches = classification["has_fire"]
+			no_fire_patches = classification["no_fire"]
+			results["total_patch_count"] = float(true_mask.shape[0])
 			results["no_fire_patch_count"] = float(no_fire_patches.sum().item())
-			results["active_patch_count"] = float(active_patches.sum().item())
+			results["fire_patch_count"] = float(fire_patches.sum().item())
+			results["active_patch_count"] = results["fire_patch_count"]  # legacy alias
 			if no_fire_patches.any():
 				results["no_fire_mask_prob_mean"] = float(mask_prob[no_fire_patches].mean().item())
 				results["no_fire_mask_false_positive_rate"] = float(mask_pred[no_fire_patches].mean().item())
+				results["no_fire_patch_false_positive_rate"] = float(mask_pred[no_fire_patches].flatten(1).any(dim=1).to(dtype=torch.float32).mean().item())
 				results["no_fire_surface_pred_mean"] = float(pred_surface[no_fire_patches].mean().item())
 				results["no_fire_canopy_pred_mean"] = float(pred_canopy[no_fire_patches].mean().item())
 			else:
-				for name in ("no_fire_mask_prob_mean", "no_fire_mask_false_positive_rate", "no_fire_surface_pred_mean", "no_fire_canopy_pred_mean"): results[name] = math.nan
+				for name in ("no_fire_mask_prob_mean", "no_fire_mask_false_positive_rate", "no_fire_patch_false_positive_rate", "no_fire_surface_pred_mean", "no_fire_canopy_pred_mean"): results[name] = math.nan
 			if energy_output_names:
 				pred_energy_log = y_pred[:, 3:4]
 				true_energy_log = y_true[:, 3:4]
@@ -265,8 +280,12 @@ def compute_metrics(y_pred: torch.Tensor, y_true: torch.Tensor, config) -> dict[
 				results["energy_total_pred_MW_sum"] = float(pred_sum.item())
 				results["energy_total_sum_relative_error"] = float((torch.abs(pred_sum - true_sum) / (torch.abs(true_sum) + eps)).item())
 				results["energy_active_fraction"] = float(true_energy_active.mean().item())
-				if no_fire_patches.any(): results["no_fire_energy_log_pred_mean"] = float(pred_energy_log[no_fire_patches].mean().item())
-				else: results["no_fire_energy_log_pred_mean"] = math.nan
+				if no_fire_patches.any():
+					results["no_fire_energy_log_pred_mean"] = float(pred_energy_log[no_fire_patches].mean().item())
+					results["no_fire_energy_mw_pred_mean"] = float(torch.clamp(torch.expm1(pred_energy_log[no_fire_patches]), min=0.0).mean().item())
+				else:
+					results["no_fire_energy_log_pred_mean"] = math.nan
+					results["no_fire_energy_mw_pred_mean"] = math.nan
 			return results
 
 		raise ValueError(f"Unsupported task_type: {task_type}")

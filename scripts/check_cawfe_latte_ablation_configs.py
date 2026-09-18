@@ -165,6 +165,107 @@ for combination_name, metadata in COMBINATION_METADATA.items():
     EXPECTED_COMPUTE_CLASS[combination_name] = metadata["compute"]
 
 
+NEW_BATCH_METADATA = {
+    "GA_Q1_fire_domain_adversarial": {
+        "short_name": "GA-Q1", "components": ["G", "A", "Q1"],
+        "parent_architecture": "GA_separate_decoder_resblocks",
+        "changed_components": ["post_fusion_backbone", "decoder", "domain_adversarial"], "compute": "medium",
+    },
+    "GA_Q2_fire_domain_mmd": {
+        "short_name": "GA-Q2", "components": ["G", "A", "Q2"],
+        "parent_architecture": "GA_separate_decoder_resblocks",
+        "changed_components": ["post_fusion_backbone", "decoder", "fire_mmd"], "compute": "medium",
+    },
+    "GA_R_mask_guided_regression_attention": {
+        "short_name": "GA-R", "components": ["G", "A", "R"],
+        "parent_architecture": "GA_separate_decoder_resblocks",
+        "changed_components": ["post_fusion_backbone", "decoder", "mask_guided_regression"], "compute": "medium",
+    },
+    "GA_S_regression_moe": {
+        "short_name": "GA-S", "components": ["G", "A", "S"],
+        "parent_architecture": "GA_separate_decoder_resblocks",
+        "changed_components": ["post_fusion_backbone", "decoder", "regression_moe"], "compute": "medium",
+    },
+    "GA_T_supervised_contrastive": {
+        "short_name": "GA-T", "components": ["G", "A", "T"],
+        "parent_architecture": "GA_separate_decoder_resblocks",
+        "changed_components": ["post_fusion_backbone", "decoder", "supervised_contrastive"], "compute": "medium",
+    },
+    "GA_U_physical_state_aux": {
+        "short_name": "GA-U", "components": ["G", "A", "U"],
+        "parent_architecture": "GA_separate_decoder_resblocks",
+        "changed_components": ["post_fusion_backbone", "decoder", "physical_state_aux"], "compute": "medium",
+    },
+    "GPK_mamba_no_terrain": {
+        "short_name": "GPK", "components": ["G", "P", "K"],
+        "parent_architecture": ["GP_separate_decoder_mamba", "GK_separate_decoder_no_terrain"],
+        "changed_components": ["post_fusion_backbone", "decoder", "terrain_film"], "compute": "high",
+    },
+    "CGPK_temporal_mamba_no_terrain": {
+        "short_name": "CGPK", "components": ["C", "G", "P", "K"],
+        "parent_architecture": ["CGP_separate_decoder_temporal_attention_mamba", "GK_separate_decoder_no_terrain"],
+        "changed_components": ["post_fusion_backbone", "temporal_pooling", "decoder", "terrain_film"], "compute": "high",
+    },
+    "GAK_resblocks_no_terrain": {
+        "short_name": "GAK", "components": ["G", "A", "K"],
+        "parent_architecture": ["GA_separate_decoder_resblocks", "GK_separate_decoder_no_terrain"],
+        "changed_components": ["post_fusion_backbone", "decoder", "terrain_film"], "compute": "medium",
+    },
+    "CGP_R_mask_guided_regression_attention": {
+        "short_name": "CGP-R", "components": ["C", "G", "P", "R"],
+        "parent_architecture": "CGP_separate_decoder_temporal_attention_mamba",
+        "changed_components": ["post_fusion_backbone", "temporal_pooling", "decoder", "mask_guided_regression"], "compute": "high",
+    },
+    "GP_R_mask_guided_regression_attention": {
+        "short_name": "GP-R", "components": ["G", "P", "R"],
+        "parent_architecture": "GP_separate_decoder_mamba",
+        "changed_components": ["post_fusion_backbone", "decoder", "mask_guided_regression"], "compute": "high",
+    },
+    "GK_R_mask_guided_regression_attention": {
+        "short_name": "GK-R", "components": ["G", "K", "R"],
+        "parent_architecture": "GK_separate_decoder_no_terrain",
+        "changed_components": ["decoder", "terrain_film", "mask_guided_regression"], "compute": "medium",
+    },
+}
+NEW_MODULE_ALLOWED = {
+    "Q1": {
+        "cawfe_latte.domain_adversarial.enabled", "cawfe_latte.domain_adversarial.lambda_grl",
+        "cawfe_latte.domain_adversarial.loss_weight", "cawfe_latte.domain_adversarial.hidden_dim",
+        "cawfe_latte.domain_adversarial.dropout", "cawfe_latte.domain_adversarial.num_domains",
+    },
+    "Q2": {
+        "cawfe_latte.fire_mmd.enabled", "cawfe_latte.fire_mmd.loss_weight", "cawfe_latte.fire_mmd.kernel",
+        "cawfe_latte.fire_mmd.bandwidths[0]", "cawfe_latte.fire_mmd.bandwidths[1]",
+        "cawfe_latte.fire_mmd.bandwidths[2]", "cawfe_latte.fire_mmd.bandwidths[3]",
+    },
+    "R": {
+        "cawfe_latte.mask_guided_regression.enabled", "cawfe_latte.mask_guided_regression.alpha_init",
+        "cawfe_latte.mask_guided_regression.attention_activation",
+    },
+    "S": {
+        "cawfe_latte.regression_moe.enabled", "cawfe_latte.regression_moe.num_experts",
+        "cawfe_latte.regression_moe.routing", "cawfe_latte.regression_moe.load_balance_weight",
+    },
+    "T": {
+        "cawfe_latte.supervised_contrastive.enabled", "cawfe_latte.supervised_contrastive.projection_dim",
+        "cawfe_latte.supervised_contrastive.temperature", "cawfe_latte.supervised_contrastive.loss_weight",
+    },
+    "U": {
+        "cawfe_latte.physical_state_aux.enabled", "cawfe_latte.physical_state_aux.hidden_dim",
+        "cawfe_latte.physical_state_aux.loss_weight",
+    },
+}
+for experiment_name, metadata in NEW_BATCH_METADATA.items():
+    component_changes = [
+        ARCHITECTURE_ALLOWED[COMPONENT_CONFIG_NAMES[code]]
+        for code in metadata["components"]
+        if code in COMPONENT_CONFIG_NAMES
+    ]
+    module_changes = [NEW_MODULE_ALLOWED[code] for code in metadata["components"] if code in NEW_MODULE_ALLOWED]
+    ARCHITECTURE_ALLOWED[experiment_name] = set().union(*component_changes, *module_changes)
+    EXPECTED_COMPUTE_CLASS[experiment_name] = metadata["compute"]
+
+
 def flatten(value: Any, prefix: str = "") -> dict[str, Any]:
     """Flatten nested mappings/lists into comparable dotted leaves."""
     if isinstance(value, Mapping):
@@ -201,6 +302,11 @@ def compare_configs(registry_path: Path = DEFAULT_REGISTRY) -> list[str]:
         if name in COMBINATION_METADATA:
             metadata = COMBINATION_METADATA[name]
             for field in ("short_name", "components", "changed_components"):
+                if entry.get(field) != metadata[field]:
+                    errors.append(f"{name}: {field} must be {metadata[field]!r}, got {entry.get(field)!r}.")
+        if name in NEW_BATCH_METADATA:
+            metadata = NEW_BATCH_METADATA[name]
+            for field in ("short_name", "components", "parent_architecture", "changed_components"):
                 if entry.get(field) != metadata[field]:
                     errors.append(f"{name}: {field} must be {metadata[field]!r}, got {entry.get(field)!r}.")
         if name in EXPECTED_COMPUTE_CLASS and entry.get("expected_compute_class") != EXPECTED_COMPUTE_CLASS[name]:
@@ -251,6 +357,44 @@ def compare_configs(registry_path: Path = DEFAULT_REGISTRY) -> list[str]:
                 for key in ARCHITECTURE_ALLOWED[parent_name]:
                     if candidate.get(key, object()) != parent.get(key, object()):
                         errors.append(f"{name}: {key} must exactly match isolated parent {parent_name}.")
+        if name in NEW_BATCH_METADATA:
+            for component in NEW_BATCH_METADATA[name]["components"]:
+                if component not in COMPONENT_CONFIG_NAMES:
+                    continue
+                parent_name = COMPONENT_CONFIG_NAMES[component]
+                parent = flatten(configs[parent_name])
+                for key in ARCHITECTURE_ALLOWED[parent_name]:
+                    if candidate.get(key, object()) != parent.get(key, object()):
+                        errors.append(f"{name}: {key} must exactly match isolated parent {parent_name}.")
+    direct_ga_children = {
+        "GA_Q1_fire_domain_adversarial": "Q1",
+        "GA_R_mask_guided_regression_attention": "R",
+        "GA_S_regression_moe": "S",
+        "GA_T_supervised_contrastive": "T",
+        "GA_U_physical_state_aux": "U",
+    }
+    ga_name = "GA_separate_decoder_resblocks"
+    if ga_name in configs:
+        ga_parent = flatten(configs[ga_name])
+        for child_name, module_name in direct_ga_children.items():
+            if child_name not in configs:
+                continue
+            child = flatten(configs[child_name])
+            differences = {
+                key for key in set(ga_parent) | set(child)
+                if ga_parent.get(key, object()) != child.get(key, object())
+            }
+            allowed = COMMON_ALLOWED | NEW_MODULE_ALLOWED[module_name]
+            unexpected = sorted(differences - allowed)
+            missing_module_change = sorted(NEW_MODULE_ALLOWED[module_name] - differences)
+            if unexpected:
+                errors.append(
+                    f"{child_name}: direct GA-parent audit found unrelated differences: {', '.join(unexpected)}."
+                )
+            if missing_module_change:
+                errors.append(
+                    f"{child_name}: direct GA-parent audit is missing module differences: {', '.join(missing_module_change)}."
+                )
     return errors
 
 

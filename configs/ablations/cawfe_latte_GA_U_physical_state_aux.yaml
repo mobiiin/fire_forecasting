@@ -1,0 +1,24 @@
+base_config: cawfe_latte_baseline.yaml
+
+experiment:
+  name: cawfe_latte_ablation_GA_U_physical_state_aux
+
+model:
+  architecture: cawfe_latte
+
+cawfe_latte:
+  ablation:
+    name: GA_U_physical_state_aux
+  post_fusion_backbone:
+    type: residual_spatiotemporal
+    num_blocks: 6
+  decoder:
+    type: separate_regression
+  physical_state_aux:
+    enabled: true
+    hidden_dim: 64
+    loss_weight: 0.05
+
+training:
+  output:
+    root_dir: artifacts/ablations/cawfe_latte/GA_U_physical_state_aux

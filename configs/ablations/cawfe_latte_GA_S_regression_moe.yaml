@@ -1,0 +1,25 @@
+base_config: cawfe_latte_baseline.yaml
+
+experiment:
+  name: cawfe_latte_ablation_GA_S_regression_moe
+
+model:
+  architecture: cawfe_latte
+
+cawfe_latte:
+  ablation:
+    name: GA_S_regression_moe
+  post_fusion_backbone:
+    type: residual_spatiotemporal
+    num_blocks: 6
+  decoder:
+    type: separate_regression
+  regression_moe:
+    enabled: true
+    num_experts: 3
+    routing: soft
+    load_balance_weight: 0.01
+
+training:
+  output:
+    root_dir: artifacts/ablations/cawfe_latte/GA_S_regression_moe

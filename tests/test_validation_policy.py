@@ -171,9 +171,15 @@ def test_unknown_validation_mode_raises_clear_error() -> None:
 		resolve_validation_policy(_config({"mode": "full_periodic"}), val_loader=_loader())
 
 
-def test_cawfe_latte_experiment_uses_fixed_sequential_validation_subset() -> None:
+def test_cawfe_latte_experiment_uses_shared_stratified_validation_subset() -> None:
 	from src.config import load_config
 	config = load_config("configs/experiments/cawfe_latte_v1.yaml")
-	policy = resolve_validation_policy(config, val_loader=_loader(length=100, batch_size=1))
-	assert policy["fixed_subset_shuffle"] is False
-	assert policy["selected_batch_indices"] == list(range(50))
+	screening = config["training"]["validation"]["screening"]
+	assert screening == {
+		"enabled": True,
+		"max_batches": 50,
+		"sampling": "stratified_fixed",
+		"seed": 12345,
+		"index_path": "artifacts/ablations/cawfe_latte/shared_validation/screening_validation_indices.json",
+	}
+	assert config["training"]["validation"]["full"]["enabled"] is True

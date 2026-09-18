@@ -1,0 +1,24 @@
+base_config: cawfe_latte_baseline.yaml
+
+experiment:
+  name: cawfe_latte_ablation_GA_R_mask_guided_regression_attention
+
+model:
+  architecture: cawfe_latte
+
+cawfe_latte:
+  ablation:
+    name: GA_R_mask_guided_regression_attention
+  post_fusion_backbone:
+    type: residual_spatiotemporal
+    num_blocks: 6
+  decoder:
+    type: separate_regression
+  mask_guided_regression:
+    enabled: true
+    alpha_init: 0.0
+    attention_activation: sigmoid
+
+training:
+  output:
+    root_dir: artifacts/ablations/cawfe_latte/GA_R_mask_guided_regression_attention

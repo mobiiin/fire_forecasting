@@ -15,6 +15,7 @@ except ImportError:  # pragma: no cover - environment-specific fallback
 	F = None
 
 from src.data.energy_release import resolve_energy_output_channel_names, resolve_energy_release_config
+from src.evaluation.fire_activity import ACTIVE_FRACTION_BIN_NAMES, ACTIVE_FRACTION_BOUNDARIES
 
 
 
@@ -179,6 +180,112 @@ class FocalLoss(nn.Module):
 		return (alpha_factor * focal_factor * bce).mean()
 
 
+def active_fraction_values(y_true: torch.Tensor) -> torch.Tensor:
+	"""Return per-patch active fractions from canonical target mask channel 2."""
+	if y_true.ndim != 4 or int(y_true.shape[1]) < 3:
+		raise ValueError(f"Activity labels expect B x C x H x W targets with C >= 3, got {tuple(y_true.shape)}.")
+	return (y_true[:, 2] > 0.5).to(dtype=torch.float32).flatten(1).mean(dim=1)
+
+
+def active_fraction_class_labels(y_true: torch.Tensor) -> torch.Tensor:
+	"""Canonical no/tiny/small/medium/large labels from target-mask activity."""
+	fraction = active_fraction_values(y_true)
+	tiny_upper, small_upper, medium_upper = ACTIVE_FRACTION_BOUNDARIES
+	labels = torch.zeros_like(fraction, dtype=torch.long)
+	labels[(fraction > 0.0) & (fraction < tiny_upper)] = 1
+	labels[(fraction >= tiny_upper) & (fraction < small_upper)] = 2
+	labels[(fraction >= small_upper) & (fraction < medium_upper)] = 3
+	labels[fraction >= medium_upper] = 4
+	return labels
+
+
+def supervised_contrastive_positive_mask(labels: torch.Tensor) -> torch.Tensor:
+	"""Same-class positive pairs with every anchor's self-pair excluded."""
+	if labels.ndim != 1:
+		raise ValueError(f"Contrastive labels must be one-dimensional, got {tuple(labels.shape)}.")
+	self_mask = torch.eye(int(labels.shape[0]), dtype=torch.bool, device=labels.device)
+	return labels[:, None].eq(labels[None, :]) & ~self_mask
+
+
+def rbf_mmd(x: torch.Tensor, y: torch.Tensor, bandwidths: list[float] | tuple[float, ...]) -> torch.Tensor:
+	"""Biased multi-bandwidth RBF MMD; identical samples evaluate to zero."""
+	if x.ndim != 2 or y.ndim != 2 or int(x.shape[1]) != int(y.shape[1]):
+		raise ValueError(f"MMD expects N x D and M x D features, got {tuple(x.shape)} and {tuple(y.shape)}.")
+	if not bandwidths or any(float(value) <= 0.0 for value in bandwidths):
+		raise ValueError("fire_mmd.bandwidths must contain positive values.")
+	def kernel(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+		distance = torch.cdist(left.float(), right.float(), p=2).square()
+		terms = [torch.exp(-distance / (2.0 * float(bandwidth) ** 2)) for bandwidth in bandwidths]
+		return torch.stack(terms, dim=0).mean(dim=0).to(dtype=left.dtype)
+	value = kernel(x, x).mean() + kernel(y, y).mean() - 2.0 * kernel(x, y).mean()
+	return torch.clamp(value, min=0.0)
+
+
+def cross_fire_mmd(
+	features: torch.Tensor,
+	domain_labels: torch.Tensor,
+	bandwidths: list[float] | tuple[float, ...],
+) -> tuple[torch.Tensor, torch.Tensor]:
+	"""Average MMD across all domain pairs represented in a batch."""
+	if features.ndim != 2 or domain_labels.ndim != 1 or int(features.shape[0]) != int(domain_labels.shape[0]):
+		raise ValueError("Cross-fire MMD expects N x D features and N labels.")
+	unique = torch.unique(domain_labels)
+	pair_losses = []
+	for left_index in range(int(unique.numel())):
+		for right_index in range(left_index + 1, int(unique.numel())):
+			pair_losses.append(
+				rbf_mmd(features[domain_labels == unique[left_index]], features[domain_labels == unique[right_index]], bandwidths)
+			)
+	if not pair_losses:
+		zero = features.sum() * 0.0
+		return zero, zero.detach()
+	return torch.stack(pair_losses).mean(), features.new_tensor(1.0)
+
+
+def supervised_contrastive_loss(
+	embeddings: torch.Tensor,
+	labels: torch.Tensor,
+	temperature: float = 0.1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+	"""Supervised contrastive loss over anchors that have an in-batch positive."""
+	if embeddings.ndim != 2 or labels.ndim != 1 or int(embeddings.shape[0]) != int(labels.shape[0]):
+		raise ValueError("Supervised contrastive loss expects N x D embeddings and N labels.")
+	if float(temperature) <= 0.0:
+		raise ValueError("supervised_contrastive.temperature must be positive.")
+	count = int(embeddings.shape[0])
+	if count < 2:
+		zero = embeddings.sum() * 0.0
+		return zero, zero.detach()
+	normalized = F.normalize(embeddings, p=2, dim=1)
+	logits = normalized @ normalized.transpose(0, 1) / float(temperature)
+	self_mask = torch.eye(count, dtype=torch.bool, device=embeddings.device)
+	logits = logits.masked_fill(self_mask, float("-inf"))
+	positive_mask = supervised_contrastive_positive_mask(labels)
+	valid = positive_mask.any(dim=1)
+	valid_fraction = valid.to(dtype=embeddings.dtype).mean()
+	if not bool(valid.any().item()):
+		return embeddings.sum() * 0.0, valid_fraction
+	log_prob = logits - torch.logsumexp(logits, dim=1, keepdim=True)
+	positive_count = positive_mask.sum(dim=1).clamp(min=1)
+	per_anchor = -(log_prob.masked_fill(~positive_mask, 0.0).sum(dim=1) / positive_count)
+	return per_anchor[valid].mean(), valid_fraction
+
+
+def physical_state_targets(y_true: torch.Tensor) -> torch.Tensor:
+	"""Derive active fraction and active-only canopy/energy means from targets."""
+	if y_true.ndim != 4 or int(y_true.shape[1]) < 4:
+		raise ValueError(f"Physical-state targets expect B x C x H x W with C >= 4, got {tuple(y_true.shape)}.")
+	active = y_true[:, 2] > 0.5
+	active_float = active.to(dtype=y_true.dtype)
+	count = active_float.flatten(1).sum(dim=1)
+	denominator = count.clamp(min=1.0)
+	fraction = active_float.flatten(1).mean(dim=1)
+	active_canopy_mean = (y_true[:, 1] * active_float).flatten(1).sum(dim=1) / denominator
+	canopy_state = torch.log1p(torch.clamp(active_canopy_mean, min=0.0))
+	energy_state = (y_true[:, 3] * active_float).flatten(1).sum(dim=1) / denominator
+	return torch.stack([fraction, canopy_state, energy_state], dim=1)
+
+
 class MultiTaskLoss(nn.Module):
 	"""Loss for multitask surface/canopy consumed fuel + active mask prediction."""
 
@@ -280,6 +387,16 @@ class MultiTaskLoss(nn.Module):
 			self.aux_fire_support_dilation_radius = 0
 			self.patch_fire_enabled = False
 			self.patch_fire_weight = 0.0
+		self.cawfe_config = _get_section(config, "cawfe_latte")
+		def optional_cawfe_section(name: str) -> dict:
+			value = self.cawfe_config.get(name)
+			return dict(value) if isinstance(value, dict) else {}
+		self.domain_adversarial_config = optional_cawfe_section("domain_adversarial")
+		self.fire_mmd_config = optional_cawfe_section("fire_mmd")
+		self.mask_guidance_config = optional_cawfe_section("mask_guided_regression")
+		self.regression_moe_config = optional_cawfe_section("regression_moe")
+		self.supervised_contrastive_config = optional_cawfe_section("supervised_contrastive")
+		self.physical_state_aux_config = optional_cawfe_section("physical_state_aux")
 
 	def _energy_threshold_in_target_space(self) -> float:
 		"""Convert the physical active threshold into target space."""
@@ -474,7 +591,101 @@ class MultiTaskLoss(nn.Module):
 					raise ValueError(f"Patch-fire logits and targets must match, got {tuple(patch_fire_logit.shape)} and {tuple(patch_target.shape)}.")
 				patch_fire_loss = F.binary_cross_entropy_with_logits(patch_fire_logit, patch_target)
 				weighted_patch_fire = self.patch_fire_weight * patch_fire_loss
-			total_loss = weighted_surface + weighted_canopy + weighted_mask + weighted_energy + weighted_aux + weighted_patch_fire
+
+			zero = y_pred.sum() * 0.0
+			auxiliary_total = zero
+			diagnostics: dict[str, torch.Tensor] = {}
+			alpha = aux_outputs.get("mask_guidance_alpha")
+			if torch.is_tensor(alpha):
+				diagnostics["mask_guidance_alpha"] = alpha
+			guidance = aux_outputs.get("mask_guidance_attention")
+			if torch.is_tensor(guidance):
+				diagnostics["guidance_mean"] = guidance.mean()
+				diagnostics["guidance_std"] = guidance.std(unbiased=False)
+				active_pixels = true_mask > 0.5
+				if bool(active_pixels.any().item()):
+					diagnostics["guidance_mean_active"] = guidance[active_pixels].mean()
+				if bool((~active_pixels).any().item()):
+					diagnostics["guidance_mean_inactive"] = guidance[~active_pixels].mean()
+
+			predicted_state = aux_outputs.get("physical_state_prediction")
+			state_loss = None
+			if torch.is_tensor(predicted_state):
+				state_target = physical_state_targets(y_true).to(dtype=predicted_state.dtype)
+				state_losses = F.smooth_l1_loss(predicted_state, state_target, reduction="none").mean(dim=0)
+				state_maes = torch.abs(predicted_state - state_target).mean(dim=0)
+				state_loss = state_losses.mean()
+				diagnostics.update(
+					physical_state_aux_loss=state_loss,
+					physical_active_fraction_loss=state_losses[0],
+					physical_canopy_state_loss=state_losses[1],
+					physical_energy_state_loss=state_losses[2],
+					physical_active_fraction_mae=state_maes[0],
+					physical_canopy_state_mae=state_maes[1],
+					physical_energy_state_mae=state_maes[2],
+				)
+
+			auxiliary_training = bool(aux_outputs.get("auxiliary_training", False))
+			if auxiliary_training:
+				domain_labels = aux_outputs.get("fire_domain_labels")
+				if bool(self.domain_adversarial_config.get("enabled", False)):
+					domain_logits = aux_outputs.get("domain_logits")
+					if not torch.is_tensor(domain_logits) or not torch.is_tensor(domain_labels):
+						raise ValueError("Domain adversarial training requires domain_logits and training fire_domain_labels.")
+					domain_loss = F.cross_entropy(domain_logits, domain_labels.long())
+					domain_accuracy = (domain_logits.argmax(dim=1) == domain_labels.long()).to(dtype=y_pred.dtype).mean()
+					domain_random_chance = y_pred.new_tensor(1.0 / float(domain_logits.shape[1]))
+					auxiliary_total = auxiliary_total + float(self.domain_adversarial_config.get("loss_weight", 0.05)) * domain_loss
+					diagnostics.update(domain_loss=domain_loss, domain_accuracy=domain_accuracy, domain_random_chance=domain_random_chance)
+				if bool(self.fire_mmd_config.get("enabled", False)):
+					mmd_features = aux_outputs.get("fire_mmd_features")
+					if not torch.is_tensor(mmd_features) or not torch.is_tensor(domain_labels):
+						raise ValueError("Fire MMD training requires fire_mmd_features and training fire_domain_labels.")
+					mmd_loss, valid_fraction = cross_fire_mmd(mmd_features, domain_labels.long(), list(self.fire_mmd_config.get("bandwidths", [0.5, 1.0, 2.0, 4.0])))
+					auxiliary_total = auxiliary_total + float(self.fire_mmd_config.get("loss_weight", 0.05)) * mmd_loss
+					diagnostics.update(mmd_loss=mmd_loss, mmd_valid_batch_fraction=valid_fraction)
+				if bool(self.regression_moe_config.get("enabled", False)):
+					router_weights = aux_outputs.get("router_weights")
+					if not torch.is_tensor(router_weights):
+						raise ValueError("Regression MoE training requires router_weights.")
+					mean_weights = router_weights.mean(dim=0)
+					uniform = torch.full_like(mean_weights, 1.0 / float(mean_weights.numel()))
+					load_balance_loss = torch.mean((mean_weights - uniform).square())
+					router_entropy = -(router_weights * torch.log(router_weights.clamp(min=1.0e-8))).sum(dim=1).mean()
+					auxiliary_total = auxiliary_total + float(self.regression_moe_config.get("load_balance_weight", 0.01)) * load_balance_loss
+					diagnostics["load_balance_loss"] = load_balance_loss
+					diagnostics["router_entropy"] = router_entropy
+					diagnostics["router_max_probability_mean"] = router_weights.max(dim=1).values.mean()
+					for expert_index, mean_weight in enumerate(mean_weights):
+						diagnostics[f"expert_{expert_index + 1}_mean_weight"] = mean_weight
+					activity_labels = active_fraction_class_labels(y_true)
+					for class_index, class_name in enumerate(ACTIVE_FRACTION_BIN_NAMES):
+						class_samples = activity_labels == class_index
+						if bool(class_samples.any().item()):
+							class_weights = router_weights[class_samples].mean(dim=0)
+							for expert_index, mean_weight in enumerate(class_weights):
+								diagnostics[f"router_{class_name}_expert_{expert_index + 1}_mean_weight"] = mean_weight
+				if bool(self.supervised_contrastive_config.get("enabled", False)):
+					embedding = aux_outputs.get("contrastive_embedding")
+					if not torch.is_tensor(embedding):
+						raise ValueError("Supervised contrastive training requires contrastive_embedding.")
+					activity_labels = active_fraction_class_labels(y_true)
+					contrastive_loss, valid_fraction = supervised_contrastive_loss(embedding, activity_labels, float(self.supervised_contrastive_config.get("temperature", 0.1)))
+					auxiliary_total = auxiliary_total + float(self.supervised_contrastive_config.get("loss_weight", 0.05)) * contrastive_loss
+					diagnostics.update(contrastive_loss=contrastive_loss, valid_contrastive_anchor_fraction=valid_fraction)
+					diagnostic_class_names = ("no_fire", "tiny", "small", "medium", "large")
+					for class_index, class_name in enumerate(diagnostic_class_names):
+						diagnostics[f"batch_fraction_{class_name}"] = (activity_labels == class_index).to(dtype=y_pred.dtype).mean()
+					cosine = embedding @ embedding.transpose(0, 1)
+					positive_mask = supervised_contrastive_positive_mask(activity_labels)
+					different_mask = activity_labels[:, None].ne(activity_labels[None, :])
+					diagnostics["same_class_cosine_similarity"] = cosine[positive_mask].mean() if bool(positive_mask.any().item()) else zero
+					diagnostics["different_class_cosine_similarity"] = cosine[different_mask].mean() if bool(different_mask.any().item()) else zero
+				if bool(self.physical_state_aux_config.get("enabled", False)):
+					if state_loss is None:
+						raise ValueError("Physical-state auxiliary training requires physical_state_prediction.")
+					auxiliary_total = auxiliary_total + float(self.physical_state_aux_config.get("loss_weight", 0.05)) * state_loss
+			total_loss = weighted_surface + weighted_canopy + weighted_mask + weighted_energy + weighted_aux + weighted_patch_fire + auxiliary_total
 			result = {
 				"total_loss": total_loss,
 				"loss_total": total_loss,
@@ -498,6 +709,7 @@ class MultiTaskLoss(nn.Module):
 				result["loss_patch_fire_bce"] = patch_fire_loss
 				result["loss_patch_fire_total"] = patch_fire_loss
 				result["weighted_patch_fire"] = weighted_patch_fire
+			result.update(diagnostics)
 			return result
 
 		surface_loss = self._regression_loss(pred_surface_consumed, true_surface_consumed, true_mask)

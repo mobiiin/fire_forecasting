@@ -1,0 +1,25 @@
+base_config: cawfe_latte_baseline.yaml
+
+experiment:
+  name: cawfe_latte_ablation_GA_Q2_fire_domain_mmd
+
+model:
+  architecture: cawfe_latte
+
+cawfe_latte:
+  ablation:
+    name: GA_Q2_fire_domain_mmd
+  post_fusion_backbone:
+    type: residual_spatiotemporal
+    num_blocks: 6
+  decoder:
+    type: separate_regression
+  fire_mmd:
+    enabled: true
+    loss_weight: 0.05
+    kernel: rbf
+    bandwidths: [0.5, 1.0, 2.0, 4.0]
+
+training:
+  output:
+    root_dir: artifacts/ablations/cawfe_latte/GA_Q2_fire_domain_mmd

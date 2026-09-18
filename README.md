@@ -1126,6 +1126,23 @@ bash scripts/submit_cawfe_latte_ablation_batch.sh \
   L_simple_concat_fusion
 ```
 
+Each standard ablation job now performs both validation phases automatically:
+a shared deterministic fire/no-fire-stratified 50-batch subset every epoch, then
+one complete validation pass with `checkpoints/best_model.pt` after training.
+The batch launcher prepares/reuses the shared screening index before allocating
+GPUs. Each run exits only after writing `screening_validation_metrics.json`,
+`full_validation_metrics.json`, and `full_validation_per_fire.json`.
+
+After every submitted training job finishes, the only required reporting step is:
+
+```bash
+python scripts/summarize_cawfe_latte_ablations.py
+```
+
+`scripts/recompute_ablation_no_fire_metrics.py` is retained only as a recovery
+tool for historical runs. It is not invoked by the standard submission, training,
+or summarization workflow.
+
 ## Per-epoch CAWFE-Latte fusion vectors
 
 Optionally save one representative post-fusion vector at the start of each epoch:

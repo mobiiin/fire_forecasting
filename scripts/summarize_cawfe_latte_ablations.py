@@ -7,7 +7,7 @@ import csv
 import json
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import yaml
 
@@ -16,43 +16,107 @@ ROOT = Path("artifacts/ablations/cawfe_latte")
 REGISTRY_PATH = Path("configs/ablations/cawfe_latte_ablations.yaml")
 METRIC_COLUMNS = {
     "Train Dice": ("train", "mask_dice"),
-    "Val Dice": ("validation", "mask_dice"),
+    "Screening Val Dice": ("validation", "mask_dice"),
     "Train IoU": ("train", "mask_iou"),
-    "Val IoU": ("validation", "mask_iou"),
+    "Screening Val IoU": ("validation", "mask_iou"),
     "Train Energy Log MAE": ("train", "energy_log_mae"),
-    "Val Energy Log MAE": ("validation", "energy_log_mae"),
+    "Screening Val Energy Log MAE": ("validation", "energy_log_mae"),
     "Train Surface MAE": ("train", "surface_consumed_mae"),
-    "Val Surface MAE": ("validation", "surface_consumed_mae"),
+    "Screening Val Surface MAE": ("validation", "surface_consumed_mae"),
     "Train Canopy MAE": ("train", "canopy_consumed_mae"),
-    "Val Canopy MAE": ("validation", "canopy_consumed_mae"),
+    "Screening Val Canopy MAE": ("validation", "canopy_consumed_mae"),
     "Train Active Canopy MAE": ("train", "active_canopy_consumed_mae"),
-    "Val Active Canopy MAE": ("validation", "active_canopy_consumed_mae"),
+    "Screening Val Active Canopy MAE": ("validation", "active_canopy_consumed_mae"),
     "Train Active Energy MAE": ("train", "active_energy_log_mae"),
-    "Val Active Energy MAE": ("validation", "active_energy_log_mae"),
-    "Val No-Fire Patch Count": ("validation", "no_fire_patch_count"),
-    "Val No-Fire Mask Prob Mean": ("validation", "no_fire_mask_prob_mean"),
-    "No-Fire FP": ("validation", "no_fire_mask_false_positive_rate"),
-    "Val No-Fire Surface Pred Mean": ("validation", "no_fire_surface_pred_mean"),
-    "Val No-Fire Canopy Pred Mean": ("validation", "no_fire_canopy_pred_mean"),
-    "Val No-Fire Energy Log Pred Mean": ("validation", "no_fire_energy_log_pred_mean"),
+    "Screening Val Active Energy MAE": ("validation", "active_energy_log_mae"),
+    "Screening Val Fire Patch Count": ("validation", "fire_patch_count"),
+    "Screening Val No-Fire Patch Count": ("validation", "no_fire_patch_count"),
+    "Screening Val No-Fire Mask Prob Mean": ("validation", "no_fire_mask_prob_mean"),
+    "Screening Val No-Fire Pixel FP Rate": ("validation", "no_fire_mask_false_positive_rate"),
+    "Screening Val No-Fire Patch FP Rate": ("validation", "no_fire_patch_false_positive_rate"),
+    "Screening Val No-Fire Surface Pred Mean": ("validation", "no_fire_surface_pred_mean"),
+    "Screening Val No-Fire Canopy Pred Mean": ("validation", "no_fire_canopy_pred_mean"),
+    "Screening Val No-Fire Energy Log Pred Mean": ("validation", "no_fire_energy_log_pred_mean"),
     "Patch Fire Accuracy": ("validation", "patch_fire_accuracy"),
     "Patch Fire F1": ("validation", "patch_fire_f1"),
+    "Domain Loss": ("train", "domain_loss"),
+    "Domain Accuracy": ("train", "domain_accuracy"),
+    "Domain Random Chance": ("train", "domain_random_chance"),
+    "MMD Loss": ("train", "mmd_loss"),
+    "MMD Valid Batch Fraction": ("train", "mmd_valid_batch_fraction"),
+    "Mask Guidance Alpha": ("train", "mask_guidance_alpha"),
+    "Guidance Mean": ("validation", "guidance_mean"),
+    "Guidance Std": ("validation", "guidance_std"),
+    "Guidance Mean Active": ("validation", "guidance_mean_active"),
+    "Guidance Mean Inactive": ("validation", "guidance_mean_inactive"),
+    "Router Mean Expert 1": ("train", "expert_1_mean_weight"),
+    "Router Mean Expert 2": ("train", "expert_2_mean_weight"),
+    "Router Mean Expert 3": ("train", "expert_3_mean_weight"),
+    "Router Entropy": ("train", "router_entropy"),
+    "Router Max Probability Mean": ("train", "router_max_probability_mean"),
+    "Load Balance Loss": ("train", "load_balance_loss"),
+    "Contrastive Loss": ("train", "contrastive_loss"),
+    "Contrastive Valid Anchor Fraction": ("train", "valid_contrastive_anchor_fraction"),
+    "Batch Fraction No Fire": ("train", "batch_fraction_no_fire"),
+    "Batch Fraction Tiny": ("train", "batch_fraction_tiny"),
+    "Batch Fraction Small": ("train", "batch_fraction_small"),
+    "Batch Fraction Medium": ("train", "batch_fraction_medium"),
+    "Batch Fraction Large": ("train", "batch_fraction_large"),
+    "Active-Fraction Aux MAE": ("validation", "physical_active_fraction_mae"),
+    "Canopy-State Aux MAE": ("validation", "physical_canopy_state_mae"),
+    "Energy-State Aux MAE": ("validation", "physical_energy_state_mae"),
 }
+FULL_VALIDATION_COLUMNS = {
+    "Full Val Dice": "full_val_dice",
+    "Full Val IoU": "full_val_iou",
+    "Full Val Energy Log MAE": "full_val_energy_log_mae",
+    "Full Val Surface MAE": "full_val_surface_mae",
+    "Full Val Canopy MAE": "full_val_canopy_mae",
+    "Full Val Active Canopy MAE": "full_val_active_canopy_mae",
+}
+FULL_VALIDATION_NO_FIRE_COLUMNS = {
+    "Full Val Total Patches": "full_val_total_patch_count",
+    "Full Val Fire Patches": "full_val_fire_patch_count",
+    "Full Val No-Fire Patches": "full_val_no_fire_patch_count",
+    "Full Val No-Fire %": "full_val_no_fire_patch_percent",
+    "Full Val No-Fire Mask Prob Mean": "full_val_no_fire_mask_prob_mean",
+    "Full Val No-Fire Pixel FP Rate": "full_val_no_fire_mask_false_positive_rate",
+    "Full Val No-Fire Patch FP Rate": "full_val_no_fire_patch_false_positive_rate",
+    "Full Val No-Fire Surface Pred Mean": "full_val_no_fire_surface_pred_mean",
+    "Full Val No-Fire Canopy Pred Mean": "full_val_no_fire_canopy_pred_mean",
+    "Full Val No-Fire Energy Log Pred Mean": "full_val_no_fire_energy_log_pred_mean",
+    "Full Val No-Fire Energy MW Pred Mean": "full_val_no_fire_energy_mw_pred_mean",
+}
+
+
 DELTA_COLUMNS = {
-    "Delta Val Dice": "Val Dice",
-    "Delta Val IoU": "Val IoU",
-    "Delta Val Energy Log MAE": "Val Energy Log MAE",
-    "Delta Val Surface MAE": "Val Surface MAE",
-    "Delta Val Canopy MAE": "Val Canopy MAE",
-    "Delta Val Active Canopy MAE": "Val Active Canopy MAE",
+    "Delta Full Val Dice": "Full Val Dice",
+    "Delta Full Val IoU": "Full Val IoU",
+    "Delta Full Val Energy Log MAE": "Full Val Energy Log MAE",
+    "Delta Full Val Surface MAE": "Full Val Surface MAE",
+    "Delta Full Val Canopy MAE": "Full Val Canopy MAE",
+    "Delta Full Val Active Canopy MAE": "Full Val Active Canopy MAE",
 }
 PRIMARY_METRICS = {
-    "Val Dice": True,
-    "Val IoU": True,
-    "Val Energy Log MAE": False,
-    "Val Surface MAE": False,
-    "Val Canopy MAE": False,
-    "Val Active Canopy MAE": False,
+    "Full Val Dice": True,
+    "Full Val IoU": True,
+    "Full Val Energy Log MAE": False,
+    "Full Val Surface MAE": False,
+    "Full Val Canopy MAE": False,
+    "Full Val Active Canopy MAE": False,
+}
+PARENT_METRICS = {**PRIMARY_METRICS, "Full Val No-Fire Pixel FP Rate": False}
+LEGACY_FULL_COLUMN_FALLBACKS = {
+    "Full Val Dice": "Val Dice",
+    "Full Val IoU": "Val IoU",
+    "Full Val Energy Log MAE": "Val Energy Log MAE",
+    "Full Val Surface MAE": "Val Surface MAE",
+    "Full Val Canopy MAE": "Val Canopy MAE",
+    "Full Val Active Canopy MAE": "Val Active Canopy MAE",
+    "Full Val No-Fire Pixel FP Rate": "No-Fire Pixel FP Rate",
+    "Full Val No-Fire Patch FP Rate": "No-Fire Patch FP Rate",
+    "Full Val No-Fire Energy Log Pred Mean": "No-Fire Energy Log Pred Mean",
+    "Full Val No-Fire Canopy Pred Mean": "No-Fire Canopy Pred Mean",
 }
 REFERENCE_NAMES = {
     "baseline": "baseline",
@@ -67,6 +131,7 @@ REFERENCE_NAMES = {
     "GE": "GE_separate_decoder_earthformer",
     "GP": "GP_separate_decoder_mamba",
     "GK": "GK_separate_decoder_no_terrain",
+    "CGP": "CGP_separate_decoder_temporal_attention_mamba",
 }
 COMBINATION_REFERENCES = {
     "CG_separate_decoder_temporal_attention": ["baseline", "C", "G"],
@@ -78,6 +143,18 @@ COMBINATION_REFERENCES = {
     "CGE_separate_decoder_temporal_attention_earthformer": ["baseline", "CG", "GE", "E", "C", "G"],
     "CGP_separate_decoder_temporal_attention_mamba": ["baseline", "CG", "GP", "P", "C", "G"],
     "CGK_separate_decoder_temporal_attention_no_terrain": ["baseline", "CG", "GK", "K", "C", "G"],
+    "GA_Q1_fire_domain_adversarial": ["GA"],
+    "GA_Q2_fire_domain_mmd": ["GA"],
+    "GA_R_mask_guided_regression_attention": ["GA"],
+    "GA_S_regression_moe": ["GA"],
+    "GA_T_supervised_contrastive": ["GA"],
+    "GA_U_physical_state_aux": ["GA"],
+    "GPK_mamba_no_terrain": ["GP", "GK"],
+    "CGPK_temporal_mamba_no_terrain": ["CGP", "GK"],
+    "GAK_resblocks_no_terrain": ["GA", "GK"],
+    "CGP_R_mask_guided_regression_attention": ["CGP"],
+    "GP_R_mask_guided_regression_attention": ["GP"],
+    "GK_R_mask_guided_regression_attention": ["GK"],
 }
 INDIVIDUAL_COMPONENTS = {
     "A_resblocks": ["A"], "B_multiscale_context": ["B"], "C_temporal_attention": ["C"],
@@ -94,13 +171,25 @@ for references in COMBINATION_REFERENCES.values():
 PARENT_DELTA_COLUMNS = [
     f"Delta vs {reference} {metric}"
     for reference in PARENT_REFERENCES
-    for metric in PRIMARY_METRICS
+    for metric in PARENT_METRICS
 ]
 BASE_COLUMNS = [
     "Ablation", "Components", "Change", "Parameters", "Train Time / Epoch",
-    "Peak GPU Memory", "Best Epoch", *METRIC_COLUMNS, *DELTA_COLUMNS, "Run directory",
+    "Peak GPU Memory", "Best Epoch", *FULL_VALIDATION_COLUMNS, *FULL_VALIDATION_NO_FIRE_COLUMNS, *METRIC_COLUMNS, *DELTA_COLUMNS, "Run directory",
 ]
-COLUMNS = [*BASE_COLUMNS[:-1], *PARENT_DELTA_COLUMNS, "Run directory"]
+LEGACY_DELTA_COLUMNS = [name.replace("Delta Full Val ", "Delta Val ") for name in DELTA_COLUMNS]
+LEGACY_PARENT_DELTA_COLUMNS = [
+    f"Delta vs {reference} {LEGACY_FULL_COLUMN_FALLBACKS[metric]}"
+    for reference in PARENT_REFERENCES
+    for metric in PARENT_METRICS
+]
+COLUMNS = [
+    *BASE_COLUMNS[:-1],
+    *PARENT_DELTA_COLUMNS,
+    *LEGACY_DELTA_COLUMNS,
+    *LEGACY_PARENT_DELTA_COLUMNS,
+    "Run directory",
+]
 
 
 def finite_or_none(value: Any) -> int | float | str | None:
@@ -126,7 +215,16 @@ def discover_rows(root: Path, registry_path: Path = REGISTRY_PATH) -> list[dict[
     for metrics_path in sorted(root.glob("*/*/metrics.json")):
         payload = json.loads(metrics_path.read_text(encoding="utf-8"))
         metrics = payload.get("best_epoch_metrics", {})
+        if not isinstance(metrics, Mapping):
+            metrics = {}
+        screening = payload.get("best_screening_validation")
+        if isinstance(screening, Mapping):
+            metrics = {**metrics, "validation": dict(screening)}
+        training_section = payload.get("training")
+        if isinstance(training_section, Mapping) and isinstance(training_section.get("best_epoch_metrics"), Mapping):
+            metrics = {**metrics, "train": dict(training_section["best_epoch_metrics"])}
         history_row: dict[str, Any] = {}
+        history_rows: list[dict[str, Any]] = []
         history_path = metrics_path.parent / "training_history.csv"
         if history_path.is_file():
             with history_path.open(encoding="utf-8", newline="") as handle:
@@ -153,12 +251,48 @@ def discover_rows(root: Path, registry_path: Path = REGISTRY_PATH) -> list[dict[
             "_short_name": str(payload.get("short_name", entry.get("short_name", components[0] if len(components) == 1 else ablation))),
             "_mtime": metrics_path.stat().st_mtime,
         }
+        final_metrics = payload.get("final_epoch_metrics", {})
+        final_history_row = history_rows[-1] if history_path.is_file() and history_rows else {}
         for column, (split, metric) in METRIC_COLUMNS.items():
-            value = metrics.get(split, {}).get(metric)
+            if metric == "mask_guidance_alpha":
+                value = final_metrics.get(split, {}).get(metric)
+                if value is None:
+                    prefix = "train" if split == "train" else "val"
+                    value = final_history_row.get(f"{prefix}_{metric}")
+            else:
+                value = metrics.get(split, {}).get(metric)
             if value is None:
                 prefix = "train" if split == "train" else "val"
                 value = history_row.get(f"{prefix}_{metric}")
+                if value is None and metric == "fire_patch_count":
+                    value = history_row.get(f"{prefix}_active_patch_count")
             row[column] = finite_or_none(value)
+        full_metrics: dict[str, Any] = {}
+        full_path = metrics_path.parent / "full_validation_metrics.json"
+        if full_path.is_file():
+            full_payload = json.loads(full_path.read_text(encoding="utf-8"))
+            nested = full_payload.get("metrics", full_payload)
+            if isinstance(nested, Mapping):
+                full_metrics.update(nested)
+        elif isinstance(payload.get("full_validation"), Mapping):
+            full_metrics.update(payload["full_validation"])
+
+        # Backward-compatible recovery only: old runs may have a no-fire-only
+        # sidecar, but new runs must use full_validation_metrics.json.
+        sidecar_path = metrics_path.parent / "no_fire_metrics.json"
+        if sidecar_path.is_file():
+            sidecar_payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+            nested_metrics = sidecar_payload.get("metrics", sidecar_payload)
+            if isinstance(nested_metrics, Mapping):
+                for key, value in nested_metrics.items():
+                    full_metrics.setdefault(str(key), value)
+        if "full_val_no_fire_patch_percent" not in full_metrics and "full_val_no_fire_percent" in full_metrics:
+            full_metrics["full_val_no_fire_patch_percent"] = full_metrics["full_val_no_fire_percent"]
+        for column, metric in {**FULL_VALIDATION_COLUMNS, **FULL_VALIDATION_NO_FIRE_COLUMNS}.items():
+            row[column] = finite_or_none(full_metrics.get(metric))
+        for full_column, legacy_column in LEGACY_FULL_COLUMN_FALLBACKS.items():
+            if full_column in row:
+                row[legacy_column] = row[full_column]
         rows.append(row)
     rows.sort(key=lambda row: (str(row["Ablation"]), str(row["Run directory"])))
     return rows
@@ -173,13 +307,25 @@ def latest_rows_by_ablation(rows: list[dict[str, Any]]) -> dict[str, dict[str, A
     return latest
 
 
+def _row_metric(row: Mapping[str, Any] | None, metric: str) -> Any:
+    if row is None:
+        return None
+    value = row.get(metric)
+    if value is not None:
+        return value
+    legacy = LEGACY_FULL_COLUMN_FALLBACKS.get(metric)
+    return row.get(legacy) if legacy is not None else None
+
+
 def add_baseline_deltas(rows: list[dict[str, Any]]) -> None:
     baseline = latest_rows_by_ablation(rows).get("baseline")
     for row in rows:
         for delta_column, metric_column in DELTA_COLUMNS.items():
-            value = row.get(metric_column)
-            reference = baseline.get(metric_column) if baseline else None
-            row[delta_column] = None if value is None or reference is None else float(value) - float(reference)
+            value = _row_metric(row, metric_column)
+            reference = _row_metric(baseline, metric_column)
+            delta = None if value is None or reference is None else float(value) - float(reference)
+            row[delta_column] = delta
+            row[delta_column.replace("Delta Full Val ", "Delta Val ")] = delta
 
 
 def add_parent_deltas(rows: list[dict[str, Any]]) -> None:
@@ -189,13 +335,16 @@ def add_parent_deltas(rows: list[dict[str, Any]]) -> None:
         for reference in COMBINATION_REFERENCES.get(str(row["Ablation"]), []):
             reference_row = latest.get(REFERENCE_NAMES[reference])
             metric_deltas: dict[str, float | None] = {}
-            for metric in PRIMARY_METRICS:
-                value = row.get(metric)
-                reference_value = reference_row.get(metric) if reference_row else None
+            for metric in PARENT_METRICS:
+                value = _row_metric(row, metric)
+                reference_value = _row_metric(reference_row, metric)
                 delta = None if value is None or reference_value is None else float(value) - float(reference_value)
                 metric_deltas[metric] = delta
+                legacy_metric = LEGACY_FULL_COLUMN_FALLBACKS[metric]
+                metric_deltas[legacy_metric] = delta
                 if reference != "baseline":
                     row[f"Delta vs {reference} {metric}"] = delta
+                    row[f"Delta vs {reference} {legacy_metric}"] = delta
             parent_deltas[reference] = metric_deltas
         row["_parent_deltas"] = parent_deltas
 
@@ -209,21 +358,21 @@ def display(value: Any) -> str:
 
 
 def best_line(rows: list[dict[str, Any]], label: str, column: str, maximize: bool) -> str:
-    candidates = [row for row in rows if isinstance(row.get(column), (int, float))]
+    candidates = [row for row in rows if isinstance(_row_metric(row, column), (int, float))]
     if not candidates:
         return f"{label}: N/A"
-    selected = (max if maximize else min)(candidates, key=lambda row: float(row[column]))
-    return f"{label}: {selected['Ablation']} ({display(selected[column])})"
+    selected = (max if maximize else min)(candidates, key=lambda row: float(_row_metric(row, column)))
+    return f"{label}: {selected['Ablation']} ({display(_row_metric(selected, column))})"
 
 
 def best_metric_lines(rows: list[dict[str, Any]], prefix: str = "Best") -> list[str]:
     return [
-        best_line(rows, f"{prefix} Val Dice", "Val Dice", True),
-        best_line(rows, f"{prefix} Val IoU", "Val IoU", True),
-        best_line(rows, f"{prefix} Energy", "Val Energy Log MAE", False),
-        best_line(rows, f"{prefix} Surface", "Val Surface MAE", False),
-        best_line(rows, f"{prefix} Canopy", "Val Canopy MAE", False),
-        best_line(rows, f"{prefix} Active Canopy", "Val Active Canopy MAE", False),
+        best_line(rows, f"{prefix} Full Val Dice", "Full Val Dice", True),
+        best_line(rows, f"{prefix} Full Val IoU", "Full Val IoU", True),
+        best_line(rows, f"{prefix} Full Val Energy", "Full Val Energy Log MAE", False),
+        best_line(rows, f"{prefix} Full Val Surface", "Full Val Surface MAE", False),
+        best_line(rows, f"{prefix} Full Val Canopy", "Full Val Canopy MAE", False),
+        best_line(rows, f"{prefix} Full Val Active Canopy", "Full Val Active Canopy MAE", False),
     ]
 
 
@@ -239,8 +388,8 @@ def comparison_status(value: Any, reference: Any, maximize: bool) -> str:
 def comparison_summary(row: dict[str, Any], reference: dict[str, Any] | None) -> dict[str, list[str]]:
     summary = {status: [] for status in ("improved", "regressed", "tied", "unavailable")}
     for metric, maximize in PRIMARY_METRICS.items():
-        status = comparison_status(row.get(metric), reference.get(metric) if reference else None, maximize)
-        summary[status].append(metric.removeprefix("Val "))
+        status = comparison_status(_row_metric(row, metric), _row_metric(reference, metric), maximize)
+        summary[status].append(metric.removeprefix("Full Val "))
     return summary
 
 
@@ -272,15 +421,48 @@ def all_metric_improvers(rows: list[dict[str, Any]]) -> list[str]:
     if baseline is None:
         return []
     improved: list[str] = []
-    for name in COMBINATION_REFERENCES:
-        row = latest.get(name)
-        if row is None:
+    for name, row in latest.items():
+        if name == "baseline":
             continue
-        statuses = [comparison_status(row.get(metric), baseline.get(metric), maximize) for metric, maximize in PRIMARY_METRICS.items()]
-        available = [status for status in statuses if status != "unavailable"]
-        if available and all(status == "improved" for status in available):
+        statuses = [comparison_status(_row_metric(row, metric), _row_metric(baseline, metric), maximize) for metric, maximize in PRIMARY_METRICS.items()]
+        if len(statuses) == len(PRIMARY_METRICS) and all(status == "improved" for status in statuses):
             improved.append(str(row.get("_short_name", name)))
-    return improved
+    return sorted(improved)
+
+
+def pareto_candidates(rows: list[dict[str, Any]]) -> list[str]:
+    """Return latest runs not dominated on their available primary metrics."""
+    latest_rows = list(latest_rows_by_ablation(rows).values())
+    candidates: list[str] = []
+    for candidate in latest_rows:
+        candidate_metrics = {
+            metric for metric in PRIMARY_METRICS
+            if isinstance(_row_metric(candidate, metric), (int, float))
+        }
+        if not candidate_metrics:
+            continue
+        dominated = False
+        for challenger in latest_rows:
+            if challenger is candidate:
+                continue
+            challenger_metrics = {
+                metric for metric in PRIMARY_METRICS
+                if isinstance(_row_metric(challenger, metric), (int, float))
+            }
+            # Missing candidate metrics are ignored. A challenger must cover every
+            # metric the candidate does report; no value is ever fabricated.
+            if not candidate_metrics.issubset(challenger_metrics):
+                continue
+            statuses = [
+                comparison_status(_row_metric(challenger, metric), _row_metric(candidate, metric), PRIMARY_METRICS[metric])
+                for metric in candidate_metrics
+            ]
+            if all(status in {"improved", "tied"} for status in statuses) and any(status == "improved" for status in statuses):
+                dominated = True
+                break
+        if not dominated:
+            candidates.append(str(candidate.get("_short_name", candidate["Ablation"])))
+    return sorted(candidates)
 
 
 def text_footer(rows: list[dict[str, Any]]) -> list[str]:
@@ -288,6 +470,7 @@ def text_footer(rows: list[dict[str, Any]]) -> list[str]:
     individuals = [row for row in rows if row["Ablation"] != "baseline" and len(row.get("_components", [])) <= 1]
     combinations = [row for row in rows if len(row.get("_components", [])) >= 2]
     improvers = all_metric_improvers(rows)
+    pareto = pareto_candidates(rows)
     return [
         separator,
         "BEST INDIVIDUAL ABLATIONS",
@@ -300,12 +483,19 @@ def text_footer(rows: list[dict[str, Any]]) -> list[str]:
         *best_metric_lines(combinations, "Best combination"),
         "",
         separator,
-        "BEST OVERALL ACROSS ALL RUNS",
+        "BEST FULL-VALIDATION RESULTS",
         separator,
         *best_metric_lines(rows, "Best"),
+        best_line(rows, "Lowest No-Fire Pixel FP", "Full Val No-Fire Pixel FP Rate", False),
+        best_line(rows, "Lowest No-Fire Patch FP", "Full Val No-Fire Patch FP Rate", False),
+        best_line(rows, "Lowest No-Fire Energy Prediction", "Full Val No-Fire Energy Log Pred Mean", False),
+        best_line(rows, "Lowest No-Fire Canopy Prediction", "Full Val No-Fire Canopy Pred Mean", False),
         "",
-        "Combination(s) that improve ALL available primary validation metrics relative to baseline: "
-        + (", ".join(improvers) if improvers else "None"),
+        "MODELS IMPROVING ALL PRIMARY FULL-VALIDATION METRICS VS BASELINE",
+        ", ".join(improvers) if improvers else "None",
+        "",
+        "PARETO / NON-DOMINATED CANDIDATES",
+        ", ".join(pareto) if pareto else "None",
     ]
 
 
@@ -313,12 +503,19 @@ def markdown_footer(rows: list[dict[str, Any]]) -> list[str]:
     individuals = [row for row in rows if row["Ablation"] != "baseline" and len(row.get("_components", [])) <= 1]
     combinations = [row for row in rows if len(row.get("_components", [])) >= 2]
     improvers = all_metric_improvers(rows)
+    pareto = pareto_candidates(rows)
     return [
         "## Best Individual Ablations", "", *best_metric_lines(individuals, "Best individual"), "",
         "## Best Combinations", "", *best_metric_lines(combinations, "Best combination"), "",
-        "## Best Overall Across All Runs", "", *best_metric_lines(rows, "Best"), "",
-        "Combination(s) that improve ALL available primary validation metrics relative to baseline: "
-        + (", ".join(improvers) if improvers else "None"), "",
+        "## Best Full-Validation Results", "", *best_metric_lines(rows, "Best"),
+        best_line(rows, "Lowest No-Fire Pixel FP", "Full Val No-Fire Pixel FP Rate", False),
+        best_line(rows, "Lowest No-Fire Patch FP", "Full Val No-Fire Patch FP Rate", False),
+        best_line(rows, "Lowest No-Fire Energy Prediction", "Full Val No-Fire Energy Log Pred Mean", False),
+        best_line(rows, "Lowest No-Fire Canopy Prediction", "Full Val No-Fire Canopy Pred Mean", False), "",
+        "## Models Improving All Primary Full-Validation Metrics vs Baseline", "",
+        ", ".join(improvers) if improvers else "None", "",
+        "## Pareto / Non-Dominated Candidates", "",
+        ", ".join(pareto) if pareto else "None", "",
     ]
 
 

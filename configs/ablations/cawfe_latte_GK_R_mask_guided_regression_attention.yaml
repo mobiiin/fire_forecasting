@@ -1,0 +1,23 @@
+base_config: cawfe_latte_baseline.yaml
+
+experiment:
+  name: cawfe_latte_ablation_GK_R_mask_guided_regression_attention
+
+model:
+  architecture: cawfe_latte
+
+cawfe_latte:
+  ablation:
+    name: GK_R_mask_guided_regression_attention
+  decoder:
+    type: separate_regression
+  terrain_film:
+    enabled: false
+  mask_guided_regression:
+    enabled: true
+    alpha_init: 0.0
+    attention_activation: sigmoid
+
+training:
+  output:
+    root_dir: artifacts/ablations/cawfe_latte/GK_R_mask_guided_regression_attention

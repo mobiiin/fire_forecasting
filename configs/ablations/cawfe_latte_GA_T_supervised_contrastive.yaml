@@ -1,0 +1,25 @@
+base_config: cawfe_latte_baseline.yaml
+
+experiment:
+  name: cawfe_latte_ablation_GA_T_supervised_contrastive
+
+model:
+  architecture: cawfe_latte
+
+cawfe_latte:
+  ablation:
+    name: GA_T_supervised_contrastive
+  post_fusion_backbone:
+    type: residual_spatiotemporal
+    num_blocks: 6
+  decoder:
+    type: separate_regression
+  supervised_contrastive:
+    enabled: true
+    projection_dim: 64
+    temperature: 0.1
+    loss_weight: 0.05
+
+training:
+  output:
+    root_dir: artifacts/ablations/cawfe_latte/GA_T_supervised_contrastive
