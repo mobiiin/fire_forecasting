@@ -1,0 +1,30 @@
+schema_version: 1
+seeds: [42, 123, 2026]
+baselines:
+  persistence:
+    display_name: Persistence
+    learned: false
+    config_path: configs/table2_baselines/persistence.yaml
+  linear_extrapolation:
+    display_name: Linear extrapolation
+    learned: false
+    config_path: configs/table2_baselines/linear_extrapolation.yaml
+  convlstm_unet:
+    display_name: ConvLSTM U-Net
+    learned: true
+    config_path: configs/table2_baselines/convlstm_unet.yaml
+  earthformer_lite:
+    display_name: Earthformer-lite
+    learned: true
+    config_path: configs/table2_baselines/earthformer_lite.yaml
+  cawfe_st_mamba:
+    display_name: CAWFE-ST-Mamba
+    learned: true
+    config_path: configs/table2_baselines/cawfe_st_mamba.yaml
+cawfe_latte_rows:
+  cawfe_latte_baseline:
+    display_name: CAWFE-Latte baseline
+    finalist: baseline
+  cawfe_latte_final:
+    display_name: CAWFE-Latte (final)
+    finalist: GA_Q2

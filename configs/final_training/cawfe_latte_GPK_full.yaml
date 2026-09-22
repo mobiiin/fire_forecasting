@@ -1,0 +1,48 @@
+base_config: ../ablations/cawfe_latte_GPK_mamba_no_terrain.yaml
+
+experiment:
+  name: cawfe_latte_final_GPK
+  description: Full-training finalist run for exact ablation GPK_mamba_no_terrain.
+
+final_training:
+  finalist: GPK
+  source_ablation: GPK_mamba_no_terrain
+  components: [G, P, K]
+
+training:
+  seed: 42
+  max_epochs: 60
+  epochs: 60
+  max_train_batches_per_epoch: null
+  max_train_batches: 7500
+  run_external_test_after_training: false
+  run_test_after_training: false
+  early_stopping:
+    enabled: true
+    monitor: val_loss
+    mode: min
+    patience: 8
+    min_delta: 0.001
+    start_epoch: 10
+    restore_best_weights: false
+    checkpoint_best: true
+    save_latest_on_stop: true
+    verbose: true
+    stop_on_nan: true
+  performance:
+    cudnn_benchmark: false
+    max_train_batches_per_epoch: null
+  validation:
+    full:
+      save_analysis_data: true
+      qualitative_index_path: artifacts/full_training/shared_analysis/qualitative_validation_samples.json
+      qualitative_seed: 24680
+      qualitative_samples_per_group: 4
+  output:
+    root_dir: artifacts/final_training/cawfe_latte/GPK/seed_42
+    flat_run_layout: true
+    update_architecture_latest_checkpoint: false
+    save_best_checkpoint: true
+    save_latest_checkpoint: true
+logging:
+  step_log_interval: 50

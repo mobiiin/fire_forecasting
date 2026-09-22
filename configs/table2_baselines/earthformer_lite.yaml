@@ -1,0 +1,69 @@
+base_config: ../final_training/cawfe_latte_baseline_full.yaml
+
+experiment:
+  name: table2_earthformer_lite
+  description: Standalone Earthformer-inspired axial cuboid-attention Table 2 baseline.
+
+model:
+  architecture: earthformer_lite
+  name: earthformer_lite
+  input_sequence_length: 5
+  input_channels: 129
+  output_channels: 4
+  output_activation: null
+
+earthformer_lite:
+  input_sequence_length: 5
+  patch_size: 64
+  embed_dim: 64
+  depths: [2, 2]
+  num_heads: [4, 8]
+  mlp_ratio: 4.0
+  dropout: 0.0
+  attention_dropout: 0.0
+  drop_path: 0.1
+  attention_pattern: axial
+  use_shifted_windows: false
+  use_global_vectors: true
+  num_global_vectors: 8
+  downsample_stages: 2
+  patch_merge_factor: 2
+  use_time_pos_embed: true
+  use_space_pos_embed: true
+  temporal_readout: attention_pool
+  output_mode: final_step
+  output_channels: 4
+  gradient_checkpointing: false
+  required_patch_divisibility: 16
+
+final_training:
+  finalist: earthformer_lite
+  source_ablation: null
+  components: [standalone_earthformer_lite]
+
+table2:
+  baseline_name: earthformer_lite
+  display_name: Earthformer-lite
+  learned: true
+  qualitative_test_index_path: artifacts/table2_baselines/shared/qualitative_test_samples.json
+  qualitative_seed: 97531
+  qualitative_samples_per_group: 4
+  output_root: artifacts/table2_baselines/earthformer_lite
+  locked_test_split: true
+
+training:
+  seed: 42
+  batch_size: 8
+  max_train_batches: 7500
+  max_epochs: 60
+  epochs: 60
+  gradient_accumulation_steps: 1
+  run_external_test_after_training: false
+  run_test_after_training: false
+  save_fusion_vectors:
+    enabled: false
+  output:
+    root_dir: artifacts/table2_baselines/earthformer_lite/seed_42
+    flat_run_layout: true
+    update_architecture_latest_checkpoint: false
+

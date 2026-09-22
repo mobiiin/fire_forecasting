@@ -206,8 +206,18 @@ def compute_metrics(y_pred: torch.Tensor, y_true: torch.Tensor, config) -> dict[
 				results["no_fire_patch_false_positive_rate"] = float(mask_pred[no_fire_patches].flatten(1).any(dim=1).to(dtype=torch.float32).mean().item())
 				results["no_fire_surface_pred_mean"] = float(pred_surface[no_fire_patches].mean().item())
 				results["no_fire_canopy_pred_mean"] = float(pred_canopy[no_fire_patches].mean().item())
+				results["no_fire_surface_abs_pred_mean"] = float(pred_surface[no_fire_patches].abs().mean().item())
+				results["no_fire_canopy_abs_pred_mean"] = float(pred_canopy[no_fire_patches].abs().mean().item())
+				results["no_fire_surface_mae"] = float(surface_abs_error[no_fire_patches].mean().item())
+				results["no_fire_canopy_mae"] = float(canopy_abs_error[no_fire_patches].mean().item())
 			else:
-				for name in ("no_fire_mask_prob_mean", "no_fire_mask_false_positive_rate", "no_fire_patch_false_positive_rate", "no_fire_surface_pred_mean", "no_fire_canopy_pred_mean"): results[name] = math.nan
+				for name in (
+					"no_fire_mask_prob_mean", "no_fire_mask_false_positive_rate",
+					"no_fire_patch_false_positive_rate", "no_fire_surface_pred_mean",
+					"no_fire_canopy_pred_mean", "no_fire_surface_abs_pred_mean",
+					"no_fire_canopy_abs_pred_mean", "no_fire_surface_mae", "no_fire_canopy_mae",
+				):
+					results[name] = math.nan
 			if energy_output_names:
 				pred_energy_log = y_pred[:, 3:4]
 				true_energy_log = y_true[:, 3:4]
@@ -282,9 +292,13 @@ def compute_metrics(y_pred: torch.Tensor, y_true: torch.Tensor, config) -> dict[
 				results["energy_active_fraction"] = float(true_energy_active.mean().item())
 				if no_fire_patches.any():
 					results["no_fire_energy_log_pred_mean"] = float(pred_energy_log[no_fire_patches].mean().item())
+					results["no_fire_energy_log_abs_pred_mean"] = float(pred_energy_log[no_fire_patches].abs().mean().item())
+					results["no_fire_energy_log_mae"] = float(energy_log_abs_error[no_fire_patches].mean().item())
 					results["no_fire_energy_mw_pred_mean"] = float(torch.clamp(torch.expm1(pred_energy_log[no_fire_patches]), min=0.0).mean().item())
 				else:
 					results["no_fire_energy_log_pred_mean"] = math.nan
+					results["no_fire_energy_log_abs_pred_mean"] = math.nan
+					results["no_fire_energy_log_mae"] = math.nan
 					results["no_fire_energy_mw_pred_mean"] = math.nan
 			return results
 

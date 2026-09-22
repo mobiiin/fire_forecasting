@@ -17,6 +17,7 @@ import numpy as np
 from src.evaluation.fire_activity import (
     ACTIVE_FRACTION_THRESHOLD,
     FIRE_MASK_THRESHOLD,
+    active_fraction_bin_name,
     classify_patch_fire_state,
 )
 
@@ -24,6 +25,10 @@ from src.evaluation.fire_activity import (
 DEFAULT_SCREENING_INDEX_PATH = Path(
     "artifacts/ablations/cawfe_latte/shared_validation/screening_validation_indices.json"
 )
+DEFAULT_QUALITATIVE_INDEX_PATH = Path(
+    "artifacts/full_training/shared_analysis/qualitative_validation_samples.json"
+)
+QUALITATIVE_SELECTION_SEED = 24680
 
 
 def _sha256_file(path: Path) -> str:
@@ -111,6 +116,7 @@ def classify_validation_records(
                 "class": "fire" if state["has_fire"] else "no_fire",
                 "active_pixels": int(state["active_pixels"]),
                 "active_fraction": float(state["active_fraction"]),
+                "activity_bin": active_fraction_bin_name(float(state["active_fraction"])),
             }
         )
         completed = index + 1
@@ -318,9 +324,145 @@ def ensure_screening_validation_indices(
         return payload
 
 
+def _qualitative_group(activity_bin: str) -> str:
+    name = str(activity_bin)
+    if name == "no_fire":
+        return "no_fire"
+    if name in {"tiny_fire", "small_fire"}:
+        return "weak_fire"
+    if name in {"medium_fire", "large_fire"}:
+        return name
+    raise ValueError(f"Unknown canonical activity bin: {name!r}")
+
+
+def select_qualitative_samples(
+    classified: Sequence[Mapping[str, Any]],
+    *,
+    per_group: int = 4,
+    seed: int = QUALITATIVE_SELECTION_SEED,
+) -> list[dict[str, Any]]:
+    """Select a deterministic, fire-diverse qualitative subset without model outputs."""
+
+    requested = max(1, int(per_group))
+    group_order = ("no_fire", "weak_fire", "medium_fire", "large_fire")
+    grouped: dict[str, dict[str, list[dict[str, Any]]]] = {
+        group: defaultdict(list) for group in group_order
+    }
+    for raw_item in classified:
+        item = dict(raw_item)
+        activity_bin = str(item.get("activity_bin", active_fraction_bin_name(float(item["active_fraction"]))))
+        item["activity_bin"] = activity_bin
+        group = _qualitative_group(activity_bin)
+        grouped[group][str(item["fire_name"])].append(item)
+
+    selected: list[dict[str, Any]] = []
+    for group in group_order:
+        candidates_by_fire = grouped[group]
+        for fire_name, candidates in candidates_by_fire.items():
+            candidates.sort(key=lambda item: _stable_seed(seed, group, fire_name, str(item["sample_id"])))
+        fire_names = sorted(
+            candidates_by_fire,
+            key=lambda fire_name: _stable_seed(seed, group, fire_name, "fire_order"),
+        )
+        group_selected: list[dict[str, Any]] = []
+        offset = 0
+        while len(group_selected) < requested:
+            added = False
+            for fire_name in fire_names:
+                candidates = candidates_by_fire[fire_name]
+                if offset < len(candidates):
+                    group_selected.append(candidates[offset])
+                    added = True
+                    if len(group_selected) >= requested:
+                        break
+            if not added:
+                break
+            offset += 1
+        for item in group_selected:
+            selected.append(
+                {
+                    "index": int(item["index"]),
+                    "sample_id": str(item["sample_id"]),
+                    "fire_name": str(item["fire_name"]),
+                    "activity_bin": str(item["activity_bin"]),
+                    "active_fraction": float(item["active_fraction"]),
+                    "selection_group": group,
+                }
+            )
+    if len({item["sample_id"] for item in selected}) != len(selected):
+        raise RuntimeError("Qualitative selection produced duplicate sample IDs.")
+    return selected
+
+
+def ensure_qualitative_validation_samples(
+    dataset: Any,
+    config: Mapping[str, Any],
+    *,
+    output_path: str | Path = DEFAULT_QUALITATIVE_INDEX_PATH,
+    per_group: int = 4,
+    seed: int = QUALITATIVE_SELECTION_SEED,
+    logger: Any = None,
+) -> dict[str, Any]:
+    """Create or reuse one dataset-identified qualitative validation subset."""
+
+    path = Path(output_path).expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    index_path = Path(getattr(dataset, "sample_index_path", "")).expanduser().resolve()
+    if not index_path.is_file():
+        raise FileNotFoundError(f"Validation sample index is missing: {index_path}")
+    identity = {
+        "dataset_root": str(Path(getattr(dataset, "root", ".")).expanduser().resolve()),
+        "sample_index_path": str(index_path),
+        "sample_index_sha256": _sha256_file(index_path),
+        "split": str(getattr(dataset, "split", "val")),
+        "dataset_length": len(dataset),
+        "selection_seed": int(seed),
+        "samples_per_group": int(per_group),
+        "groups": ["no_fire", "weak_fire", "medium_fire", "large_fire"],
+        "canonical_activity_bins": ["no_fire", "tiny_fire", "small_fire", "medium_fire", "large_fire"],
+    }
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with lock_path.open("a+", encoding="utf-8") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        if path.is_file():
+            existing = json.loads(path.read_text(encoding="utf-8"))
+            if existing.get("identity") == identity:
+                samples = existing.get("selected_samples", [])
+                if len({str(item["sample_id"]) for item in samples}) != len(samples):
+                    raise RuntimeError(f"Existing qualitative subset contains duplicate IDs: {path}")
+                if logger is not None:
+                    logger.info("Reusing shared qualitative validation samples: %s", path)
+                return existing
+            if logger is not None:
+                logger.warning("Qualitative validation identity changed; regenerating %s", path)
+
+        classified = classify_validation_records(dataset, logger=logger)
+        samples = select_qualitative_samples(classified, per_group=per_group, seed=seed)
+        counts: dict[str, int] = Counter(str(item["selection_group"]) for item in samples)
+        payload = {
+            "schema_version": 1,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "selection_rule": "target_only_canonical_activity_bins_fire_diverse_fixed_seed",
+            "identity": identity,
+            "selected_sample_count": len(samples),
+            "counts_by_selection_group": {group: int(counts.get(group, 0)) for group in identity["groups"]},
+            "selected_sample_ids": [item["sample_id"] for item in samples],
+            "selected_samples": samples,
+        }
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        temporary.replace(path)
+        if logger is not None:
+            logger.info("Saved shared qualitative validation samples: %s", path)
+        return payload
+
+
 __all__ = [
+    "DEFAULT_QUALITATIVE_INDEX_PATH",
     "DEFAULT_SCREENING_INDEX_PATH",
     "classify_validation_records",
+    "ensure_qualitative_validation_samples",
     "ensure_screening_validation_indices",
+    "select_qualitative_samples",
     "select_stratified_indices",
 ]

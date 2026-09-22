@@ -10,6 +10,7 @@ import math
 import os
 import re
 import socket
+import statistics
 import subprocess
 import sys
 import time
@@ -963,6 +964,9 @@ def _run_epoch(
 	logger=None,
 	epoch_number: int | None = None,
 	timing_csv_path: Path | None = None,
+	global_step_start: int = 0,
+	step_log_interval: int = 0,
+	step_history_path: Path | None = None,
 ) -> dict[str, float]:
 	"""Execute one train or validation epoch and return averaged losses/metrics."""
 
@@ -1009,6 +1013,10 @@ def _run_epoch(
 	loss_component_weights: dict[str, float] = defaultdict(float)
 	timing_totals: dict[str, float] = defaultdict(float)
 	timing_rows: list[dict[str, Any]] = []
+	step_rows: list[dict[str, Any]] = []
+	optimization_steps_completed = 0
+	gradient_norm_total = None
+	gradient_norm_count = 0
 	epoch_start_time = time.perf_counter()
 	total_loader_batches = len(loader)
 	selected_batch_indices = None if batch_indices is None else sorted({int(index) for index in batch_indices})
@@ -1082,6 +1090,7 @@ def _run_epoch(
 		optimizer_time = 0.0
 		metrics_time = 0.0
 		batch_metrics: dict[str, float] = {}
+		batch_gradient_norm = None
 		with torch.set_grad_enabled(train):
 			with _maybe_autocast(device, amp_dtype):
 				forward_start_time = time.perf_counter()
@@ -1167,7 +1176,8 @@ def _run_epoch(
 					scaler.scale(loss_for_backward).backward()
 					if should_step and gradient_clip_norm is not None:
 						scaler.unscale_(optimizer)
-						torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
+						gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
+						batch_gradient_norm = gradient_norm.detach().float()
 					_sync_if_timing()
 					backward_time = time.perf_counter() - backward_start_time
 					if should_step:
@@ -1180,7 +1190,8 @@ def _run_epoch(
 					backward_start_time = time.perf_counter()
 					loss_for_backward.backward()
 					if should_step and gradient_clip_norm is not None:
-						torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
+						gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
+						batch_gradient_norm = gradient_norm.detach().float()
 					_sync_if_timing()
 					backward_time = time.perf_counter() - backward_start_time
 					if should_step:
@@ -1188,6 +1199,15 @@ def _run_epoch(
 						optimizer.step()
 						_sync_if_timing()
 						optimizer_time = time.perf_counter() - optimizer_start_time
+				if should_step:
+					optimization_steps_completed += 1
+					if batch_gradient_norm is not None:
+						gradient_norm_total = (
+							batch_gradient_norm.clone()
+							if gradient_norm_total is None
+							else gradient_norm_total + batch_gradient_norm
+						)
+						gradient_norm_count += 1
 
 		batch_size = int(x_batch.shape[0])
 		batch_loss_value = float(loss.detach().item())
@@ -1197,6 +1217,19 @@ def _run_epoch(
 			component_weight = 1.0 if component_name.endswith("_fraction") else float(batch_size)
 			loss_component_totals[component_name] += float(component_value) * component_weight
 			loss_component_weights[component_name] += component_weight
+		if train and should_step and step_log_interval > 0:
+			current_global_step = int(global_step_start) + optimization_steps_completed
+			if current_global_step % int(step_log_interval) == 0:
+				step_row: dict[str, Any] = {
+					"global_step": current_global_step,
+					"epoch": epoch_number if epoch_number is not None else "",
+					"train_total_loss": batch_loss_value,
+					"learning_rate": _current_lr(optimizer),
+					"gradient_norm": float(batch_gradient_norm.item()) if batch_gradient_norm is not None else "",
+				}
+				for component_name, component_value in batch_loss_components.items():
+					step_row[f"train_{component_name}"] = float(component_value)
+				step_rows.append(step_row)
 
 		should_compute_metrics = (
 			(compute_train_metrics_every_batch or batch_number % train_metrics_every_n_batches == 0 or batch_number == total_batches)
@@ -1314,12 +1347,21 @@ def _run_epoch(
 	results[f"{desc}_batches"] = float(batch_number)
 	completed_batches = max(1, int(batch_number))
 	epoch_wall_time = time.perf_counter() - epoch_start_time
+	results[f"{desc}_epoch_seconds"] = float(epoch_wall_time)
+	if train:
+		results["train_gradient_norm"] = (
+			float((gradient_norm_total / gradient_norm_count).item())
+			if gradient_norm_total is not None and gradient_norm_count > 0
+			else math.nan
+		)
 	for timing_name, timing_total in timing_totals.items():
 		results[f"{desc}_{timing_name}_avg"] = float(timing_total) / completed_batches
 	results[f"{desc}_samples_per_second"] = float(total_samples) / max(epoch_wall_time, 1.0e-9)
 	results[f"{desc}_patches_per_second"] = float(total_samples) / max(epoch_wall_time, 1.0e-9)
 	if timing_csv_path is not None and timing_rows:
 		_log_rows_to_csv(timing_csv_path, timing_rows, append=timing_csv_path.exists())
+	if step_history_path is not None and step_rows:
+		_log_rows_to_csv(step_history_path, step_rows, append=step_history_path.exists())
 	avg_data_wait = results.get(f"{desc}_data_wait_avg", 0.0)
 	avg_forward = results.get(f"{desc}_forward_avg", 0.0)
 	avg_backward = results.get(f"{desc}_backward_avg", 0.0)
@@ -1468,11 +1510,121 @@ def _positive_int_or_none(value: Any) -> int | None:
 	return result if result > 0 else None
 
 
+TRAINING_SAMPLING_PROTOCOL_ID = "epoch_random_subset_without_replacement_v1"
+
+
 def _resolve_max_batches(config: Mapping[str, Any], split: str) -> int | None:
 	performance_config = get_performance_config(config)
 	training_config = _get_section(config, "training")
 	key = f"max_{split}_batches_per_epoch"
-	return _positive_int_or_none(performance_config.get(key, training_config.get(key)))
+	legacy_value = _positive_int_or_none(performance_config.get(key, training_config.get(key)))
+	if str(split).lower() != "train":
+		return legacy_value
+	canonical_value = _positive_int_or_none(training_config.get("max_train_batches"))
+	if canonical_value is not None and legacy_value is not None and canonical_value != legacy_value:
+		raise ValueError(
+			"Conflicting training batch limits: "
+			f"training.max_train_batches={canonical_value} but {key}={legacy_value}."
+		)
+	return canonical_value if canonical_value is not None else legacy_value
+
+
+def _epoch_subset_sampler(loader: Any) -> Any | None:
+	"""Return a loader's explicit epoch-aware subset sampler, if present."""
+
+	candidates = [getattr(loader, "sampler", None)]
+	batch_sampler = getattr(loader, "batch_sampler", None)
+	if batch_sampler is not None:
+		candidates.append(getattr(batch_sampler, "sampler", None))
+	for sampler in candidates:
+		if sampler is not None and hasattr(sampler, "set_epoch") and hasattr(sampler, "indices_for_epoch"):
+			return sampler
+	return None
+
+
+def _set_training_sampler_epoch(loader: Any, epoch_number: int) -> None:
+	sampler = _epoch_subset_sampler(loader)
+	if sampler is not None:
+		sampler.set_epoch(int(epoch_number))
+
+
+def _training_sampler_indices(loader: Any) -> tuple[int, ...]:
+	sampler = _epoch_subset_sampler(loader)
+	if sampler is None:
+		return ()
+	return tuple(int(index) for index in getattr(sampler, "last_indices", ()))
+
+
+def _build_training_sampling_protocol(
+	config: Mapping[str, Any],
+	train_loader: Any,
+	max_epochs: int,
+) -> dict[str, Any] | None:
+	"""Describe and validate the canonical partial-epoch training schedule."""
+
+	training_config = _get_section(config, "training")
+	batches_per_epoch = _positive_int_or_none(training_config.get("max_train_batches"))
+	if batches_per_epoch is None:
+		return None
+	sampler = _epoch_subset_sampler(train_loader)
+	if sampler is None:
+		raise RuntimeError(
+			"training.max_train_batches requires an epoch-aware without-replacement sampler; "
+			"the training DataLoader does not expose one."
+		)
+	batch_size = int(getattr(train_loader, "batch_size", 0) or 0)
+	if batch_size <= 0:
+		raise RuntimeError("Partial-epoch training requires a positive DataLoader batch_size.")
+	full_samples = int(len(train_loader.dataset))
+	samples_per_epoch = int(len(sampler))
+	expected_samples = batches_per_epoch * batch_size
+	if samples_per_epoch != expected_samples:
+		raise RuntimeError(
+			f"Epoch sampler emits {samples_per_epoch} samples, expected exactly {expected_samples}."
+		)
+	if len(train_loader) != batches_per_epoch:
+		raise RuntimeError(
+			f"Epoch sampler produces {len(train_loader)} batches, expected exactly {batches_per_epoch}."
+		)
+	base_seed = int(training_config.get("seed", config.get("seed", 42)))
+	return {
+		"protocol_id": TRAINING_SAMPLING_PROTOCOL_ID,
+		"full_training_samples": full_samples,
+		"batch_size": batch_size,
+		"batches_per_epoch": batches_per_epoch,
+		"samples_per_epoch": samples_per_epoch,
+		"approximate_fraction_per_epoch": samples_per_epoch / float(full_samples),
+		"sampling_within_epoch": "without_replacement",
+		"subset_changes_each_epoch": True,
+		"base_seed": base_seed,
+		"epoch_seed_rule": "base_seed + one_based_epoch",
+		"maximum_epochs": int(max_epochs),
+		"estimated_full_dataset_equivalent_epochs_at_max": (
+			float(max_epochs) * samples_per_epoch / float(full_samples)
+		),
+	}
+
+
+def _validate_resume_training_sampling_protocol(
+	current_protocol: Mapping[str, Any] | None,
+	checkpoint_protocol: Any,
+) -> None:
+	"""Reject checkpoints from the legacy full-split or another sampling budget."""
+
+	if current_protocol is None:
+		return
+	protected_keys = (
+		"protocol_id", "full_training_samples", "batch_size", "batches_per_epoch",
+		"samples_per_epoch", "sampling_within_epoch", "subset_changes_each_epoch",
+		"base_seed", "epoch_seed_rule",
+	)
+	if not isinstance(checkpoint_protocol, Mapping) or any(
+		checkpoint_protocol.get(key) != current_protocol.get(key) for key in protected_keys
+	):
+		raise RuntimeError(
+			"Refusing to resume a legacy or incompatible training-sampling checkpoint. "
+			"The 7,500-batch epoch-random protocol must start in a new run directory."
+		)
 
 
 def _model_parameter_count(model: nn.Module) -> int:
@@ -2083,6 +2235,7 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 	criterion = get_loss_function(config)
 	optimizer = _build_optimizer(model, config)
 	epochs = int(training_config.get("max_epochs", config.get("max_epochs", config.get("epochs", training_config.get("epochs", 1)))))
+	training_sampling_protocol = _build_training_sampling_protocol(config, train_loader, epochs)
 	scheduler = _build_scheduler(optimizer, config, epochs)
 
 	amp_dtype = choose_amp_dtype(config, device)
@@ -2109,8 +2262,14 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 	if resume_enabled and latest_checkpoint_path.exists():
 		logger.info("Resuming from checkpoint: %s", latest_checkpoint_path)
 		checkpoint = load_checkpoint(latest_checkpoint_path, map_location="cpu")
+		_validate_resume_training_sampling_protocol(
+			training_sampling_protocol, checkpoint.get("training_sampling_protocol")
+		)
 		validate_checkpoint_model_compatibility(model, checkpoint, latest_checkpoint_path)
-		model.load_state_dict(checkpoint["model_state_dict"])
+		# CAWFE-Latte creates its learned spatial positional parameter lazily on
+		# the first forward pass. A resumed checkpoint already contains that
+		# parameter, so materialize it before strict state-dict loading.
+		load_model_state_dict_compatible(model, checkpoint, latest_checkpoint_path)
 		if checkpoint.get("optimizer_state_dict") is not None:
 			optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 		if checkpoint.get("scheduler_state_dict") is not None and scheduler is not None:
@@ -2148,6 +2307,10 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 	append_metrics_log = metrics_log_path.exists() and start_epoch > 0
 	timing_log_path = _resolve_timing_log_path(config)
 	timing_log_path.parent.mkdir(parents=True, exist_ok=True)
+	step_log_interval = max(0, int(logging_config.get("step_log_interval", 0)))
+	step_history_path = run_manager.run_dir / "history" / "step_history.csv"
+	if step_log_interval > 0:
+		step_history_path.parent.mkdir(parents=True, exist_ok=True)
 	loader_summaries = {
 		"train": _loader_summary(train_loader),
 		"val": _loader_summary(val_loader),
@@ -2161,6 +2324,52 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 	validation_policy = resolve_validation_policy(config, val_loader=val_loader, logger=logger)
 	validation_subset_path = save_validation_subset_metadata(run_manager, validation_policy, val_loader)
 	validation_protocol_metadata = _validation_subset_metadata(validation_policy, val_loader)
+	max_train_batches = _resolve_max_batches(config, "train")
+	training_batches_per_epoch = len(train_loader) if max_train_batches is None else min(len(train_loader), int(max_train_batches))
+	training_sampling_protocol_path: Path | None = None
+	training_coverage_path: Path | None = None
+	training_coverage: bytearray | None = None
+	if training_sampling_protocol is not None:
+		training_config["sampling_protocol"] = dict(training_sampling_protocol)
+		config["training"] = training_config
+		training_sampling_protocol_path = run_manager.metadata_dir / "training_sampling_protocol.json"
+		_write_json(training_sampling_protocol_path, training_sampling_protocol)
+		training_coverage_path = run_manager.metadata_dir / "training_sample_coverage.bin"
+		full_training_samples = int(training_sampling_protocol["full_training_samples"])
+		# Reconstruct coverage from deterministic completed-epoch schedules on resume.
+		# This avoids trusting a state file that may have been written by an epoch
+		# whose validation/checkpoint did not complete before interruption.
+		training_coverage = bytearray(full_training_samples)
+		if start_epoch > 0:
+			sampler = _epoch_subset_sampler(train_loader)
+			assert sampler is not None
+			logger.info("Reconstructing temporal-sample coverage for %s completed epoch(s).", start_epoch)
+			for completed_epoch in range(1, start_epoch + 1):
+				for sample_index in sampler.indices_for_epoch(completed_epoch):
+					training_coverage[int(sample_index)] = 1
+	logger.info("TRAINING PROTOCOL")
+	if training_sampling_protocol is not None:
+		logger.info("full_training_samples=%s", training_sampling_protocol["full_training_samples"])
+		logger.info("sampled_training_samples_per_epoch=%s", training_sampling_protocol["samples_per_epoch"])
+		logger.info("train_fraction_per_epoch=%.6f", training_sampling_protocol["approximate_fraction_per_epoch"])
+		logger.info("train_batches_per_epoch=%s", training_sampling_protocol["batches_per_epoch"])
+		logger.info("batch_size=%s", training_sampling_protocol["batch_size"])
+		logger.info("subset_sampling=epoch_random_without_replacement")
+		logger.info("expected_epoch_duration=approximately_1_hour")
+		logger.info("maximum_epochs=%s", epochs)
+		logger.info(
+			"estimated_full_dataset_equivalent_epochs_at_max=%.4f",
+			training_sampling_protocol["estimated_full_dataset_equivalent_epochs_at_max"],
+		)
+	else:
+		logger.info("full_training_samples=%s", len(train_loader.dataset))
+		logger.info("train_batches_per_epoch=%s", training_batches_per_epoch)
+		logger.info("subset_sampling=full_loader_order")
+	logger.info(
+		"validation_screening_samples=%s | maximum_epochs=%s",
+		validation_policy.get("validation_samples_used", len(val_loader.dataset)),
+		epochs,
+	)
 	if validation_policy["validation_mode"] == "full_every_epoch":
 		logger.info("Validation mode: full_every_epoch")
 		logger.info("Validation batches this epoch: all")
@@ -2241,6 +2450,8 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 	)
 	if validation_subset_path is not None:
 		run_artifact_paths["validation_subset_path"] = str(validation_subset_path)
+	if training_sampling_protocol_path is not None:
+		run_artifact_paths["training_sampling_protocol_path"] = str(training_sampling_protocol_path)
 
 	logger.info("Starting training for %s epochs", epochs)
 	test_sample_count = 0 if test_loader is None else len(test_loader.dataset)
@@ -2275,6 +2486,16 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 		gradient_accumulation_steps,
 	)
 
+	cumulative_train_samples_seen = 0
+	if history_rows:
+		last_cumulative = history_rows[-1].get("cumulative_train_samples_seen")
+		if last_cumulative not in (None, "", "null"):
+			cumulative_train_samples_seen = int(float(last_cumulative))
+		else:
+			cumulative_train_samples_seen = int(
+				sum(float(row.get("train_samples_this_epoch", row.get("train_samples", 0.0))) for row in history_rows)
+			)
+
 	partial_training_result: dict[str, Any] = {
 		"start_epoch": start_epoch,
 		"epochs": epochs,
@@ -2298,6 +2519,7 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 		"final_epoch_summary": {},
 		"num_epochs_completed": start_epoch,
 		"validation": validation_protocol_metadata,
+		"training_sampling_protocol": training_sampling_protocol,
 		"early_stopping": early_stopper.state_dict(),
 		"stopped_early": False,
 		"stop_reason": "",
@@ -2342,8 +2564,14 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 					"aux_fire_support": float(_get_section(loss_config_for_meta, "auxiliary_fire_support").get("weight", 0.2)),
 				},
 			}
+		architecture_name = _get_section(config, "final_training").get(
+			"finalist", _get_section(_get_section(config, "cawfe_latte"), "ablation").get("name", architecture)
+		)
 		return {
 			"architecture": architecture,
+			"architecture_name": architecture_name,
+			"seed": seed,
+			"val_loss": float(history_rows[-1]["val_loss"]) if history_rows else best_val_loss,
 			"run_name": run_manager.run_name,
 			"run_dir": str(run_manager.run_dir),
 			"global_step": global_step,
@@ -2357,6 +2585,7 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 			"normalization_stats": str(normalization_stats_path) if normalization_stats_path is not None else None,
 			"normalization": normalization_metadata.get("train", {}),
 			"validation": validation_protocol_metadata,
+			"training_sampling_protocol": training_sampling_protocol,
 			"cache_manifest_path": run_artifact_paths.get("cache_manifest_copy_path")
 			or run_artifact_paths.get("cache_manifest_path_record"),
 			"resolved_config_path": run_artifact_paths.get("resolved_config_path"),
@@ -2398,6 +2627,7 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 		if device.type == "cuda":
 			torch.cuda.reset_peak_memory_stats(device)
 		logger.info("Epoch %s/%s", epoch_number, epochs)
+		_set_training_sampler_epoch(train_loader, epoch_number)
 		if fusion_vector_logger.enabled:
 			fusion_vector_logger.collect_epoch_vector(model, fusion_vector_batch, device, epoch_number)
 			fusion_vector_logger.save()
@@ -2421,6 +2651,63 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 			logger=logger,
 			epoch_number=epoch_number,
 			timing_csv_path=timing_log_path,
+			global_step_start=global_step,
+			step_log_interval=step_log_interval,
+			step_history_path=step_history_path,
+		)
+		actual_train_batches = int(train_results.get("train_batches", 0.0))
+		actual_train_samples = int(train_results.get("train_samples", 0.0))
+		requested_train_batches = int(max_train_batches or len(train_loader))
+		if training_sampling_protocol is not None:
+			expected_samples = int(training_sampling_protocol["samples_per_epoch"])
+			if actual_train_batches != requested_train_batches or actual_train_samples != expected_samples:
+				raise RuntimeError(
+					"Partial training epoch did not consume the exact requested budget: "
+					f"batches={actual_train_batches}/{requested_train_batches} "
+					f"samples={actual_train_samples}/{expected_samples}."
+				)
+			epoch_indices = _training_sampler_indices(train_loader)
+			if len(epoch_indices) != actual_train_samples:
+				raise RuntimeError(
+					f"Sampler recorded {len(epoch_indices)} indices for {actual_train_samples} training samples."
+				)
+			if len(set(epoch_indices)) != len(epoch_indices):
+				raise RuntimeError("Epoch-random training sampler repeated an index within one epoch.")
+			assert training_coverage is not None
+			for sample_index in epoch_indices:
+				training_coverage[sample_index] = 1
+			if training_coverage_path is not None:
+				temporary_coverage = training_coverage_path.with_suffix(training_coverage_path.suffix + ".tmp")
+				temporary_coverage.write_bytes(bytes(training_coverage))
+				temporary_coverage.replace(training_coverage_path)
+		cumulative_train_samples_seen += actual_train_samples
+		full_training_samples = int(len(train_loader.dataset))
+		unique_training_samples_seen = sum(training_coverage) if training_coverage is not None else None
+		epoch_exposure = {
+			"requested_train_batches_per_epoch": requested_train_batches,
+			"actual_train_batches": actual_train_batches,
+			"actual_train_samples": actual_train_samples,
+			"train_batches_this_epoch": actual_train_batches,
+			"train_samples_this_epoch": actual_train_samples,
+			"train_fraction_of_dataset": actual_train_samples / float(full_training_samples),
+			"cumulative_train_samples_seen": cumulative_train_samples_seen,
+			"equivalent_full_dataset_epochs": cumulative_train_samples_seen / float(full_training_samples),
+			"unique_training_samples_seen": unique_training_samples_seen,
+			"unique_training_sample_fraction": (
+				unique_training_samples_seen / float(full_training_samples)
+				if unique_training_samples_seen is not None else None
+			),
+		}
+		logger.info(
+			"Training data exposure | requested_batches=%s actual_batches=%s actual_samples=%s "
+			"fraction=%.6f cumulative_samples=%s equivalent_full_epochs=%.4f unique_samples=%s",
+			requested_train_batches,
+			actual_train_batches,
+			actual_train_samples,
+			epoch_exposure["train_fraction_of_dataset"],
+			cumulative_train_samples_seen,
+			epoch_exposure["equivalent_full_dataset_epochs"],
+			unique_training_samples_seen,
 		)
 		if bool(_get_section(_get_section(config, "cawfe_latte"), "fire_mmd").get("enabled", False)):
 			mmd_valid_fraction = float(train_results.get("train_mmd_valid_batch_fraction", 0.0))
@@ -2505,6 +2792,7 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 			"validation_samples_used": int(val_results.get("val_samples", 0.0)),
 			"is_full_validation": bool(validation_policy["is_full_validation"]),
 		}
+		row.update(epoch_exposure)
 		for metric_name, metric_value in train_results.items():
 			if metric_name != "train_loss":
 				row[metric_name] = metric_value
@@ -2520,6 +2808,17 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 				logger.info("Early stopping triggered at epoch %s: %s", epoch_number, stop_reason)
 
 		history_rows.append(row)
+		post_warmup_epoch_times = [
+			float(item["epoch_time_sec"])
+			for item in history_rows
+			if int(item.get("epoch", 0)) > 2 and item.get("epoch_time_sec") is not None
+		]
+		if post_warmup_epoch_times and statistics.median(post_warmup_epoch_times) > 90.0 * 60.0:
+			logger.warning(
+				"Median epoch duration after the first two epochs is %.1f minutes (>90 minutes). "
+				"The configured training batch budget will not be changed dynamically.",
+				statistics.median(post_warmup_epoch_times) / 60.0,
+			)
 		should_save_latest = save_latest_checkpoint and (
 			epoch_number % save_every_n_epochs == 0
 			or epoch_number == epochs
@@ -2674,7 +2973,7 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 		if best_checkpoint_path.exists():
 			checkpoint = load_checkpoint(best_checkpoint_path, map_location=device)
 			validate_checkpoint_model_compatibility(model, checkpoint, best_checkpoint_path)
-			model.load_state_dict(checkpoint["model_state_dict"])
+			load_model_state_dict_compatible(model, checkpoint, best_checkpoint_path)
 		if split_mode == "train_val_external_test":
 			test_plot_results, spatial_mode_counts = _run_external_test_epoch_with_spatial_handling(
 				model=model,
@@ -2759,6 +3058,7 @@ def train_model_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 		"history_rows": history_rows,
 		"normalization": normalization_metadata,
 		"validation": validation_protocol_metadata,
+		"training_sampling_protocol": training_sampling_protocol,
 		"full_validation": full_validation_results,
 		"test_results": test_results,
 		"early_stopping": _early_stopping_summary(),
@@ -2845,17 +3145,32 @@ def _log_to_csv(path: Path, row: Mapping[str, Any], append: bool) -> None:
 
 
 def _log_rows_to_csv(path: Path, rows: list[Mapping[str, Any]], append: bool) -> None:
-	"""Append multiple rows to a CSV file."""
+	"""Append rows while safely extending the CSV schema for optional diagnostics."""
 
 	if not rows:
 		return
 	path.parent.mkdir(parents=True, exist_ok=True)
-	fieldnames = list(rows[0].keys())
-	mode = "a" if append else "w"
-	with path.open(mode, newline="", encoding="utf-8") as handle:
-		writer = csv.DictWriter(handle, fieldnames=fieldnames)
-		if not append:
-			writer.writeheader()
+	existing_rows: list[dict[str, Any]] = []
+	fieldnames: list[str] = []
+	if append and path.is_file():
+		with path.open(newline="", encoding="utf-8") as handle:
+			reader = csv.DictReader(handle)
+			fieldnames = list(reader.fieldnames or [])
+			existing_rows = list(reader)
+	original_fieldnames = list(fieldnames)
+	for row in rows:
+		for key in row:
+			if key not in fieldnames:
+				fieldnames.append(str(key))
+	if append and path.is_file() and fieldnames == original_fieldnames:
+		with path.open("a", newline="", encoding="utf-8") as handle:
+			writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+			writer.writerows(rows)
+		return
+	with path.open("w", newline="", encoding="utf-8") as handle:
+		writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+		writer.writeheader()
+		writer.writerows(existing_rows)
 		writer.writerows(rows)
 
 
@@ -3109,7 +3424,7 @@ def evaluate_model_on_test_set(
 	logger.info("Loading checkpoint for test evaluation: %s", resolved_checkpoint_path)
 	checkpoint = load_checkpoint(resolved_checkpoint_path, map_location=device)
 	validate_checkpoint_model_compatibility(model, checkpoint, resolved_checkpoint_path)
-	model.load_state_dict(checkpoint["model_state_dict"])
+	load_model_state_dict_compatible(model, checkpoint, resolved_checkpoint_path)
 
 	test_results, spatial_mode_counts = _run_external_test_epoch_with_spatial_handling(
 		model=model,

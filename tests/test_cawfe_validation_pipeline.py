@@ -198,6 +198,14 @@ def test_full_evaluator_visits_every_sample_once_without_shuffle_or_drop_last(tm
     assert payload["evaluated_sample_count"] == 4
     assert payload["unique_sample_id_count"] == 4
     assert (tmp_path / "full_validation_per_fire.json").is_file()
+    activity_path = tmp_path / "full_validation_by_activity_bin.json"
+    assert activity_path.is_file()
+    activity = json.loads(activity_path.read_text(encoding="utf-8"))["bins"]
+    assert set(activity) == {"no_fire", "tiny_fire", "small_fire", "medium_fire", "large_fire"}
+    assert sum(item["patch_count"] for item in activity.values()) == len(loader.dataset)
+    assert result["metrics"]["full_val_energy_mw_mae"] == pytest.approx(0.0)
+    assert result["metrics"]["full_val_inference_time_seconds"] > 0.0
+    assert result["metrics"]["full_val_samples_per_second"] > 0.0
 
     bad_loader = torch.utils.data.DataLoader(_FullDataset(), batch_size=3, shuffle=False, drop_last=True)
     with pytest.raises(RuntimeError, match="drop_last=false"):

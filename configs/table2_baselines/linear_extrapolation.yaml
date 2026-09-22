@@ -1,0 +1,30 @@
+base_config: ../final_training/cawfe_latte_baseline_full.yaml
+
+experiment:
+  name: table2_linear_extrapolation
+  description: Leakage-safe equal-step linear extrapolation benchmark on sparse5_h10.
+
+model:
+  architecture: linear_extrapolation
+  name: linear_extrapolation
+  input_channels: 129
+  output_channels: 4
+
+table2:
+  baseline_name: linear_extrapolation
+  display_name: Linear extrapolation
+  learned: false
+  deterministic_definition: latest_two_observed_interval_targets_equal_step
+  qualitative_test_index_path: artifacts/table2_baselines/shared/qualitative_test_samples.json
+  qualitative_seed: 97531
+  qualitative_samples_per_group: 4
+  output_root: artifacts/table2_baselines/linear_extrapolation
+  locked_test_split: true
+
+training:
+  enabled: false
+  seed: 42
+  batch_size: 8
+  max_train_batches: 7500
+  max_epochs: 60
+

@@ -59,6 +59,12 @@ class FullValidationNoFireAccumulator:
     canopy_sum: float = 0.0
     energy_log_sum: float = 0.0
     energy_mw_sum: float = 0.0
+    surface_abs_sum: float = 0.0
+    canopy_abs_sum: float = 0.0
+    energy_log_abs_sum: float = 0.0
+    surface_absolute_error: float = 0.0
+    canopy_absolute_error: float = 0.0
+    energy_log_absolute_error: float = 0.0
 
     def update(self, prediction: torch.Tensor, target: torch.Tensor) -> None:
         if prediction.ndim != 4 or target.ndim != 4:
@@ -82,6 +88,7 @@ class FullValidationNoFireAccumulator:
             return
 
         selected = prediction[no_fire].detach().to(dtype=torch.float32)
+        selected_target = target[no_fire].detach().to(dtype=torch.float32)
         if not torch.isfinite(selected).all():
             raise ValueError("Model predictions contain NaN or Inf on target no-fire patches.")
         mask_probability = torch.sigmoid(selected[:, 2])
@@ -94,6 +101,12 @@ class FullValidationNoFireAccumulator:
         self.surface_sum += float(selected[:, 0].sum(dtype=torch.float64).item())
         self.canopy_sum += float(selected[:, 1].sum(dtype=torch.float64).item())
         self.energy_log_sum += float(selected[:, 3].sum(dtype=torch.float64).item())
+        self.surface_abs_sum += float(selected[:, 0].abs().sum(dtype=torch.float64).item())
+        self.canopy_abs_sum += float(selected[:, 1].abs().sum(dtype=torch.float64).item())
+        self.energy_log_abs_sum += float(selected[:, 3].abs().sum(dtype=torch.float64).item())
+        self.surface_absolute_error += float((selected[:, 0] - selected_target[:, 0]).abs().sum(dtype=torch.float64).item())
+        self.canopy_absolute_error += float((selected[:, 1] - selected_target[:, 1]).abs().sum(dtype=torch.float64).item())
+        self.energy_log_absolute_error += float((selected[:, 3] - selected_target[:, 3]).abs().sum(dtype=torch.float64).item())
         energy_mw = torch.clamp(torch.expm1(selected[:, 3].to(dtype=torch.float64)), min=0.0)
         self.energy_mw_sum += float(energy_mw.sum(dtype=torch.float64).item())
 
@@ -110,6 +123,13 @@ class FullValidationNoFireAccumulator:
                 "full_val_no_fire_energy_log_pred_mean": None,
                 "full_val_no_fire_energy_mw_pred_mean": None,
                 "full_val_no_fire_energy_MW_pred_mean": None,
+                "full_val_no_fire_surface_abs_pred_mean": None,
+                "full_val_no_fire_canopy_abs_pred_mean": None,
+                "full_val_no_fire_energy_log_abs_pred_mean": None,
+                "full_val_no_fire_surface_mae": None,
+                "full_val_no_fire_canopy_mae": None,
+                "full_val_no_fire_energy_log_mae": None,
+                "full_val_no_fire_energy_mw_abs_mean": None,
             }
         else:
             if self.no_fire_pixels <= 0:
@@ -124,6 +144,13 @@ class FullValidationNoFireAccumulator:
                 "full_val_no_fire_energy_log_pred_mean": self.energy_log_sum / pixel_denominator,
                 "full_val_no_fire_energy_mw_pred_mean": self.energy_mw_sum / pixel_denominator,
                 "full_val_no_fire_energy_MW_pred_mean": self.energy_mw_sum / pixel_denominator,
+                "full_val_no_fire_surface_abs_pred_mean": self.surface_abs_sum / pixel_denominator,
+                "full_val_no_fire_canopy_abs_pred_mean": self.canopy_abs_sum / pixel_denominator,
+                "full_val_no_fire_energy_log_abs_pred_mean": self.energy_log_abs_sum / pixel_denominator,
+                "full_val_no_fire_surface_mae": self.surface_absolute_error / pixel_denominator,
+                "full_val_no_fire_canopy_mae": self.canopy_absolute_error / pixel_denominator,
+                "full_val_no_fire_energy_log_mae": self.energy_log_absolute_error / pixel_denominator,
+                "full_val_no_fire_energy_mw_abs_mean": self.energy_mw_sum / pixel_denominator,
             }
         return {
             "full_val_total_patch_count": self.total_patches,

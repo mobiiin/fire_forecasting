@@ -1,0 +1,30 @@
+base_config: ../final_training/cawfe_latte_baseline_full.yaml
+
+experiment:
+  name: table2_persistence
+  description: Leakage-safe persistence benchmark on the canonical sparse5_h10 protocol.
+
+model:
+  architecture: persistence
+  name: persistence
+  input_channels: 129
+  output_channels: 4
+
+table2:
+  baseline_name: persistence
+  display_name: Persistence
+  learned: false
+  deterministic_definition: latest_observed_interval_target
+  qualitative_test_index_path: artifacts/table2_baselines/shared/qualitative_test_samples.json
+  qualitative_seed: 97531
+  qualitative_samples_per_group: 4
+  output_root: artifacts/table2_baselines/persistence
+  locked_test_split: true
+
+training:
+  enabled: false
+  seed: 42
+  batch_size: 8
+  max_train_batches: 7500
+  max_epochs: 60
+

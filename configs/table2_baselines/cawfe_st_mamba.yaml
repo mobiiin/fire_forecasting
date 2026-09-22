@@ -1,0 +1,79 @@
+base_config: ../final_training/cawfe_latte_baseline_full.yaml
+
+experiment:
+  name: table2_cawfe_st_mamba
+  description: Standalone generic spatiotemporal official-Mamba Table 2 baseline.
+
+model:
+  architecture: st_mamba_lite
+  name: cawfe_st_mamba
+  input_sequence_length: 5
+  input_channels: 129
+  output_channels: 4
+  output_activation: null
+
+st_mamba_lite:
+  input_sequence_length: 5
+  patch_size: 64
+  embed_dim: 64
+  encoder_channels: [64, 128]
+  decoder_channels: [128, 64]
+  depths: [2, 2]
+  mamba_backend: mamba_ssm
+  d_state: 16
+  d_conv: 4
+  expand: 2
+  scan_mode: route_pair
+  scan_routes: [HVT, TVH]
+  bidirectional_scan: true
+  bidirectional_merge: mean
+  route_merge: mean
+  use_depthwise_conv3d: true
+  depthwise_conv3d_kernel_size: [3, 3, 3]
+  use_st_mixer: true
+  st_mixer_sequence_order: THW
+  temporal_readout: attention_pool
+  use_unet_decoder: true
+  use_skip_connections: true
+  upsample_mode: bilinear
+  dropout: 0.0
+  drop_path: 0.1
+  norm_type: layernorm
+  mlp_ratio: 4.0
+  use_adaln_conditioning: false
+  use_fire_static_embedding: false
+  gradient_checkpointing: false
+  required_patch_divisibility: 16
+
+final_training:
+  finalist: cawfe_st_mamba
+  source_ablation: null
+  components: [standalone_spatiotemporal_mamba]
+
+table2:
+  baseline_name: cawfe_st_mamba
+  display_name: CAWFE-ST-Mamba
+  learned: true
+  require_official_mamba: true
+  qualitative_test_index_path: artifacts/table2_baselines/shared/qualitative_test_samples.json
+  qualitative_seed: 97531
+  qualitative_samples_per_group: 4
+  output_root: artifacts/table2_baselines/cawfe_st_mamba
+  locked_test_split: true
+
+training:
+  seed: 42
+  batch_size: 8
+  max_train_batches: 7500
+  max_epochs: 60
+  epochs: 60
+  gradient_accumulation_steps: 1
+  run_external_test_after_training: false
+  run_test_after_training: false
+  save_fusion_vectors:
+    enabled: false
+  output:
+    root_dir: artifacts/table2_baselines/cawfe_st_mamba/seed_42
+    flat_run_layout: true
+    update_architecture_latest_checkpoint: false
+

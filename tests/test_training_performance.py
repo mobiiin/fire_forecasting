@@ -232,3 +232,56 @@ def test_run_epoch_can_log_percent_progress_without_tqdm(capsys: pytest.CaptureF
 	assert "100%" in output
 	assert "elapsed=" in output
 	assert "remaining=" in output
+
+
+
+def test_run_epoch_writes_lightweight_optimizer_step_history(tmp_path) -> None:
+	torch = pytest.importorskip("torch")
+	from src.training.train import _run_epoch
+
+	class ToyModel(torch.nn.Module):
+		def __init__(self) -> None:
+			super().__init__()
+			self.scale = torch.nn.Parameter(torch.tensor(1.0))
+
+		def forward(self, x):
+			return x[:, -1, :1] * self.scale
+
+	class ComponentLoss(torch.nn.Module):
+		def forward(self, prediction, target):
+			loss = (prediction - target).square().mean()
+			return {"total_loss": loss, "loss_surface": loss}
+
+	loader = [
+		(torch.ones(2, 2, 1, 4, 4), torch.zeros(2, 1, 4, 4))
+		for _ in range(2)
+	]
+	model = ToyModel()
+	optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+	path = tmp_path / "history" / "step_history.csv"
+	results = _run_epoch(
+		model=model,
+		loader=loader,
+		criterion=ComponentLoss(),
+		config={"training": {"performance": {"log_timing": False, "show_progress_bar": False}}},
+		device=torch.device("cpu"),
+		input_sequence_length=2,
+		input_channels=1,
+		output_channels=1,
+		train=True,
+		optimizer=optimizer,
+		gradient_clip_norm=1.0,
+		epoch_number=3,
+		global_step_start=49,
+		step_log_interval=50,
+		step_history_path=path,
+	)
+	with path.open(newline="", encoding="utf-8") as handle:
+		rows = list(__import__("csv").DictReader(handle))
+	assert len(rows) == 1
+	assert rows[0]["global_step"] == "50"
+	assert rows[0]["epoch"] == "3"
+	assert "train_loss_surface" in rows[0]
+	assert float(rows[0]["gradient_norm"]) >= 0.0
+	assert results["train_epoch_seconds"] > 0.0
+	assert results["train_gradient_norm"] >= 0.0

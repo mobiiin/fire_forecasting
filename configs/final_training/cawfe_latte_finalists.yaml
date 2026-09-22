@@ -1,0 +1,23 @@
+schema_version: 1
+seeds: [42, 123, 2026]
+finalists:
+  baseline:
+    config_path: configs/final_training/cawfe_latte_baseline_full.yaml
+    source_ablation: baseline
+    components: [baseline]
+    description: Exact original CAWFE-Latte baseline from the 33-run ablation study.
+  CGP:
+    config_path: configs/final_training/cawfe_latte_CGP_full.yaml
+    source_ablation: CGP_separate_decoder_temporal_attention_mamba
+    components: [C, G, P]
+    description: Separate decoder, temporal attention pooling, and official Mamba post-fusion backbone.
+  GA_Q2:
+    config_path: configs/final_training/cawfe_latte_GA_Q2_full.yaml
+    source_ablation: GA_Q2_fire_domain_mmd
+    components: [G, A, Q2]
+    description: Separate decoder, six residual post-fusion blocks, and training-only cross-fire MMD.
+  GPK:
+    config_path: configs/final_training/cawfe_latte_GPK_full.yaml
+    source_ablation: GPK_mamba_no_terrain
+    components: [G, P, K]
+    description: Separate decoder and official Mamba post-fusion backbone with terrain FiLM disabled.

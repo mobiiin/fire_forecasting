@@ -9,11 +9,14 @@ import numpy as np
 
 try:
 	import torch  # type: ignore[import-not-found]
-	from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler  # type: ignore[import-not-found]
+	from torch.utils.data import DataLoader, Dataset, Sampler, WeightedRandomSampler  # type: ignore[import-not-found]
 except ImportError:  # pragma: no cover - environment-specific fallback
 	torch = None
 	DataLoader = None
 	WeightedRandomSampler = None
+
+	class Sampler:  # type: ignore[too-many-ancestors]
+		pass
 
 	class Dataset:  # type: ignore[too-many-ancestors]
 		"""Fallback base class used only when PyTorch is unavailable."""
@@ -149,6 +152,17 @@ def _metadata_value_for_sample(value: Any, sample_index: int, batch_size: int) -
 	if isinstance(value, Mapping):
 		return {key: _metadata_value_for_sample(nested_value, sample_index, batch_size) for key, nested_value in value.items()}
 	if isinstance(value, (list, tuple)):
+		# ``default_collate`` transposes a fixed-length per-sample sequence. For
+		# example ``input_indices=[0, 10, 20, 30, 40]`` becomes a list of five
+		# tensors shaped ``[batch]``. Reconstruct that sequence first.
+		if value and all(
+			torch is not None
+			and torch.is_tensor(nested_value)
+			and nested_value.ndim > 0
+			and int(nested_value.shape[0]) == int(batch_size)
+			for nested_value in value
+		):
+			return [_metadata_value_for_sample(nested_value, sample_index, batch_size) for nested_value in value]
 		if len(value) == int(batch_size):
 			return value[sample_index]
 		if len(value) == 1:
@@ -1852,6 +1866,74 @@ class MultiFirePatchSequenceDataset(MultiFireSequenceDataset):
 	"""Backward-compatible explicit name for the multi-fire patch-aware dataset."""
 
 
+class EpochRandomSubsetSampler(Sampler):
+	"""Deterministic, without-replacement subset sampler keyed by training epoch."""
+
+	def __init__(self, dataset_size: int, num_samples: int, seed: int) -> None:
+		if torch is None:
+			raise ImportError("PyTorch is required to use EpochRandomSubsetSampler.")
+		self.dataset_size = int(dataset_size)
+		self.num_samples = int(num_samples)
+		self.seed = int(seed)
+		if self.dataset_size <= 0:
+			raise ValueError(f"dataset_size must be positive, got {self.dataset_size}.")
+		if self.num_samples <= 0:
+			raise ValueError(f"num_samples must be positive, got {self.num_samples}.")
+		if self.num_samples > self.dataset_size:
+			raise ValueError(
+				"Without-replacement epoch sampling cannot request more samples than the dataset: "
+				f"requested={self.num_samples} dataset={self.dataset_size}."
+			)
+		self.epoch = 1
+		self.last_indices: tuple[int, ...] = ()
+
+	def set_epoch(self, epoch: int) -> None:
+		epoch_number = int(epoch)
+		if epoch_number <= 0:
+			raise ValueError(f"EpochRandomSubsetSampler uses one-based epochs, got {epoch_number}.")
+		self.epoch = epoch_number
+
+	def indices_for_epoch(self, epoch: int) -> tuple[int, ...]:
+		epoch_number = int(epoch)
+		if epoch_number <= 0:
+			raise ValueError(f"EpochRandomSubsetSampler uses one-based epochs, got {epoch_number}.")
+		generator = torch.Generator()
+		generator.manual_seed(self.seed + epoch_number)
+		selected = torch.randperm(self.dataset_size, generator=generator)[: self.num_samples]
+		return tuple(int(index) for index in selected.tolist())
+
+	def __iter__(self):
+		self.last_indices = self.indices_for_epoch(self.epoch)
+		return iter(self.last_indices)
+
+	def __len__(self) -> int:
+		return self.num_samples
+
+
+def _epoch_random_subset_sampler(
+	config: Mapping[str, Any],
+	dataset_size: int,
+	dataloader_options: Mapping[str, Any],
+) -> EpochRandomSubsetSampler | None:
+	"""Build the canonical partial-epoch sampler when training.max_train_batches is set."""
+
+	training_config = _get_section(config, "training")
+	raw_batches = training_config.get("max_train_batches")
+	if raw_batches in (None, "", "null", 0, 0.0):
+		return None
+	batches = int(raw_batches)
+	batch_size = int(dataloader_options["batch_size"])
+	if batches <= 0 or batch_size <= 0:
+		raise ValueError("training.max_train_batches and training batch_size must be positive.")
+	if bool(dataloader_options.get("drop_last", False)):
+		raise ValueError("Epoch-random subset training requires data_loader.train.drop_last=false.")
+	return EpochRandomSubsetSampler(
+		dataset_size=dataset_size,
+		num_samples=batches * batch_size,
+		seed=int(training_config.get("seed", config.get("seed", 42))),
+	)
+
+
 def _resolve_dataloader_options(config: Mapping[str, Any], split: str) -> dict[str, Any]:
 	"""Resolve split-specific DataLoader options with legacy fallbacks."""
 
@@ -1889,11 +1971,15 @@ def _resolve_dataloader_options(config: Mapping[str, Any], split: str) -> dict[s
 	)
 	drop_last_default = False
 	drop_last = bool(split_config.get("drop_last", data_loader_config.get("drop_last", drop_last_default)))
+	seed = int(_get_section(config, "training").get("seed", config.get("seed", 42)))
+	generator = torch.Generator()
+	generator.manual_seed(seed)
 	options: dict[str, Any] = {
 		"batch_size": max(1, batch_size),
 		"num_workers": num_workers,
 		"pin_memory": pin_memory,
 		"drop_last": drop_last,
+		"generator": generator,
 	}
 	if num_workers > 0:
 		options["persistent_workers"] = bool(
@@ -2116,7 +2202,12 @@ def create_dataloaders(config):
 			if bad:
 				raise ValueError(f"Processed {split} dataset contains records from another split: {bad[:3]}")
 		options = [_resolve_dataloader_options(config, split) for split in ("train", "val", "test")]
-		loaders = (DataLoader(train_dataset, shuffle=True, **options[0]), DataLoader(val_dataset, shuffle=False, **options[1]), DataLoader(test_dataset, shuffle=False, **options[2]))
+		train_sampler = _epoch_random_subset_sampler(config, len(train_dataset), options[0])
+		loaders = (
+			DataLoader(train_dataset, shuffle=train_sampler is None, sampler=train_sampler, **options[0]),
+			DataLoader(val_dataset, shuffle=False, **options[1]),
+			DataLoader(test_dataset, shuffle=False, **options[2]),
+		)
 		print(f"Data source: processed_full_frames | root={root} | pattern={pattern} | sample_index={sample_path} | normalization={stats_path}")
 		print(f"Processed samples | train={len(train_dataset)} val={len(val_dataset)} test={len(test_dataset)}")
 		return loaders

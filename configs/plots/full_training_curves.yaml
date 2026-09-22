@@ -1,0 +1,78 @@
+theme: paper
+
+figure:
+  width: 7.16
+  height: 5.0
+  dpi: 600
+
+fonts:
+  family: serif
+  serif: [Times New Roman, Times, STIX Two Text, DejaVu Serif]
+  sans_serif: [Arial, Helvetica, DejaVu Sans]
+  base_size: 9
+  title_size: 9.5
+  label_size: 9
+  tick_size: 8
+  legend_size: 8.5
+
+lines:
+  linewidth: 1.8
+  seed_linewidth: 0.7
+  seed_alpha: 0.22
+  std_alpha: 0.15
+
+models:
+  baseline:
+    label: CAWFE-Latte baseline
+    color: "#4D4D4D"
+    linestyle: "-"
+    marker: null
+  CGP:
+    label: CGP
+    color: "#0072B2"
+    linestyle: "--"
+    marker: null
+  GA_Q2:
+    label: GA-Q2
+    color: "#D55E00"
+    linestyle: "-."
+    marker: null
+  GPK:
+    label: GPK
+    color: "#009E73"
+    linestyle: ":"
+    marker: null
+
+layout:
+  type: 2x3
+  rows: 2
+  cols: 3
+
+legend:
+  location: center
+  columns: 1
+  frame: false
+
+grid:
+  enabled: true
+  alpha: 0.2
+  linewidth: 0.5
+
+x_axis:
+  type: equivalent
+
+smoothing:
+  window: 0
+
+uncertainty: std
+min_seeds: 2
+
+ylim:
+  dice: [null, null]
+  energy: [null, null]
+  surface: [null, null]
+  canopy: [null, null]
+  active_canopy: [null, null]
+
+log_y: []
+

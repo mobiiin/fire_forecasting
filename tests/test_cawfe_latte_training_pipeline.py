@@ -192,3 +192,18 @@ def test_cawfe_latte_requires_terrain_when_enabled(tmp_path: Path) -> None:
     x = torch.randn(1, T, C, H, W)
     with pytest.raises(ValueError, match="terrain conditioning is enabled"):
         model(x)
+
+
+
+def test_processed_loader_applies_epoch_subset_only_to_training(tmp_path: Path) -> None:
+    from src.data.dataset import EpochRandomSubsetSampler
+
+    root = tmp_path / "processed"
+    _write_fake_processed_dataset(root)
+    config = _config(root)
+    config["training"]["max_train_batches"] = 1
+    train_loader, val_loader, test_loader = create_dataloaders(config)
+    assert isinstance(train_loader.sampler, EpochRandomSubsetSampler)
+    assert len(train_loader) == 1
+    assert isinstance(val_loader.sampler, torch.utils.data.SequentialSampler)
+    assert isinstance(test_loader.sampler, torch.utils.data.SequentialSampler)

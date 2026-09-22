@@ -1,0 +1,61 @@
+base_config: ../final_training/cawfe_latte_baseline_full.yaml
+
+experiment:
+  name: table2_convlstm_unet
+  description: Conventional standalone ConvLSTM U-Net Table 2 baseline.
+
+model:
+  architecture: convlstm_unet
+  name: convlstm_unet
+  input_sequence_length: 5
+  input_channels: 129
+  hidden_dim: 64
+  kernel_size: 3
+  num_layers: 1
+  unet_base_channels: 64
+  unet_depth: 4
+  dropout: 0.0
+  output_channels: 4
+  output_activation: null
+
+convlstm_unet:
+  input_sequence_length: 5
+  use_mask_gated_regression: false
+  regression_activation: none
+  output_bias_init:
+    enabled: true
+    regression_bias: -3.0
+    mask_bias: -3.0
+    energy_bias: -2.0
+
+final_training:
+  finalist: convlstm_unet
+  source_ablation: null
+  components: [standalone_convlstm_unet]
+
+table2:
+  baseline_name: convlstm_unet
+  display_name: ConvLSTM U-Net
+  learned: true
+  qualitative_test_index_path: artifacts/table2_baselines/shared/qualitative_test_samples.json
+  qualitative_seed: 97531
+  qualitative_samples_per_group: 4
+  output_root: artifacts/table2_baselines/convlstm_unet
+  locked_test_split: true
+
+training:
+  seed: 42
+  batch_size: 8
+  max_train_batches: 7500
+  max_epochs: 60
+  epochs: 60
+  gradient_accumulation_steps: 1
+  run_external_test_after_training: false
+  run_test_after_training: false
+  save_fusion_vectors:
+    enabled: false
+  output:
+    root_dir: artifacts/table2_baselines/convlstm_unet/seed_42
+    flat_run_layout: true
+    update_architecture_latest_checkpoint: false
+
