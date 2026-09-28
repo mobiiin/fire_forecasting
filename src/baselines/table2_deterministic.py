@@ -176,9 +176,13 @@ class ProcessedHistoryBaselinePredictor:
 
 	@lru_cache(maxsize=32)
 	def _full_prediction(self, fire_name: str, input_indices: tuple[int, ...], current_index: int) -> np.ndarray:
+		# The published formulas only consume the latest observed interval
+		# (two frames) or latest two intervals (three frames). Loading earlier
+		# sequence frames is redundant and makes CPU evaluation needlessly costly.
+		required_indices = input_indices[-2:] if self.method == "persistence" else input_indices[-3:]
 		record = {
 			"fire_name": fire_name,
-			"input_indices": list(input_indices),
+			"input_indices": list(required_indices),
 			"current_index": current_index,
 		}
 		frames = load_observed_raw_history(

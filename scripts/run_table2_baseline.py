@@ -393,6 +393,22 @@ def evaluate_existing_cawfe_run(run_dir: str | Path, table2_name: str, seed: int
 	)
 
 
+def _deterministic_record_order(record: Mapping[str, Any]) -> tuple[Any, ...]:
+	"""Group identical full-frame predictions while preserving deterministic patch order."""
+
+	patch = record.get("patch", {})
+	return (
+		str(record["fire_name"]),
+		tuple(int(value) for value in record["input_indices"]),
+		int(record["current_index"]),
+		int(patch.get("y0", 0)),
+		int(patch.get("x0", 0)),
+		int(patch.get("height", 0)),
+		int(patch.get("width", 0)),
+		str(record.get("sample_id", "")),
+	)
+
+
 def _evaluate_deterministic(config: dict[str, Any], baseline: str, identity: Mapping[str, Any], run_dir: Path) -> dict[str, Any]:
 	if _complete_test_artifact(run_dir) and identities_match(identity, _candidate_identity(run_dir, baseline, None)):
 		print(f"REUSING COMPLETE RUN: {run_dir}")
@@ -401,6 +417,11 @@ def _evaluate_deterministic(config: dict[str, Any], baseline: str, identity: Map
 	root = Path(str(dataloader.get("dataset_root", config["processed_dataset"]["root"]))).expanduser().resolve()
 	pattern = str(dataloader["sample_pattern"])
 	dataset = ProcessedTargetOnlyDataset(root, root / "indices" / "temporal" / f"samples_{pattern}.jsonl", "test")
+	# The canonical index interleaves prediction keys. Grouping records here keeps
+	# SequentialSampler/no-shuffle semantics while allowing the predictor cache to
+	# compute each full-frame deterministic prediction once. Membership and every
+	# sample ID are unchanged; the locked evaluator still enforces exact-once use.
+	dataset.records.sort(key=_deterministic_record_order)
 	loader = DataLoader(
 		dataset,
 		batch_size=int(config.get("training", {}).get("batch_size", 8)),
@@ -428,6 +449,7 @@ def _evaluate_deterministic(config: dict[str, Any], baseline: str, identity: Map
 			"mean_training_seconds_per_epoch": None,
 			"total_training_time_seconds": 0.0,
 			"training_peak_gpu_memory_gb": None,
+			"deterministic_evaluation_order": "prediction_key_grouped_sequential",
 		},
 	)
 

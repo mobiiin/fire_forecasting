@@ -14,7 +14,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 import yaml
 
-from scripts.run_table2_baseline import _complete_test_artifact, _write_run_metadata
+from scripts.run_table2_baseline import _complete_test_artifact, _deterministic_record_order, _write_run_metadata
 from scripts.summarize_table2_results import METRIC_COLUMNS, _aggregate_model
 from src.baselines.table2_deterministic import (
 	ProcessedHistoryBaselinePredictor,
@@ -139,6 +139,55 @@ def test_observed_history_loader_rejects_noncausal_indexing(tmp_path: Path) -> N
 			tmp_path,
 			{"fire_name": "F", "input_indices": [0, 10], "current_index": 20},
 		)
+
+
+@pytest.mark.parametrize(
+	("method", "expected_indices"),
+	[("persistence", [30, 40]), ("linear_extrapolation", [20, 30, 40])],
+)
+def test_deterministic_predictor_loads_only_frames_used_by_formula(
+	tmp_path: Path,
+	method: str,
+	expected_indices: list[int],
+) -> None:
+	root = tmp_path / "dataset"
+	geometry = root / "fires" / "FIRE" / "geometry"
+	geometry.mkdir(parents=True)
+	np.save(geometry / "area_2d.npy", np.ones((4, 4), dtype=np.float32))
+	opened: list[int] = []
+
+	def tracked_loader(path: Path) -> np.ndarray:
+		opened.append(int(path.stem.split("_")[-1]))
+		return _raw_frame(10.0, 5.0, 1.0e6)
+
+	predictor = ProcessedHistoryBaselinePredictor(
+		method,
+		root,
+		_minimal_target_config(),
+		frame_loader=tracked_loader,
+	)
+	record = {
+		"sample_id": "first",
+		"fire_name": "FIRE",
+		"input_indices": [0, 10, 20, 30, 40],
+		"current_index": 40,
+		"target_index": 50,
+		"patch": {"y0": 0, "x0": 0, "height": 4, "width": 4},
+	}
+	first = predictor.predict_one(record)
+	second = predictor.predict_one({**record, "sample_id": "second"})
+	assert first.shape == second.shape == (4, 4, 4)
+	assert opened == expected_indices
+
+
+def test_deterministic_record_order_groups_prediction_keys() -> None:
+	records = [
+		{"sample_id": "b", "fire_name": "F", "input_indices": [0, 10], "current_index": 10, "patch": {"y0": 4, "x0": 0, "height": 4, "width": 4}},
+		{"sample_id": "c", "fire_name": "F", "input_indices": [10, 20], "current_index": 20, "patch": {"y0": 0, "x0": 0, "height": 4, "width": 4}},
+		{"sample_id": "a", "fire_name": "F", "input_indices": [0, 10], "current_index": 10, "patch": {"y0": 0, "x0": 0, "height": 4, "width": 4}},
+	]
+	ordered = sorted(records, key=_deterministic_record_order)
+	assert [record["sample_id"] for record in ordered] == ["a", "b", "c"]
 
 
 def test_metadata_batch_reconstructs_collated_fixed_length_histories() -> None:

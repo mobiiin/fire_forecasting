@@ -62,6 +62,12 @@ class FullValidationNoFireAccumulator:
     surface_abs_sum: float = 0.0
     canopy_abs_sum: float = 0.0
     energy_log_abs_sum: float = 0.0
+    surface_square_sum: float = 0.0
+    canopy_square_sum: float = 0.0
+    energy_log_square_sum: float = 0.0
+    surface_target_abs_sum: float = 0.0
+    canopy_target_abs_sum: float = 0.0
+    energy_log_target_abs_sum: float = 0.0
     surface_absolute_error: float = 0.0
     canopy_absolute_error: float = 0.0
     energy_log_absolute_error: float = 0.0
@@ -104,6 +110,12 @@ class FullValidationNoFireAccumulator:
         self.surface_abs_sum += float(selected[:, 0].abs().sum(dtype=torch.float64).item())
         self.canopy_abs_sum += float(selected[:, 1].abs().sum(dtype=torch.float64).item())
         self.energy_log_abs_sum += float(selected[:, 3].abs().sum(dtype=torch.float64).item())
+        self.surface_square_sum += float(selected[:, 0].square().sum(dtype=torch.float64).item())
+        self.canopy_square_sum += float(selected[:, 1].square().sum(dtype=torch.float64).item())
+        self.energy_log_square_sum += float(selected[:, 3].square().sum(dtype=torch.float64).item())
+        self.surface_target_abs_sum += float(selected_target[:, 0].abs().sum(dtype=torch.float64).item())
+        self.canopy_target_abs_sum += float(selected_target[:, 1].abs().sum(dtype=torch.float64).item())
+        self.energy_log_target_abs_sum += float(selected_target[:, 3].abs().sum(dtype=torch.float64).item())
         self.surface_absolute_error += float((selected[:, 0] - selected_target[:, 0]).abs().sum(dtype=torch.float64).item())
         self.canopy_absolute_error += float((selected[:, 1] - selected_target[:, 1]).abs().sum(dtype=torch.float64).item())
         self.energy_log_absolute_error += float((selected[:, 3] - selected_target[:, 3]).abs().sum(dtype=torch.float64).item())
@@ -126,6 +138,12 @@ class FullValidationNoFireAccumulator:
                 "full_val_no_fire_surface_abs_pred_mean": None,
                 "full_val_no_fire_canopy_abs_pred_mean": None,
                 "full_val_no_fire_energy_log_abs_pred_mean": None,
+                "full_val_no_fire_surface_pred_rmse": None,
+                "full_val_no_fire_canopy_pred_rmse": None,
+                "full_val_no_fire_energy_log_pred_rmse": None,
+                "full_val_no_fire_surface_target_abs_mean": None,
+                "full_val_no_fire_canopy_target_abs_mean": None,
+                "full_val_no_fire_energy_log_target_abs_mean": None,
                 "full_val_no_fire_surface_mae": None,
                 "full_val_no_fire_canopy_mae": None,
                 "full_val_no_fire_energy_log_mae": None,
@@ -147,6 +165,12 @@ class FullValidationNoFireAccumulator:
                 "full_val_no_fire_surface_abs_pred_mean": self.surface_abs_sum / pixel_denominator,
                 "full_val_no_fire_canopy_abs_pred_mean": self.canopy_abs_sum / pixel_denominator,
                 "full_val_no_fire_energy_log_abs_pred_mean": self.energy_log_abs_sum / pixel_denominator,
+                "full_val_no_fire_surface_pred_rmse": (self.surface_square_sum / pixel_denominator) ** 0.5,
+                "full_val_no_fire_canopy_pred_rmse": (self.canopy_square_sum / pixel_denominator) ** 0.5,
+                "full_val_no_fire_energy_log_pred_rmse": (self.energy_log_square_sum / pixel_denominator) ** 0.5,
+                "full_val_no_fire_surface_target_abs_mean": self.surface_target_abs_sum / pixel_denominator,
+                "full_val_no_fire_canopy_target_abs_mean": self.canopy_target_abs_sum / pixel_denominator,
+                "full_val_no_fire_energy_log_target_abs_mean": self.energy_log_target_abs_sum / pixel_denominator,
                 "full_val_no_fire_surface_mae": self.surface_absolute_error / pixel_denominator,
                 "full_val_no_fire_canopy_mae": self.canopy_absolute_error / pixel_denominator,
                 "full_val_no_fire_energy_log_mae": self.energy_log_absolute_error / pixel_denominator,
