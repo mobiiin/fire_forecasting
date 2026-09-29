@@ -207,3 +207,27 @@ def test_processed_loader_applies_epoch_subset_only_to_training(tmp_path: Path) 
     assert len(train_loader) == 1
     assert isinstance(val_loader.sampler, torch.utils.data.SequentialSampler)
     assert isinstance(test_loader.sampler, torch.utils.data.SequentialSampler)
+
+
+def test_processed_loader_can_skip_test_split_entirely(tmp_path: Path) -> None:
+    root = tmp_path / "processed"
+    _write_fake_processed_dataset(root)
+    config = _config(root)
+    config["dataloader"]["include_test_split"] = False
+    train_loader, val_loader, test_loader = create_dataloaders(config)
+    assert len(train_loader.dataset) == 1
+    assert len(val_loader.dataset) == 1
+    assert test_loader is None
+
+
+def test_original_cawfe_latte_baseline_accepts_single_temporal_state(tmp_path: Path) -> None:
+    root = tmp_path / "processed"
+    _write_fake_processed_dataset(root)
+    config = _config(root)
+    config["input_sequence_length"] = 1
+    config["cawfe_latte"]["input_sequence_length"] = 1
+    model = build_model_from_config(config, input_channels=C)
+    x = torch.randn(1, 1, C, H, W)
+    terrain = torch.randn(1, 4, H, W)
+    prediction = extract_prediction(model(x, terrain=terrain))
+    assert tuple(prediction.shape) == (1, 4, H, W)

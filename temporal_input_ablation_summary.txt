@@ -1,0 +1,303 @@
+============================================================
+TEMPORAL INPUT ABLATION
+============================================================
+
+A. EXPERIMENT PROVENANCE
+
+- Most directly controlled and complete recovered version:
+  Slurm array submitted with
+  `sbatch slurm/slurm_train_convlstm_ablation_processed_array.sh`.
+  All three array tasks completed on 2026-08-14. The launcher maps task 0 to
+  consecutive5_h10, task 1 to single1_h10, and task 2 to sparse5_h10.
+
+- Completed runs (Slurm times are reproduced as reported by sacct):
+  * Five consecutive: run name
+    `convlstm_consecutive5_h10_slurm15035864_task0`; raw Slurm job ID
+    15043460; COMPLETED; 2026-08-14 18:22:20 to 21:57:11 (03:34:51).
+  * Single timestamp: run name
+    `convlstm_single1_h10_slurm15035864_task1`; raw Slurm job ID
+    15043461; COMPLETED; 2026-08-14 18:22:21 to 19:07:55 (00:45:34).
+  * Five sparse: run name
+    `convlstm_sparse5_h10_slurm15035864_task2`; raw Slurm job ID
+    15035864; COMPLETED; 2026-08-14 18:22:21 to 21:43:44 (03:21:23).
+
+- Original results directories recorded inside the checkpoints:
+  * artifacts/runs/convlstm_unet/convlstm_consecutive5_h10_slurm15035864_task0
+  * artifacts/runs/convlstm_unet/convlstm_single1_h10_slurm15035864_task1
+  * artifacts/runs/convlstm_unet/convlstm_sparse5_h10_slurm15035864_task2
+  These live results directories and their original Slurm log files are no
+  longer present in the repository.
+
+- Recovered validation-selected checkpoints (currently in the user's Trash):
+  * /home/mhabibp/.local/share/Trash/files/checkpoints/convlstm_unet/convlstm_consecutive5_h10_slurm15035864_task0/best_model.pt
+    SHA-256: 3636958a86fd743a5c0207b95f7dd81297cdf5a16aee3f7079ebdeaed56b73bc
+  * /home/mhabibp/.local/share/Trash/files/checkpoints/convlstm_unet/convlstm_single1_h10_slurm15035864_task1/best_model.pt
+    SHA-256: 6fe6c55bf8cfdd919d1797660db000b35e76dd025a8dad408eba140c0a7190bd
+  * /home/mhabibp/.local/share/Trash/files/checkpoints/convlstm_unet/convlstm_sparse5_h10_slurm15035864_task2/best_model.pt
+    SHA-256: 9f4fa5c200eebe6a84316141fa02ec6786f665c362bbfc9f677f0a827f3bfc3c
+  Each checkpoint contains the resolved configuration and the complete
+  20-epoch history. No checkpoint was moved or modified during recovery.
+
+- Config files, with SHA-256 hashes matching `_config_sha256` embedded in the
+  corresponding checkpoints:
+  * configs/experiments/convlstm_consecutive5_h10.yaml
+    358bcc70f507fea1fee217afcd519b91675e0754d14539c7f3ebd130e636beb2
+  * configs/experiments/convlstm_single1_h10.yaml
+    1b12a4d424e6d9909dce636395cd33a922eb42b48abffd04e098565a1cc7ce94
+  * configs/experiments/convlstm_sparse5_h10.yaml
+    d0da4ef087ffc1377204d8931babc202b1a881f50e5167db27b39ebc03e56668
+  * Common resolved base config:
+    configs/derived/default_with_fire_mask_thresholds.yaml
+    embedded SHA-256:
+    7c8dd72f1402e0d390b1b981b6cd2ee8d20b200630a7fa3599397d8e4d5ad050
+
+- Evaluation files:
+  There is no separate recovered evaluation JSON/CSV for this run set. The
+  exact metrics below are the epoch-20 rows in each best checkpoint's
+  top-level `history`; epoch 20 is also the minimum-val_loss epoch and the
+  stored `best_epoch` for every run. The checkpoint's top-level `epoch=19` is
+  the corresponding zero-based state index.
+
+- Scripts defining temporal sampling and execution:
+  * scripts/build_temporal_sample_index.py
+  * configs/default.yaml (`temporal_sampling.sample_patterns`)
+  * slurm/slurm_train_convlstm_ablation_processed_array.sh
+  * scripts/train_forecasting_model.py
+  * src/training/train.py
+
+- Other candidate version found, but not usable as completed results:
+  Three earlier interactive/desktop-allocation attempts under Slurm allocation
+  15031721 are in the user's Trash. Two consecutive-input logs stop during
+  initialization or data loading. The single-input run summary says
+  `status: failed`, `num_epochs_completed: 0`, `best_epoch: null`, and
+  `best_metric_value: Infinity`. There is no matching completed sparse run.
+  Consequently, these are failed preliminary attempts rather than another
+  result-bearing three-way ablation. The completed array above is the only
+  recovered controlled three-condition version.
+
+B. CONTROLLED PROTOCOL
+
+- Architecture: ConvLSTM U-Net (`convlstm_unet`) for all three runs; 129 input
+  channels, 4 output channels, hidden dimension 64, one ConvLSTM layer,
+  3x3 kernel, dropout 0.0, and 64x64 patches. Apart from fields necessarily
+  derived from the temporal pattern/input length and run identity/paths, the
+  recovered resolved configurations use the same architecture, loss, optimizer,
+  normalization path, split, batch protocol, and training controls.
+
+- Seed(s): one run per condition. No training seed is explicitly serialized in
+  any recovered config/checkpoint. `src/training/train.py` resolves a missing
+  training/top-level seed to 42, so the effective seed is 42 if the recovered
+  config was executed by the matching trainer behavior. The fixed validation
+  subset seed is explicitly stored as 42. This is a single-seed screening
+  ablation, not a multi-seed experiment.
+
+- Training budget: `training.max_epochs=20`; all three histories contain 20
+  completed epochs and selected epoch 20. The inherited legacy top-level
+  `epochs=50` is present, but the resolved training section overrides it with
+  `max_epochs=20`. Each epoch was capped at 100 train batches with batch size
+  128 (12,800 sampled patches per epoch), gradient accumulation 4, AdamW, and
+  the same early-stopping rule (val_loss, minimization, patience 8, min_delta
+  0.001, start epoch 5). None stopped early.
+
+- Train split: manual full-fire holdout using
+  THOMAS__1204__keepz_08 and THOMAS__1208__keepz_08.
+
+- Validation split: manual full-fire holdout using
+  THOMAS__1209__keepz_08.
+
+- Configured test split: manual full-fire holdout using
+  THOMAS__1210__keepz_08. It was not evaluated by these training runs:
+  `run_test_after_training=false` and `run_external_test_after_training=false`.
+
+- Prediction horizon: target at current/latest-input index +10 processed-frame
+  indices for every condition; target definition
+  `interval_consumed_current_to_horizon_target_v1`.
+
+- Checkpoint selection: minimum fixed-subset validation loss (`val_loss`), with
+  the same fixed subset used for checkpointing. Best epoch was 20 for all runs.
+  Exact best val_loss values were 4.010369548797607 (consecutive),
+  4.357753434181213 (single), and 3.9596778482630635 (sparse).
+
+- Evaluation protocol: patch-level validation, not full validation and not the
+  held-out test. Validation used sequential batches (fixed-subset shuffle false),
+  batch size 128, and at most 50 batches:
+  * consecutive: 50/51 batches, 6,400/6,504 samples;
+  * single: 50/52 batches, 6,400/6,552 samples;
+  * sparse: 48/48 batches, 6,072/6,072 samples.
+  The valid temporal windows, and therefore validation population/count, differ
+  as a direct consequence of the input offsets. Thus the intended experimental
+  change is temporal context, but the evaluated sample sets are not identical.
+
+- Input normalization: enabled and applied by the dataset to 129 channels. All
+  three checkpoints record the same path:
+  /scratch/mhabibp/cawfe_datasets/cawfe_engineered_v1/normalization/latest_normalization.json
+
+C. EXACT TEMPORAL INPUT DEFINITIONS
+
+Let t be `current_index`, the most recent input state in the temporal sample
+index. The code computes each input as `t + input_offset` and the target as
+`t + horizon`.
+
+Single timestamp:
+- number of frames: 1
+- exact indices: [t]
+- exact spacing: not applicable
+- target: t + 10 processed-frame indices
+
+Five sparse timestamps:
+- number of frames: 5
+- exact spacing: 10 processed-frame indices between adjacent inputs
+- exact indices: [t-40, t-30, t-20, t-10, t]
+- input span: 40 processed-frame indices
+- target: t + 10 processed-frame indices
+
+Five consecutive timestamps:
+- number of frames: 5
+- exact spacing: 1 processed-frame index between adjacent inputs
+- exact indices: [t-4, t-3, t-2, t-1, t]
+- input span: 4 processed-frame indices
+- target: t + 10 processed-frame indices
+
+The recovered code/configuration does not attach timestamps or an authoritative
+wall-clock cadence to these indices. Therefore the sparse spacing is verified
+as exactly 10 processed-frame indices, but it cannot be reported as exactly
+10 minutes from the recovered evidence. Likewise, the prediction target is
+verified as 10 processed-frame indices beyond the latest input, not as exactly
+10 wall-clock minutes. The checkpoint metadata field
+`target_offset_from_last_input=10` agrees for all three runs.
+
+D. RAW RESULTS
+
+All numbers below are copied exactly from the best-checkpoint history row.
+`NaN` is the exact stored Active Canopy MAE value; it is not replaced or
+imputed. Seed 42 is the trainer-fallback inference described in Section B, not
+an explicitly serialized training-seed field.
+
+Configuration      | Seed         | Dice               | IoU                | Energy Log MAE      | Surface MAE        | Canopy MAE         | Active Canopy MAE
+-------------------|--------------|--------------------|--------------------|---------------------|--------------------|--------------------|------------------
+Single timestamp   | 42 fallback* | 0.7476275861263275 | 0.6296928238868713 | 0.4269369560480118  | 1.5428497564792634 | 1.5295464432239532 | NaN
+Five sparse        | 42 fallback* | 0.7770421212840929 | 0.6728304566444929 | 0.4577093652507219  | 1.3121441305861643 | 1.5274171062766013 | NaN
+Five consecutive   | 42 fallback* | 0.7596404153108597 | 0.6465056329965592 | 0.4283403825759888  | 1.289989538192749  | 1.4878151082992555 | NaN
+
+Additional raw best-checkpoint validation metrics:
+
+Configuration      | Precision          | Recall             | Energy Log RMSE    | Surface RMSE       | Canopy RMSE
+-------------------|--------------------|--------------------|--------------------|--------------------|-------------------
+Single timestamp   | 0.773932027220726  | 0.7420006221532822 | 0.620515701174736  | 2.084103503227234  | 1.7669069850444794
+Five sparse        | 0.8204958567663301 | 0.7442071271351046 | 0.633101419890508  | 1.8426414230281343 | 1.7521151392984453
+Five consecutive   | 0.8828409111499786 | 0.6789343410730362 | 0.6194652485847473 | 1.8603381204605103 | 1.7170492458343505
+
+No no-fire subset metrics are stored in these histories. A training-loss
+component named `val_background_suppression_loss` is present, but it is not a
+no-fire evaluation. Its exact values are 0.0020711737871170043 (single),
+0.0018314461865522487 (sparse), and 0.0008219271153211594 (consecutive).
+
+Metric-scaling audit:
+No recovered config, checkpoint field, summary, or temporal-ablation
+postprocessor specifies multiplication by 10^2 or 10^3. Consequently, a
+paper-display scaling cannot be verified and is reported as N/A rather than
+guessed. The raw values above are the source-of-truth values. The later Table 2
+writer found in this repository formats its own raw metrics directly, but those
+later held-out benchmark runs are not this temporal ablation and must not be
+mixed with it.
+
+E. AGGREGATED RESULTS -- SINGLE-SEED SCREENING RESULTS
+
+Only one completed run exists per condition. Mean +/- standard deviation is
+therefore not estimable; no zero standard deviation is claimed. The single-run
+values are:
+
+Configuration      | Dice               | IoU                | Energy Log MAE     | Surface MAE        | Canopy MAE         | Active Canopy MAE
+-------------------|--------------------|--------------------|--------------------|--------------------|--------------------|------------------
+Single timestamp   | 0.7476275861263275 | 0.6296928238868713 | 0.4269369560480118 | 1.5428497564792634 | 1.5295464432239532 | NaN
+Five sparse        | 0.7770421212840929 | 0.6728304566444929 | 0.4577093652507219 | 1.3121441305861643 | 1.5274171062766013 | NaN
+Five consecutive   | 0.7596404153108597 | 0.6465056329965592 | 0.4283403825759888 | 1.289989538192749  | 1.4878151082992555 | NaN
+
+F. RELATIVE COMPARISON TO FIVE CONSECUTIVE INPUTS
+
+Definitions used below:
+- signed Dice/IoU delta = competing configuration minus five consecutive;
+- absolute difference = magnitude of that signed delta;
+- MAE percent change = 100 * (competing - consecutive) / consecutive.
+  Positive MAE change is worse; negative MAE change is better.
+
+Single timestamp relative to five consecutive:
+- Dice: signed delta -0.0120128291845322; absolute difference
+  0.0120128291845322 (single is lower).
+- IoU: signed delta -0.0168128091096879; absolute difference
+  0.0168128091096879 (single is lower).
+- Energy Log MAE: -0.327642824507% (single is lower/better).
+- Surface MAE: +19.601726277623% (single is higher/worse).
+- Canopy MAE: +2.804873716627% (single is higher/worse).
+- Active Canopy MAE: N/A because both stored values are NaN.
+
+Five sparse relative to five consecutive:
+- Dice: signed delta +0.0174017059732332; absolute difference
+  0.0174017059732332 (sparse is higher).
+- IoU: signed delta +0.0263248236479337; absolute difference
+  0.0263248236479337 (sparse is higher).
+- Energy Log MAE: +6.856458991354% (sparse is higher/worse).
+- Surface MAE: +1.717424191242% (sparse is higher/worse).
+- Canopy MAE: +2.661755332127% (sparse is higher/worse).
+- Active Canopy MAE: N/A because both stored values are NaN.
+
+G. INTERPRETATION -- FACTS ONLY
+
+- Relative to one timestamp, five consecutive inputs have higher Dice and IoU
+  and lower Surface and Canopy MAE. One timestamp has a slightly lower Energy
+  Log MAE and higher recall, while five consecutive has higher precision.
+  Therefore, the observed advantage of consecutive history over a single state
+  is not uniform across every target/metric.
+
+- Five consecutive inputs do not uniformly outperform the longer-span sparse
+  inputs. Five sparse has higher Dice and IoU, whereas five consecutive has
+  lower Energy Log, Surface, and Canopy MAE. For the additional RMSE metrics,
+  consecutive has lower Energy Log and Canopy RMSE, while sparse has lower
+  Surface RMSE.
+
+- The results therefore show a segmentation-versus-regression tradeoff rather
+  than one temporal pattern winning every stored metric. Active Canopy MAE
+  cannot inform this comparison because it is NaN for all three runs.
+
+- These observations are from one validation-screening run per condition and
+  do not establish statistical significance or performance on the held-out
+  test fire.
+
+H. UNCERTAINTIES / MISSING INFORMATION
+
+- Wall-clock cadence is not recoverable from the temporal indices/configs, so
+  neither the 10-index sparse spacing nor the +10-index target horizon can be
+  certified as minutes.
+
+- The training seed is not explicitly stored. Seed 42 is inferred from the
+  fallback in the present trainer code; the completed runs' Git commit/code
+  snapshot was not recovered, so this inference is marked rather than treated
+  as direct checkpoint metadata. Fixed validation seed 42 is directly stored.
+
+- The original run directories, Slurm stdout/stderr files, and separate
+  evaluation products are absent. Exact metrics survive in the recovered
+  best checkpoints, whose hashes are recorded above.
+
+- The mutable normalization path is stored but no normalization-file hash or
+  run-local copy was found. Its exact contents as of 2026-08-14 cannot be
+  reverified. All three checkpoints nevertheless record the same path and the
+  same 129-channel shape.
+
+- No held-out-test, full-validation, no-fire-subset, or multi-seed results were
+  found for this temporal ablation. Active Canopy MAE and the other stored
+  active log/fuel MAEs are NaN at the selected epochs.
+
+- Validation sample populations are not identical: the temporal offsets change
+  which current indices are valid, and sparse uses 6,072 samples while the
+  other selected subsets use 6,400. This limits a strict paired-sample reading.
+
+- No evidence was found for a 10^2 or 10^3 paper-display scaling convention for
+  these runs, so scaled values are intentionally not invented.
+
+- The statement that five consecutive inputs were eventually used by the final
+  model is not supported by the current repository state. The recovered
+  `configs/default.yaml` names consecutive5_h10 as its generic default pattern,
+  but current `configs/experiments/cawfe_latte_v1.yaml` and
+  `configs/experiments/cawfe_latte_baseline.yaml` explicitly select
+  sparse5_h10. A historical final-model config proving a dense-consecutive
+  selection was not found.

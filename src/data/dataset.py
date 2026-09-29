@@ -2191,25 +2191,36 @@ def create_dataloaders(config):
 		common = {"dataset_root": root, "sample_index_path": sample_path, "normalization_stats_path": stats_path, "normalize_inputs": normalize_inputs, "input_key": str(dataloader_config.get("input_key", "x_engineered")), "return_metadata": bool(config.get("return_metadata", dataloader_config.get("return_metadata", False))), "single_frame_mode": str(dataloader_config.get("single_frame_mode", "as_is")), "repeat_to_length": dataloader_config.get("repeat_to_length"), "return_terrain": return_terrain, "terrain_key": str(dataloader_config.get("terrain_key", "terrain_features"))}
 		train_dataset = ProcessedTemporalPatchDataset(split="train", **common)
 		val_dataset = ProcessedTemporalPatchDataset(split="val", **common)
-		test_dataset = ProcessedTemporalPatchDataset(split="test", **common)
-		fire_sets = {split: {str(record["fire_name"]) for record in dataset.records} for split, dataset in (("train", train_dataset), ("val", val_dataset), ("test", test_dataset))}
+		include_test_split = bool(dataloader_config.get("include_test_split", True))
+		test_dataset = ProcessedTemporalPatchDataset(split="test", **common) if include_test_split else None
+		datasets_by_split = [("train", train_dataset), ("val", val_dataset)]
+		if test_dataset is not None:
+			datasets_by_split.append(("test", test_dataset))
+		fire_sets = {split: {str(record["fire_name"]) for record in dataset.records} for split, dataset in datasets_by_split}
 		for left, right in (("train", "val"), ("train", "test"), ("val", "test")):
+			if left not in fire_sets or right not in fire_sets:
+				continue
 			overlap = fire_sets[left] & fire_sets[right]
 			if overlap:
 				raise ValueError(f"Processed dataset fire split leakage between {left} and {right}: {sorted(overlap)}")
-		for split, dataset in (("train", train_dataset), ("val", val_dataset), ("test", test_dataset)):
+		for split, dataset in datasets_by_split:
 			bad = [record.get("sample_id", "<unknown>") for record in dataset.records if record.get("split") != split]
 			if bad:
 				raise ValueError(f"Processed {split} dataset contains records from another split: {bad[:3]}")
-		options = [_resolve_dataloader_options(config, split) for split in ("train", "val", "test")]
-		train_sampler = _epoch_random_subset_sampler(config, len(train_dataset), options[0])
+		train_options = _resolve_dataloader_options(config, "train")
+		val_options = _resolve_dataloader_options(config, "val")
+		train_sampler = _epoch_random_subset_sampler(config, len(train_dataset), train_options)
+		test_loader = None
+		if test_dataset is not None:
+			test_options = _resolve_dataloader_options(config, "test")
+			test_loader = DataLoader(test_dataset, shuffle=False, **test_options)
 		loaders = (
-			DataLoader(train_dataset, shuffle=train_sampler is None, sampler=train_sampler, **options[0]),
-			DataLoader(val_dataset, shuffle=False, **options[1]),
-			DataLoader(test_dataset, shuffle=False, **options[2]),
+			DataLoader(train_dataset, shuffle=train_sampler is None, sampler=train_sampler, **train_options),
+			DataLoader(val_dataset, shuffle=False, **val_options),
+			test_loader,
 		)
 		print(f"Data source: processed_full_frames | root={root} | pattern={pattern} | sample_index={sample_path} | normalization={stats_path}")
-		print(f"Processed samples | train={len(train_dataset)} val={len(val_dataset)} test={len(test_dataset)}")
+		print(f"Processed samples | train={len(train_dataset)} val={len(val_dataset)} test={0 if test_dataset is None else len(test_dataset)}")
 		return loaders
 
 	for required_key in ("file_pattern", "input_sequence_length", "prediction_horizon"):
