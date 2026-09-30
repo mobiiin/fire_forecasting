@@ -159,8 +159,8 @@ def test_aggregate_only_produces_auditable_exact_outputs(tmp_path: Path) -> None
     assert sum(int(row["no_fire_patch_count"]) for row in per_fire) == 12
     latex = (output / "no_fire_table.tex").read_text(encoding="utf-8")
     assert "\\label{tab:no_fire}" in latex
-    assert "Baseline &" in latex
-    assert "CAWFE-Latte &" in latex
+    assert "FLARE baseline &" in latex
+    assert "FLARE final &" in latex
     assert "\\pm" in latex
     assert latex.count("\\\\\n") == 3
     summary = (output / "no_fire_summary.txt").read_text(encoding="utf-8")

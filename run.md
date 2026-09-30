@@ -595,8 +595,8 @@ Notes:
 - the shifted-window path currently uses cyclic shifts without a masking scheme
 - channel `2` remains mask logits; the model does not apply sigmoid internally
 
-## CAWFE-Latte v1 End-to-End
-CAWFE-Latte v1 is the first trainable end-to-end baseline for the fresh architecture. It uses four encoders, fire-query modality fusion, a small temporal CNN backbone, a shallow same-resolution decoder, and four heads.
+## FLARE v1 End-to-End
+FLARE v1 is the first trainable end-to-end baseline for the fresh architecture. It uses four encoders, fire-query modality fusion, a small temporal CNN backbone, a shallow same-resolution decoder, and four heads.
 
 Outputs are surface consumed fuel, canopy consumed fuel, fire mask logits, and log1p energy release. The v1 loss uses surface Huber weight 1, canopy Huber weight 1, mask BCE+Dice weight 5, energy-log Huber weight 1, and one auxiliary fire-support mask loss after local fused features with weight 0.2. There are no per-encoder auxiliary losses and no heavy backbone, neural operator, Mamba, or large transformer yet.
 

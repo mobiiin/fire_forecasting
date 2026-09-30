@@ -23,7 +23,7 @@ lines:
 
 models:
   baseline:
-    label: CAWFE-Latte baseline
+    label: FLARE baseline
     color: "#4D4D4D"
     linestyle: "-"
     marker: null
@@ -33,7 +33,7 @@ models:
     linestyle: "--"
     marker: null
   GA_Q2:
-    label: GA-Q2
+    label: FLARE final
     color: "#D55E00"
     linestyle: "-."
     marker: null

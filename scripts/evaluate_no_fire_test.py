@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate frozen CAWFE-Latte finalists on the canonical no-fire test subset.
+"""Evaluate frozen FLARE finalists on the canonical no-fire test subset.
 
 This script never trains or selects a checkpoint. It reuses complete locked-test
 artifacts when they contain the exact paper quantities; otherwise it invokes the
@@ -42,8 +42,8 @@ MODEL_TO_TABLE2 = {
     "GA_Q2": "cawfe_latte_final",
 }
 DISPLAY_NAMES = {
-    "baseline": "Baseline",
-    "GA_Q2": "CAWFE-Latte",
+    "baseline": "FLARE baseline",
+    "GA_Q2": "FLARE final",
 }
 CAWFE_ROOT = Path("artifacts/final_training/cawfe_latte")
 OUTPUT_ROOT = Path("artifacts/no_fire_test_analysis")
@@ -584,8 +584,8 @@ def _summary_text(records: Sequence[Mapping[str, Any]], subset_hash: str, output
         )
     )
     lines = ["NO-FIRE TEST EVALUATION", ""]
-    for model, label in (("baseline", "Baseline"), ("GA_Q2", "GA_Q2")):
-        lines.append(f"{label} checkpoints:")
+    for model in MODELS:
+        lines.append(f"{DISPLAY_NAMES[model]} checkpoints:")
         for record in sorted((row for row in records if row["model"] == model), key=lambda row: int(row["seed"])):
             lines.append(f"  seed {record['seed']}: {record['checkpoint_path']}")
         lines.append("")

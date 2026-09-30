@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build plot-ready, multi-seed CAWFE-Latte full-training data tables."""
+"""Build plot-ready, multi-seed FLARE full-training data tables."""
 
 from __future__ import annotations
 

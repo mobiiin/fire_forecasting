@@ -1,0 +1,57 @@
+figure:
+  width: 7.16
+  dpi: 600
+  background: white
+fonts:
+  family: serif
+  base_size: 8
+  title_size: 8.5
+  label_size: 8
+  tick_size: 7
+  colorbar_size: 7
+layout:
+  mode: compact
+  num_cases: 2
+  hspace: 0.10
+  wspace: 0.08
+  context_width_ratio: 1.08
+  case_height: 4.20
+selection:
+  seed: 42
+  shortlist_per_fire: 16
+  medium_min_pixels: 32
+  medium_min_perimeter: 16
+  large_min_pixels: 100
+  weak_min_pixels: 12
+  high_energy_quantile: 0.75
+  medium_min_interior_fraction: 0.18
+  large_min_interior_fraction: 0.25
+  max_centroid_distance: 0.45
+  top_choice_count: 12
+mask:
+  vmin: 0
+  vmax: 1
+  cmap: magma
+  show_gt_perimeter: true
+  perimeter_linewidth: 0.40
+  show_threshold_contour: false
+continuous:
+  color_percentile: 99
+  clip_negative_for_display: true
+  cmaps:
+    surface: viridis
+    canopy: cividis
+    energy_log: inferno
+wind:
+  enabled: true
+  stride: 8
+  scale: 0.28
+  width: 0.003
+terrain:
+  contours: true
+  contour_levels: 5
+  linewidth: 0.30
+  alpha: 0.22
+colorbars:
+  orientation: vertical
+  compact: true

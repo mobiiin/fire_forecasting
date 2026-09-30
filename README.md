@@ -1,13 +1,23 @@
-# ConvLSTM U-Net Wildfire Forecasting
+# FLARE: Wildfire Forecasting
 
 ## Overview
-This project trains a ConvLSTM U-Net on one `.npy` tensor per timestamp to forecast future wildfire state from historical simulation frames.
+FLARE forecasts future wildfire state from historical simulation frames. The repository retains `cawfe_latte` architecture identifiers and checkpoint paths for compatibility with frozen experiments; paper figures use FLARE baseline and FLARE final. ConvLSTM U-Net remains a comparison model.
 
 The current default setup is still the multitask forecast introduced earlier:
 - output channel `0`: surface consumed fuel
 - output channel `1`: canopy consumed fuel
 - output channel `2`: active fire / perimeter mask logits
 - output channel `3`: `log1p` energy release total MW
+
+## Qualitative test figure
+
+To compare ground truth, ConvLSTM U-Net, FLARE baseline, and FLARE final for one fire, run:
+
+```bash
+python scripts/qualitative_test_comparison.py CHIMNEYTOPS2 10
+```
+
+The arguments are a fire name or `test`, `val`, `train`, or `all`, followed by the number of PNGs per fire. The command picks different random timestamps and writes PNGs under `artifacts/qualitative_test_comparison/<split>/<fire>/`. See [the qualitative figure guide](research/qualitative_test_comparison.md) for details.
 
 ## Conda Environment Setup
 Create and activate the environment before running any scripts:
@@ -1011,8 +1021,8 @@ Use `--help` on any Python script for the full CLI:
 python scripts/visualize_predictions.py --help
 ```
 
-## CAWFE-Latte v1 End-to-End
-CAWFE-Latte v1 is the first trainable end-to-end baseline for the fresh architecture. It uses four encoders, fire-query modality fusion, a small temporal CNN backbone, a shallow same-resolution decoder, and four heads.
+## FLARE v1 End-to-End
+FLARE v1 is the first trainable end-to-end baseline for the fresh architecture. It uses four encoders, fire-query modality fusion, a small temporal CNN backbone, a shallow same-resolution decoder, and four heads.
 
 Outputs are surface consumed fuel, canopy consumed fuel, fire mask logits, and log1p energy release. The v1 loss uses surface Huber weight 1, canopy Huber weight 1, mask BCE+Dice weight 5, energy-log Huber weight 1, and one auxiliary fire-support mask loss after local fused features with weight 0.2. There are no per-encoder auxiliary losses and no heavy backbone, neural operator, Mamba, or large transformer yet.
 
@@ -1089,11 +1099,11 @@ bash scripts/run_data_preparation_pipeline.sh configs/default.yaml --pattern spa
 
 The runner builds engineered frames, estimates train-only fire-mask thresholds, constructs targets using the frozen derived config, builds patch and temporal indices, computes train-only normalization, inspects the dataset, and optionally saves visualizations. It never trains models by default. Logs are written under `artifacts/logs/data_preparation/`; after success, the script prints the exact next training commands.
 
-## Terrain Processing and CAWFE-Latte Conditioning
+## Terrain Processing and FLARE Conditioning
 
 When `terrain.enabled: true`, the engineered-frame builder finds each fire's `.terrain` file, validates its dimensions against the processed frames, and saves it under `fires/<FIRE_NAME>/terrain/`. It stores the original file, elevation, and four static feature maps: relative elevation, slope magnitude, `slope_x`, and `slope_y`.
 
-The processed dataloader crops the same terrain patch as the dynamic inputs and targets. Terrain is returned as `B x 4 x H x W` without a time dimension. CAWFE-Latte encodes these maps with a CNN and applies zero-initialized FiLM conditioning after dynamic fire-query cross-attention; terrain is not treated as a dynamic attention token. ConvLSTM and other architectures continue to receive the existing tuple `(X, y)` unless terrain is explicitly enabled.
+The processed dataloader crops the same terrain patch as the dynamic inputs and targets. Terrain is returned as `B x 4 x H x W` without a time dimension. FLARE encodes these maps with a CNN and applies zero-initialized FiLM conditioning after dynamic fire-query cross-attention; terrain is not treated as a dynamic attention token. ConvLSTM and other architectures continue to receive the existing tuple `(X, y)` unless terrain is explicitly enabled.
 
 Build and inspect terrain with:
 
@@ -1105,9 +1115,9 @@ python scripts/visualize_processed_samples.py \
   --pattern consecutive5_h10 --split train
 ```
 
-## CAWFE-Latte Ablations
+## FLARE Ablations
 
-CAWFE-Latte has one active architecture, `model.architecture: cawfe_latte`. The first 10-epoch screening batch changes only the post-fusion backbone (A/B) or temporal pooling (C); early stopping and automatic test evaluation are disabled.
+FLARE has one active architecture, `model.architecture: cawfe_latte`. The first 10-epoch screening batch changes only the post-fusion backbone (A/B) or temporal pooling (C); early stopping and automatic test evaluation are disabled.
 
 ```bash
 python scripts/check_cawfe_latte_ablation_configs.py
@@ -1143,7 +1153,7 @@ python scripts/summarize_cawfe_latte_ablations.py
 tool for historical runs. It is not invoked by the standard submission, training,
 or summarization workflow.
 
-## Per-epoch CAWFE-Latte fusion vectors
+## Per-epoch FLARE fusion vectors
 
 Optionally save one representative post-fusion vector at the start of each epoch:
 

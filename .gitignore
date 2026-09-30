@@ -14,6 +14,7 @@ artifacts/
 outputs/
 configs/artifacts/
 fuel_layout_diagnostics/
+results/
 
 # Raw simulation outputs and large derived files
 KINGNSM04ASC.*

@@ -541,7 +541,7 @@ def write_outputs(root: Path, rows: list[dict[str, Any]]) -> None:
     synergy = combination_synergy_lines(rows)
     markdown_synergy = ["## Combination Synergy", ""] + [f"- {line}" if not line.endswith(":") else f"### {line}" for line in synergy[1:]]
     markdown = "\n".join(
-        ["# CAWFE-Latte Ablation Results", "", header, separator, *markdown_rows, "", *markdown_footer(rows), *markdown_synergy, ""]
+        ["# FLARE Ablation Results", "", header, separator, *markdown_rows, "", *markdown_footer(rows), *markdown_synergy, ""]
     )
     (root / "ablation_results.md").write_text(markdown, encoding="utf-8")
 

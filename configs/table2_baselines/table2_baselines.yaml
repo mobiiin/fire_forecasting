@@ -23,8 +23,8 @@ baselines:
     config_path: configs/table2_baselines/cawfe_st_mamba.yaml
 cawfe_latte_rows:
   cawfe_latte_baseline:
-    display_name: CAWFE-Latte baseline
+    display_name: FLARE baseline
     finalist: baseline
   cawfe_latte_final:
-    display_name: CAWFE-Latte (final)
+    display_name: FLARE final
     finalist: GA_Q2

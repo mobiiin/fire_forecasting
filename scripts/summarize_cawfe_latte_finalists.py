@@ -266,7 +266,7 @@ def render_report(
     *,
     markdown: bool,
 ) -> str:
-    lines = ["# CAWFE-Latte Finalist Results" if markdown else "CAWFE-LATTE FINALIST RESULTS", ""]
+    lines = ["# FLARE Finalist Results" if markdown else "FLARE FINALIST RESULTS", ""]
     if missing:
         lines.append(f"Incomplete registered runs: {len(missing)}")
         lines.extend(f"- {item}" for item in missing)

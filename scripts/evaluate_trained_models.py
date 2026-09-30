@@ -77,7 +77,7 @@ DISPLAY_NAMES = {
 	"st_mamba_lite": "CAWFE-ST-Mamba",
 	"cawfe_st_mamba": "CAWFE-ST-Mamba",
 	"weatherformer_lite": "WeatherFormer-lite",
-	"cawfe_latte": "CAWFE-Latte v1",
+	"cawfe_latte": "FLARE v1",
 }
 
 PAPER_COLUMNS = [
